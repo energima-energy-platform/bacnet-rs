@@ -4,15 +4,18 @@ use std::{sync::Arc, time::Duration};
 
 use bacnet_rs::{
     app::Apdu,
-    client::{AsyncBacnetClient, ClientConfig},
-    network::Npdu,
+    client::{AsyncBacnetClient, ClientConfig, DiscoveredRouter},
+    network::{NetworkAddress, Npdu},
     object::{
         database::ObjectDatabase, AnalogValue, Device, ObjectIdentifier, ObjectType,
-        PropertyIdentifier,
+        PropertyIdentifier, Segmentation,
     },
     property::PropertyValue,
     server::AsyncBacnetIpServer,
-    service::{ConfirmedServiceChoice, ReadPropertyRequest, ReadPropertyResponse},
+    service::{
+        ConfirmedServiceChoice, IAmRequest, ReadPropertyRequest, ReadPropertyResponse,
+        UnconfirmedServiceChoice,
+    },
 };
 use tokio::net::UdpSocket;
 
@@ -56,6 +59,28 @@ fn read_property_ack(request: Apdu) -> (u32, Vec<u8>) {
 fn wrap_response(apdu: Apdu) -> Vec<u8> {
     let mut payload = Npdu::new().encode();
     payload.extend_from_slice(&apdu.encode());
+    let length = payload.len() + 4;
+    let mut frame = vec![0x81, 0x0A, (length >> 8) as u8, length as u8];
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+fn i_am_frame(device_id: u32, route: Option<NetworkAddress>) -> Vec<u8> {
+    let mut npdu = Npdu::new();
+    if let Some(route) = route {
+        npdu.set_source(route);
+    }
+    let iam = IAmRequest::new(
+        ObjectIdentifier::new(ObjectType::Device, device_id),
+        1476,
+        Segmentation::NoSegmentation,
+        99,
+    );
+    let mut service_data = Vec::new();
+    iam.encode(&mut service_data).unwrap();
+    let mut payload = npdu.encode();
+    payload.extend_from_slice(&[0x10, UnconfirmedServiceChoice::IAm as u8]);
+    payload.extend_from_slice(&service_data);
     let length = payload.len() + 4;
     let mut frame = vec![0x81, 0x0A, (length >> 8) as u8, length as u8];
     frame.extend_from_slice(&payload);
@@ -182,6 +207,130 @@ async fn cancelled_requests_release_invoke_ids_before_new_work_is_admitted() {
             .unwrap(),
         vec![PropertyValue::Real(9.0)]
     );
+    responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn who_is_collects_and_dedupes_i_am_responses() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = device.local_addr().unwrap();
+    let responder = tokio::spawn(async move {
+        let mut buffer = [0_u8; 1500];
+        let (_, source) = device.recv_from(&mut buffer).await.unwrap();
+        let frame = i_am_frame(1234, None);
+        device.send_to(&frame, source).await.unwrap();
+        device.send_to(&frame, source).await.unwrap();
+    });
+
+    let client = test_client(Duration::from_millis(200), 0).await;
+    let devices = client.who_is_to(address, None, None).await.unwrap();
+    assert_eq!(devices.len(), 1, "duplicate I-Am must be de-duplicated");
+    assert_eq!(devices[0].device_id, 1234);
+    assert_eq!(devices[0].address, address);
+    assert_eq!(devices[0].route, None);
+    assert_eq!(devices[0].max_apdu, 1476);
+    responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_i_am_yields_route_used_for_confirmed_requests() {
+    let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = router.local_addr().unwrap();
+    let route = NetworkAddress::new(100, vec![146, 52]);
+    let responder = tokio::spawn({
+        let route = route.clone();
+        async move {
+            let mut buffer = [0_u8; 1500];
+            let (_, source) = router.recv_from(&mut buffer).await.unwrap();
+            router
+                .send_to(&i_am_frame(13458, Some(route.clone())), source)
+                .await
+                .unwrap();
+
+            // The follow-up confirmed request must carry the discovered
+            // route as its NPDU destination.
+            let (length, source) = router.recv_from(&mut buffer).await.unwrap();
+            let (npdu, npdu_length) = Npdu::decode(&buffer[4..length]).unwrap();
+            assert_eq!(npdu.destination, Some(route));
+            let apdu = Apdu::decode(&buffer[4 + npdu_length..length]).unwrap();
+            let (_, frame) = read_property_ack(apdu);
+            router.send_to(&frame, source).await.unwrap();
+        }
+    });
+
+    let client = test_client(Duration::from_millis(200), 0).await;
+    let devices = client.who_is_to(address, None, None).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].route, Some(route));
+
+    let object = ObjectIdentifier::new(ObjectType::AnalogValue, 5);
+    let values = client
+        .read_property(devices[0].target(), object, PropertyIdentifier::PresentValue)
+        .await
+        .unwrap();
+    assert_eq!(values, vec![PropertyValue::Real(5.0)]);
+    responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn who_is_router_collects_advertised_networks() {
+    let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = router.local_addr().unwrap();
+    let responder = tokio::spawn(async move {
+        let mut buffer = [0_u8; 1500];
+        let (length, source) = router.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(buffer[..2], [0x81, 0x0A], "expected unicast Who-Is-Router");
+        assert!(length >= 7);
+        let frame = [
+            0x81, 0x0A, 0x00, 0x0B, // BVLC Original-Unicast-NPDU
+            0x01, 0x80, // NPDU network-layer message
+            0x01, // I-Am-Router-To-Network
+            0x00, 0x64, // network 100
+            0x01, 0x2C, // network 300
+        ];
+        router.send_to(&frame, source).await.unwrap();
+    });
+
+    let client = test_client(Duration::from_millis(200), 0).await;
+    let routers = client.who_is_router_to(address, None).await.unwrap();
+    assert_eq!(
+        routers,
+        vec![DiscoveredRouter {
+            address,
+            networks: vec![100, 300],
+        }]
+    );
+    responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn discovery_window_does_not_block_confirmed_requests() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = device.local_addr().unwrap();
+    let responder = tokio::spawn(async move {
+        let mut buffer = [0_u8; 1500];
+        // The Who-Is arrives first but is answered only after the confirmed
+        // read has been served, proving the window doesn't serialize traffic.
+        let (_, whois_source) = device.recv_from(&mut buffer).await.unwrap();
+        let (length, source) = device.recv_from(&mut buffer).await.unwrap();
+        let (_, frame) = read_property_ack(parse_confirmed_request(&buffer[..length]));
+        device.send_to(&frame, source).await.unwrap();
+        device
+            .send_to(&i_am_frame(77, None), whois_source)
+            .await
+            .unwrap();
+    });
+
+    let client = test_client(Duration::from_millis(500), 0).await;
+    let object = ObjectIdentifier::new(ObjectType::AnalogValue, 3);
+    let (devices, values) = tokio::join!(
+        client.who_is_to(address, None, None),
+        client.read_property(address, object, PropertyIdentifier::PresentValue),
+    );
+    assert_eq!(values.unwrap(), vec![PropertyValue::Real(3.0)]);
+    let devices = devices.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, 77);
     responder.await.unwrap();
 }
 

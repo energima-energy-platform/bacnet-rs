@@ -3,9 +3,17 @@
 //! One endpoint task owns the UDP socket, receives every datagram, and routes
 //! confirmed responses to callers through per-transaction one-shot channels.
 //! Cloned client handles submit commands through a bounded queue; requests are
-//! sent without waiting for earlier transactions to complete.
+//! sent without waiting for earlier transactions to complete. Discovery
+//! (Who-Is, Who-Is-Router-To-Network) registers a response sink with the
+//! endpoint, which forwards matching unconfirmed frames until the timeout
+//! window closes.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{
     net::UdpSocket,
@@ -15,19 +23,23 @@ use tokio::{
 
 use crate::{
     app::{Apdu, MaxApduSize, MaxSegments},
+    datalink::bip::BACNET_IP_PORT,
     network::Npdu,
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier},
     property::{encode_property_value, PropertyValue},
     service::{
         AbortReason, ConfirmedServiceChoice, PropertyReference, ReadAccessSpecification,
         ReadPropertyMultipleRequest, ReadPropertyMultipleResponse, ReadPropertyRequest,
-        ReadPropertyResponse, WritePropertyRequest,
+        ReadPropertyResponse, UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
     },
 };
 
 use super::{
-    decode_object_list_value, property_read_result, BacnetTarget, ClientConfig, ClientError,
-    ObjectSnapshot, PropertyReadResult, BVLC_ORIGINAL_UNICAST,
+    create_unconfirmed_frame, create_who_is_network_frame, create_who_is_router_frame,
+    decode_bacnet_ip_frame, decode_object_list_value, is_broadcast_target,
+    parse_i_am_router_response, parse_iam_response, property_read_result, BacnetTarget,
+    ClientConfig, ClientError, DeviceInfo, DiscoveredRouter, ObjectSnapshot, PropertyReadResult,
+    BVLC_ORIGINAL_UNICAST,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -63,6 +75,8 @@ impl AsyncBacnetClient {
         retries: u8,
     ) -> Result<Self, ClientError> {
         let local_addr = socket.local_addr()?;
+        // Discovery may target broadcast addresses.
+        socket.set_broadcast(true)?;
         let (commands, receiver) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         tokio::spawn(Endpoint::new(socket, receiver, timeout, retries).run());
         Ok(Self {
@@ -74,6 +88,129 @@ impl AsyncBacnetClient {
     /// Address of the endpoint's single UDP socket.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Broadcast a Who-Is on the local subnet and collect every device that
+    /// answers with an I-Am, until the configured timeout elapses.
+    ///
+    /// Results are de-duplicated by device id.
+    pub async fn who_is(
+        &self,
+        low_limit: Option<u32>,
+        high_limit: Option<u32>,
+    ) -> Result<Vec<DeviceInfo>, ClientError> {
+        let broadcast = SocketAddr::from(([255, 255, 255, 255], BACNET_IP_PORT));
+        self.who_is_to(broadcast, low_limit, high_limit).await
+    }
+
+    /// Send a Who-Is to a specific address (broadcast or unicast) and collect
+    /// all I-Am replies until the timeout elapses.
+    ///
+    /// Broadcast targets are framed as a global-broadcast NPDU inside an
+    /// Original-Broadcast-NPDU BVLC, matching the sync client.
+    pub async fn who_is_to(
+        &self,
+        target_addr: SocketAddr,
+        low_limit: Option<u32>,
+        high_limit: Option<u32>,
+    ) -> Result<Vec<DeviceInfo>, ClientError> {
+        let frame = create_unconfirmed_frame(
+            UnconfirmedServiceChoice::WhoIs as u8,
+            &encode_who_is(low_limit, high_limit)?,
+            is_broadcast_target(target_addr),
+        );
+        self.discover_devices(frame, target_addr).await
+    }
+
+    /// Send Who-Is through a known BACnet router to every station on a
+    /// downstream BACnet network and collect the resulting I-Am responses.
+    pub async fn who_is_network(
+        &self,
+        router_addr: SocketAddr,
+        destination_network: u16,
+        low_limit: Option<u32>,
+        high_limit: Option<u32>,
+    ) -> Result<Vec<DeviceInfo>, ClientError> {
+        let frame = create_who_is_network_frame(
+            destination_network,
+            &encode_who_is(low_limit, high_limit)?,
+        );
+        self.discover_devices(frame, router_addr).await
+    }
+
+    /// Discover every BACnet router visible through the limited IP broadcast.
+    pub async fn who_is_router(
+        &self,
+        destination_network: Option<u16>,
+    ) -> Result<Vec<DiscoveredRouter>, ClientError> {
+        let broadcast = SocketAddr::from(([255, 255, 255, 255], BACNET_IP_PORT));
+        self.who_is_router_to(broadcast, destination_network).await
+    }
+
+    /// Send Who-Is-Router-To-Network to an explicit UDP destination and
+    /// collect I-Am-Router-To-Network responses until the timeout elapses.
+    pub async fn who_is_router_to(
+        &self,
+        target_addr: SocketAddr,
+        destination_network: Option<u16>,
+    ) -> Result<Vec<DiscoveredRouter>, ClientError> {
+        let frame =
+            create_who_is_router_frame(destination_network, is_broadcast_target(target_addr));
+        let (sink, mut responses) = mpsc::unbounded_channel();
+        self.commands
+            .send(EndpointCommand::DiscoverRouters {
+                frame,
+                destination: target_addr,
+                sink,
+            })
+            .await
+            .map_err(|_| ClientError::EndpointClosed)?;
+
+        let mut routers: Vec<DiscoveredRouter> = Vec::new();
+        while let Some(response) = responses.recv().await {
+            let response = response?;
+            if let Some(existing) = routers
+                .iter_mut()
+                .find(|router| router.address == response.address)
+            {
+                for network in response.networks {
+                    if !existing.networks.contains(&network) {
+                        existing.networks.push(network);
+                    }
+                }
+                existing.networks.sort_unstable();
+            } else {
+                routers.push(response);
+            }
+        }
+        routers.sort_by_key(|router| router.address);
+        Ok(routers)
+    }
+
+    async fn discover_devices(
+        &self,
+        frame: Vec<u8>,
+        destination: SocketAddr,
+    ) -> Result<Vec<DeviceInfo>, ClientError> {
+        let (sink, mut responses) = mpsc::unbounded_channel();
+        self.commands
+            .send(EndpointCommand::DiscoverDevices {
+                frame,
+                destination,
+                sink,
+            })
+            .await
+            .map_err(|_| ClientError::EndpointClosed)?;
+
+        let mut devices = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(device) = responses.recv().await {
+            let device = device?;
+            if seen.insert(device.device_id) {
+                devices.push(device);
+            }
+        }
+        Ok(devices)
     }
 
     async fn send_confirmed_request(
@@ -281,6 +418,23 @@ enum EndpointCommand {
         service_data: Vec<u8>,
         response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
     },
+    DiscoverDevices {
+        frame: Vec<u8>,
+        destination: SocketAddr,
+        sink: mpsc::UnboundedSender<Result<DeviceInfo, ClientError>>,
+    },
+    DiscoverRouters {
+        frame: Vec<u8>,
+        destination: SocketAddr,
+        sink: mpsc::UnboundedSender<Result<DiscoveredRouter, ClientError>>,
+    },
+}
+
+/// One in-progress discovery: responses are forwarded to `sink` until
+/// `deadline`, when dropping the sender closes the caller's channel.
+struct ActiveDiscovery<T> {
+    sink: mpsc::UnboundedSender<Result<T, ClientError>>,
+    deadline: Instant,
 }
 
 struct PendingTransaction {
@@ -296,6 +450,8 @@ struct Endpoint {
     socket: UdpSocket,
     commands: mpsc::Receiver<EndpointCommand>,
     pending: HashMap<u8, PendingTransaction>,
+    device_discoveries: Vec<ActiveDiscovery<DeviceInfo>>,
+    router_discoveries: Vec<ActiveDiscovery<DiscoveredRouter>>,
     next_invoke_id: u8,
     timeout: Duration,
     retries: u8,
@@ -313,6 +469,8 @@ impl Endpoint {
             socket,
             commands,
             pending: HashMap::new(),
+            device_discoveries: Vec::new(),
+            router_discoveries: Vec::new(),
             next_invoke_id: 0,
             timeout,
             retries,
@@ -323,7 +481,13 @@ impl Endpoint {
     async fn run(mut self) {
         loop {
             self.remove_cancelled();
-            let next_deadline = self.pending.values().map(|pending| pending.deadline).min();
+            let next_deadline = self
+                .pending
+                .values()
+                .map(|pending| pending.deadline)
+                .chain(self.device_discoveries.iter().map(|d| d.deadline))
+                .chain(self.router_discoveries.iter().map(|d| d.deadline))
+                .min();
             let timeout_at = next_deadline.unwrap_or_else(|| {
                 Instant::now()
                     .checked_add(Duration::from_secs(86_400))
@@ -353,12 +517,65 @@ impl Endpoint {
     }
 
     async fn handle_command(&mut self, command: EndpointCommand) {
-        let EndpointCommand::Confirmed {
-            target,
-            service_choice,
-            service_data,
-            response,
-        } = command;
+        match command {
+            EndpointCommand::Confirmed {
+                target,
+                service_choice,
+                service_data,
+                response,
+            } => {
+                self.handle_confirmed_command(target, service_choice, service_data, response)
+                    .await;
+            }
+            EndpointCommand::DiscoverDevices {
+                frame,
+                destination,
+                sink,
+            } => {
+                if let Some(discovery) = self.start_discovery(&frame, destination, sink).await {
+                    self.device_discoveries.push(discovery);
+                }
+            }
+            EndpointCommand::DiscoverRouters {
+                frame,
+                destination,
+                sink,
+            } => {
+                if let Some(discovery) = self.start_discovery(&frame, destination, sink).await {
+                    self.router_discoveries.push(discovery);
+                }
+            }
+        }
+    }
+
+    /// Send a discovery frame and open its response window. A failed send is
+    /// reported through the sink instead, and no window is opened.
+    async fn start_discovery<T>(
+        &mut self,
+        frame: &[u8],
+        destination: SocketAddr,
+        sink: mpsc::UnboundedSender<Result<T, ClientError>>,
+    ) -> Option<ActiveDiscovery<T>> {
+        if sink.is_closed() {
+            return None;
+        }
+        if let Err(error) = self.socket.send_to(frame, destination).await {
+            let _ = sink.send(Err(ClientError::Io(error)));
+            return None;
+        }
+        Some(ActiveDiscovery {
+            sink,
+            deadline: Instant::now() + self.timeout,
+        })
+    }
+
+    async fn handle_confirmed_command(
+        &mut self,
+        target: BacnetTarget,
+        service_choice: ConfirmedServiceChoice,
+        service_data: Vec<u8>,
+        response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
+    ) {
         if response.is_closed() {
             return;
         }
@@ -401,8 +618,39 @@ impl Endpoint {
     }
 
     fn handle_packet(&mut self, length: usize, source: SocketAddr) {
-        let Some(apdu) = decode_response_apdu(&self.receive_buffer[..length]) else {
-            return;
+        let apdu = {
+            let data = &self.receive_buffer[..length];
+            let Some(frame) = decode_bacnet_ip_frame(data, source) else {
+                return;
+            };
+
+            if frame.npdu.is_network_message() {
+                if !self.router_discoveries.is_empty() {
+                    if let Some(router) = parse_i_am_router_response(data, source) {
+                        for discovery in &self.router_discoveries {
+                            let _ = discovery.sink.send(Ok(router.clone()));
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Unconfirmed-Request PDU: only I-Am matters, for device discovery.
+            if frame.payload.first() == Some(&0x10) {
+                if !self.device_discoveries.is_empty() {
+                    if let Some(device) = parse_iam_response(data, source) {
+                        for discovery in &self.device_discoveries {
+                            let _ = discovery.sink.send(Ok(device.clone()));
+                        }
+                    }
+                }
+                return;
+            }
+
+            let Ok(apdu) = Apdu::decode(frame.payload) else {
+                return;
+            };
+            apdu
         };
         let invoke_id = match &apdu {
             Apdu::ComplexAck { invoke_id, .. }
@@ -426,6 +674,10 @@ impl Endpoint {
 
     async fn handle_timeouts(&mut self) {
         let now = Instant::now();
+        // An expired discovery window simply closes its sink, which ends the
+        // caller's collection loop.
+        self.device_discoveries.retain(|d| d.deadline > now);
+        self.router_discoveries.retain(|d| d.deadline > now);
         let expired = self
             .pending
             .iter()
@@ -460,6 +712,10 @@ impl Endpoint {
     fn remove_cancelled(&mut self) {
         self.pending
             .retain(|_, pending| !pending.response.is_closed());
+        self.device_discoveries
+            .retain(|discovery| !discovery.sink.is_closed());
+        self.router_discoveries
+            .retain(|discovery| !discovery.sink.is_closed());
     }
 
     fn fail_all<F>(&mut self, mut error: F)
@@ -469,7 +725,26 @@ impl Endpoint {
         for (_, pending) in self.pending.drain() {
             let _ = pending.response.send(Err(error()));
         }
+        for discovery in self.device_discoveries.drain(..) {
+            let _ = discovery.sink.send(Err(error()));
+        }
+        for discovery in self.router_discoveries.drain(..) {
+            let _ = discovery.sink.send(Err(error()));
+        }
     }
+}
+
+fn encode_who_is(
+    low_limit: Option<u32>,
+    high_limit: Option<u32>,
+) -> Result<Vec<u8>, ClientError> {
+    let whois = match (low_limit, high_limit) {
+        (Some(low), Some(high)) => WhoIsRequest::for_range(low, high),
+        _ => WhoIsRequest::new(),
+    };
+    let mut buffer = Vec::new();
+    whois.encode(&mut buffer)?;
+    Ok(buffer)
 }
 
 fn build_confirmed_frame(
@@ -508,26 +783,6 @@ fn build_confirmed_frame(
     ]);
     frame.extend_from_slice(&payload);
     frame
-}
-
-fn decode_response_apdu(frame: &[u8]) -> Option<Apdu> {
-    if frame.len() < 6 || frame[0] != 0x81 {
-        return None;
-    }
-    let frame_length = u16::from_be_bytes([frame[2], frame[3]]) as usize;
-    if frame_length != frame.len() {
-        return None;
-    }
-    let npdu_start = if frame[1] == 0x04 {
-        if frame.len() < 12 {
-            return None;
-        }
-        10
-    } else {
-        4
-    };
-    let (_, npdu_length) = Npdu::decode(&frame[npdu_start..]).ok()?;
-    Apdu::decode(frame.get(npdu_start + npdu_length..)?).ok()
 }
 
 fn response_matches_service(apdu: &Apdu, expected: ConfirmedServiceChoice) -> bool {
