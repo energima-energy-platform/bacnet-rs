@@ -1370,6 +1370,7 @@ impl PropertyResult {
 
     pub fn decode(bytes: &[u8]) -> EncodingResult<(Self, usize)> {
         let (property_identifier, consumed) = decode_context_enumerated(bytes, 2)?;
+        let property_identifier = PropertyIdentifier::from(property_identifier);
         let mut total_consumed = consumed;
 
         let (tag, _, _) = decode_tag(&bytes[total_consumed..])?;
@@ -1387,7 +1388,13 @@ impl PropertyResult {
 
         let value = if let BACnetTag::Context(4) = tag {
             let value_end = find_constructed_value_end(bytes, total_consumed, 4)?;
-            let values = decode_property_result_values(&bytes[total_consumed..value_end])?;
+            let encoded_values = &bytes[total_consumed..value_end];
+            let values = if property_identifier == PropertyIdentifier::ActiveCovSubscriptions {
+                crate::property::complex::decode_cov_subscriptions(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
+            } else {
+                decode_property_result_values(encoded_values)?
+            };
             total_consumed = value_end;
             PropertyResultValue::Value(values)
         } else if let BACnetTag::Context(5) = tag {
@@ -1413,7 +1420,7 @@ impl PropertyResult {
 
         Ok((
             Self {
-                property_identifier: property_identifier.into(),
+                property_identifier,
                 array_index,
                 value,
             },
