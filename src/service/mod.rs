@@ -1395,6 +1395,34 @@ impl PropertyResult {
             } else if property_identifier == PropertyIdentifier::DeviceAddressBinding {
                 crate::property::complex::decode_address_bindings(encoded_values)
                     .or_else(|_| decode_property_result_values(encoded_values))?
+            } else if matches!(
+                property_identifier,
+                PropertyIdentifier::EventTimeStamps
+                    | PropertyIdentifier::CommandTimeArray
+                    | PropertyIdentifier::LastCommandTime
+            ) {
+                crate::property::complex::decode_timestamps(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
+            } else if matches!(
+                property_identifier,
+                PropertyIdentifier::ListOfObjectPropertyReferences
+                    | PropertyIdentifier::EventAlgorithmInhibitRef
+                    | PropertyIdentifier::ObjectPropertyReference
+            ) {
+                crate::property::complex::decode_object_property_references(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
+            } else if property_identifier == PropertyIdentifier::RecipientList {
+                crate::property::complex::decode_destinations(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
+            } else if property_identifier == PropertyIdentifier::WeeklySchedule {
+                crate::property::complex::decode_weekly_schedule(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
+            } else if matches!(
+                property_identifier,
+                PropertyIdentifier::ValueSource | PropertyIdentifier::ValueSourceArray
+            ) {
+                crate::property::complex::decode_value_sources(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
             } else {
                 decode_property_result_values(encoded_values)?
             };

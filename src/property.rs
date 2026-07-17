@@ -27,8 +27,9 @@ use crate::{
 
 pub mod complex;
 pub use complex::{
-    AddressBindingValue, BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient,
-    RecipientProcess,
+    AddressBindingValue, BacnetAddress, CovSubscriptionValue, DailyScheduleValue, DestinationValue,
+    ObjectPropertyReference, Recipient, RecipientProcess, TimeValueValue, TimestampValue,
+    ValueSourceValue,
 };
 
 /// Decoded BACnet property value
@@ -67,6 +68,16 @@ pub enum PropertyValue {
     CovSubscription(CovSubscriptionValue),
     /// BACnetAddressBinding composite value.
     AddressBinding(AddressBindingValue),
+    /// BACnetTimeStamp choice.
+    Timestamp(TimestampValue),
+    /// BACnetObjectPropertyReference composite value.
+    ObjectPropertyReference(ObjectPropertyReference),
+    /// BACnetDestination composite value.
+    Destination(DestinationValue),
+    /// BACnetDailySchedule composite value.
+    DailySchedule(DailyScheduleValue),
+    /// BACnetValueSource choice.
+    ValueSource(ValueSourceValue),
     /// Null value
     Null,
     /// Unknown/unsupported value type
@@ -107,6 +118,11 @@ impl PropertyValue {
             PropertyValue::List(values) => format_collection("List", values),
             PropertyValue::CovSubscription(value) => format!("{value:?}"),
             PropertyValue::AddressBinding(value) => format!("{value:?}"),
+            PropertyValue::Timestamp(value) => format!("{value:?}"),
+            PropertyValue::ObjectPropertyReference(value) => format!("{value:?}"),
+            PropertyValue::Destination(value) => format!("{value:?}"),
+            PropertyValue::DailySchedule(value) => format!("{value:?}"),
+            PropertyValue::ValueSource(value) => format!("{value:?}"),
             PropertyValue::Null => "Null".to_string(),
             PropertyValue::Unknown(_) => "Unknown".to_string(),
         }
@@ -258,6 +274,11 @@ pub fn encode_property_value(
         }
         PropertyValue::CovSubscription(value) => value.encode(buffer)?,
         PropertyValue::AddressBinding(value) => value.encode(buffer)?,
+        PropertyValue::Timestamp(value) => value.encode(buffer)?,
+        PropertyValue::ObjectPropertyReference(value) => value.encode(buffer)?,
+        PropertyValue::Destination(value) => value.encode(buffer)?,
+        PropertyValue::DailySchedule(value) => value.encode(buffer)?,
+        PropertyValue::ValueSource(value) => value.encode(buffer)?,
         PropertyValue::Null => encode_application_tag(buffer, ApplicationTag::Null, 0),
         PropertyValue::Unknown(data) => buffer.extend_from_slice(data),
     }
