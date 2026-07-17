@@ -9,6 +9,13 @@ use crate::{
 /// Errors returned while serving a hosted BACnet device.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("invalid server configuration: {0}")]
+    InvalidConfiguration(String),
+
+    #[cfg(feature = "async")]
+    #[error("asynchronous request task failed: {0}")]
+    AsyncTask(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 

@@ -4,8 +4,8 @@
 //! development and interoperability testing, but is not a formal BACnet PICS or
 //! a certification claim.
 //!
-//! The server supports BACnet/IP original unicast and broadcast messages using
-//! protocol version 1, revision 22. It executes Who-Is, ReadProperty,
+//! The server accepts BACnet/IP original unicast, original broadcast, and
+//! Forwarded-NPDU messages using protocol version 1, revision 22. It executes Who-Is, ReadProperty,
 //! ReadPropertyMultiple, and WriteProperty, and emits I-Am responses. RPM
 //! supports explicit properties and the `All` selector; `Required` and
 //! `Optional` selectors are not implemented yet.
@@ -17,8 +17,10 @@
 //!
 //! The Analog Value is commandable. Present_Value accepts priorities 1 through
 //! 16, defaults to priority 16, and accepts Null to relinquish a priority slot.
-//! COV subscriptions, event reporting, BBMD operation, and segmented requests
-//! or responses are outside this profile.
+//! Indexed property writes are not implemented and return
+//! optional-functionality-not-supported.
+//! COV subscriptions, event reporting, acting as a BBMD or foreign device, and
+//! segmented requests or responses are outside this profile.
 //!
 //! ```text
 //! cargo run --example hosted_device -- 127.0.0.2:47808 1234
@@ -60,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setpoint.present_value = 21.5;
     database.add_object(Box::new(setpoint))?;
 
-    let server = BacnetIpServer::bind(&bind_address, database)?;
+    let mut server = BacnetIpServer::bind(&bind_address, database)?;
     println!("Hosting BACnet device {device_instance} on {bind_address}");
 
     loop {

@@ -53,12 +53,16 @@ impl ServerDispatcher {
                 let request = if service_data.is_empty() {
                     WhoIsRequest::new()
                 } else {
-                    WhoIsRequest::decode(&service_data)?
+                    let Ok(request) = WhoIsRequest::decode(&service_data) else {
+                        return Ok(None);
+                    };
+                    request
                 };
-                let iam = self.objects.i_am()?;
-                if !request.matches(iam.device_identifier.instance) {
+                let device = self.objects.database().get_device_id();
+                if !request.matches(device.instance) {
                     return Ok(None);
                 }
+                let iam = self.objects.i_am()?;
 
                 let mut service_data = Vec::new();
                 iam.encode(&mut service_data)?;
@@ -188,7 +192,7 @@ fn enforce_max_apdu(
     max_response_size: MaxApduSize,
     segmented_response_accepted: bool,
 ) -> Apdu {
-    if response.encode().len() <= max_response_size.size() {
+    if response.encoded_len() <= max_response_size.size() {
         return response;
     }
 
@@ -209,8 +213,8 @@ fn object_error_apdu(
     Apdu::Error {
         invoke_id,
         service_choice,
-        error_class: error_class as u8,
-        error_code: error_code as u8,
+        error_class,
+        error_code,
     }
 }
 

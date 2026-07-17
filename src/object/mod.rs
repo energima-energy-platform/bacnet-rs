@@ -162,6 +162,8 @@ pub enum ObjectError {
     PropertyIsNotArray,
     /// An array index was outside the property's bounds.
     InvalidArrayIndex,
+    /// The requested optional behavior is not implemented.
+    OptionalFunctionalityNotSupported,
     /// Invalid property type
     InvalidPropertyType,
     /// Invalid property value
@@ -183,6 +185,9 @@ impl fmt::Display for ObjectError {
             ObjectError::PropertyNotWritable => write!(f, "Property not writable"),
             ObjectError::PropertyIsNotArray => write!(f, "Property is not an array"),
             ObjectError::InvalidArrayIndex => write!(f, "Invalid array index"),
+            ObjectError::OptionalFunctionalityNotSupported => {
+                write!(f, "Optional functionality not supported")
+            }
             ObjectError::InvalidPropertyType => write!(f, "Invalid property type"),
             ObjectError::InvalidValue(msg) => write!(f, "Invalid value: {}", msg),
             ObjectError::WriteAccessDenied => write!(f, "Write access denied"),
@@ -269,6 +274,30 @@ pub trait BacnetObject: Send + Sync {
 
     /// Get list of all properties
     fn property_list(&self) -> Vec<PropertyIdentifier>;
+}
+
+/// Update one slot in a BACnet command priority array and return the resulting
+/// effective value. Priority 1 is the highest; the relinquish default is used
+/// when every slot is null.
+pub(crate) fn write_priority_slot<T: Copy>(
+    priority_array: &mut [Option<T>; 16],
+    priority: u8,
+    value: Option<T>,
+    relinquish_default: T,
+) -> Result<T> {
+    if !(1..=16).contains(&priority) {
+        return Err(ObjectError::InvalidValue(
+            "Priority must be 1-16".to_string(),
+        ));
+    }
+
+    priority_array[usize::from(priority - 1)] = value;
+    Ok(priority_array
+        .iter()
+        .flatten()
+        .next()
+        .copied()
+        .unwrap_or(relinquish_default))
 }
 
 /// BACnet date representation
@@ -470,9 +499,18 @@ impl BacnetObject for Device {
             PropertyIdentifier::NumberOfApduRetries => {
                 Ok(PropertyValue::Unsigned(self.number_of_apdu_retries.into()))
             }
-            PropertyIdentifier::DeviceAddressBinding if self.device_address_binding.is_empty() => {
-                Ok(PropertyValue::List(Vec::new()))
-            }
+            PropertyIdentifier::DeviceAddressBinding => Ok(PropertyValue::List(
+                self.device_address_binding
+                    .iter()
+                    .flat_map(|binding| {
+                        [
+                            PropertyValue::ObjectIdentifier(binding.device_identifier),
+                            PropertyValue::Unsigned(binding.network_number.into()),
+                            PropertyValue::OctetString(binding.mac_address.clone()),
+                        ]
+                    })
+                    .collect(),
+            )),
             PropertyIdentifier::DatabaseRevision => {
                 Ok(PropertyValue::Unsigned(self.database_revision.into()))
             }
@@ -751,7 +789,8 @@ pub fn protocol_object_type_bit_count(protocol_revision: u8) -> usize {
 #[derive(Debug, Clone)]
 pub struct AddressBinding {
     pub device_identifier: ObjectIdentifier,
-    pub network_address: Vec<u8>,
+    pub network_number: u16,
+    pub mac_address: Vec<u8>,
 }
 
 /// Analog object types (AI, AO, AV)
@@ -898,5 +937,27 @@ mod tests {
         assert_eq!(object_types.len(), 63);
         assert!(object_types[u32::from(ObjectType::Device) as usize]);
         assert_eq!(device.segmentation_supported, Segmentation::NoSegmentation);
+    }
+
+    #[test]
+    fn device_address_binding_encodes_nonempty_bindings() {
+        let mut device = Device::new(123, "Test Device".to_string());
+        let remote_device = ObjectIdentifier::new(ObjectType::Device, 456);
+        device.device_address_binding.push(AddressBinding {
+            device_identifier: remote_device,
+            network_number: 416,
+            mac_address: vec![192, 168, 1, 10, 0xBA, 0xC0],
+        });
+
+        assert_eq!(
+            device
+                .get_property(PropertyIdentifier::DeviceAddressBinding)
+                .unwrap(),
+            PropertyValue::List(vec![
+                PropertyValue::ObjectIdentifier(remote_device),
+                PropertyValue::Unsigned(416),
+                PropertyValue::OctetString(vec![192, 168, 1, 10, 0xBA, 0xC0]),
+            ])
+        );
     }
 }

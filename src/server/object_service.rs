@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     object::{
-        database::ObjectDatabase, object_types_supported_bit_string, ObjectError, ObjectIdentifier,
-        ObjectType, PropertyIdentifier, PropertyValue, ProtocolServicesSupported, Segmentation,
+        database::ObjectDatabase, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier,
+        PropertyValue, Segmentation,
     },
     service::{
         IAmRequest, PropertyReference, PropertyResult, ReadAccessResult,
@@ -122,27 +122,17 @@ impl ObjectService {
                     .map(PropertyValue::ObjectIdentifier)
                     .collect(),
             ),
-            PropertyIdentifier::ProtocolServicesSupported if is_device => {
-                let protocol_revision = self.device_protocol_revision()?;
-                PropertyValue::BitString(
-                    ProtocolServicesSupported::hosted_object_services()
-                        .to_bool_vec_for_revision(protocol_revision),
-                )
-            }
-            PropertyIdentifier::ProtocolObjectTypesSupported if is_device => {
-                PropertyValue::BitString(object_types_supported_bit_string(
-                    &self.database.object_types(),
-                    self.device_protocol_revision()?,
-                ))
-            }
-            PropertyIdentifier::SegmentationSupported if is_device => {
-                PropertyValue::Enumerated(Segmentation::NoSegmentation as u32)
-            }
-            PropertyIdentifier::DatabaseRevision if is_device => {
-                PropertyValue::Unsigned(self.database.revision().into())
-            }
             PropertyIdentifier::PropertyList => {
-                let properties = self.properties_for(object_identifier)?;
+                let mut properties = self.properties_for(object_identifier)?;
+                properties.retain(|property| {
+                    !matches!(
+                        property,
+                        PropertyIdentifier::ObjectIdentifier
+                            | PropertyIdentifier::ObjectName
+                            | PropertyIdentifier::ObjectType
+                            | PropertyIdentifier::PropertyList
+                    )
+                });
                 PropertyValue::Array(
                     properties
                         .into_iter()
@@ -156,16 +146,6 @@ impl ObjectService {
         };
 
         select_array_value(value, property_array_index)
-    }
-
-    fn device_protocol_revision(&self) -> Result<u8, ObjectError> {
-        unsigned_property(
-            &self.database,
-            self.database.get_device_id(),
-            PropertyIdentifier::ProtocolRevision,
-        )?
-        .try_into()
-        .map_err(|_| ObjectError::InvalidPropertyType)
     }
 
     fn properties_for(
@@ -207,8 +187,17 @@ impl ObjectService {
     }
 
     pub fn write_property(&self, request: &WritePropertyRequest) -> Result<(), ObjectError> {
-        if request.property_array_index.is_some() {
-            return Err(ObjectError::PropertyIsNotArray);
+        if let Some(index) = request.property_array_index {
+            match self.database.get_property(
+                request.object_identifier,
+                request.property_identifier.into(),
+            )? {
+                PropertyValue::Array(values) if index == 0 || (index as usize) <= values.len() => {
+                    return Err(ObjectError::OptionalFunctionalityNotSupported)
+                }
+                PropertyValue::Array(_) => return Err(ObjectError::InvalidArrayIndex),
+                _ => return Err(ObjectError::PropertyIsNotArray),
+            }
         }
 
         let (value, consumed) = crate::property::decode_property_value(&request.property_value)
@@ -272,6 +261,7 @@ pub(crate) fn object_error_codes(error: &ObjectError) -> (u32, u32) {
         ObjectError::InvalidValue(_) => (2, 37),
         ObjectError::PropertyIsNotArray => (2, 50),
         ObjectError::InvalidArrayIndex => (2, 42),
+        ObjectError::OptionalFunctionalityNotSupported => (2, 45),
         ObjectError::TypeNotSupported | ObjectError::InvalidConfiguration(_) => (1, 0),
     }
 }
@@ -337,8 +327,16 @@ mod tests {
     }
 
     #[test]
-    fn hosted_device_capabilities_follow_the_dispatcher_and_database() {
-        let service = service_with_analog_value();
+    fn hosted_device_capabilities_follow_the_device_and_database() {
+        let mut device = Device::new(1234, "Test device".to_string());
+        device.protocol_services_supported =
+            crate::object::ProtocolServicesSupported::READ_PROPERTY;
+        device.segmentation_supported = Segmentation::Receive;
+        let database = Arc::new(ObjectDatabase::new(device));
+        database
+            .add_object(Box::new(AnalogValue::new(1, "Setpoint".to_string())))
+            .unwrap();
+        let service = ObjectService::new(database);
 
         let services_value =
             read_device_property(&service, PropertyIdentifier::ProtocolServicesSupported);
@@ -352,7 +350,7 @@ mod tests {
                 .enumerate()
                 .filter_map(|(index, enabled)| enabled.then_some(index))
                 .collect::<Vec<_>>(),
-            vec![12, 14, 15, 26, 34]
+            vec![12]
         );
 
         let object_types_value =
@@ -366,13 +364,11 @@ mod tests {
 
         assert_eq!(
             read_device_property(&service, PropertyIdentifier::SegmentationSupported),
-            vec![PropertyValue::Enumerated(
-                Segmentation::NoSegmentation as u32
-            )]
+            vec![PropertyValue::Enumerated(Segmentation::Receive as u32)]
         );
         assert_eq!(
             service.i_am().unwrap().segmentation_supported,
-            Segmentation::NoSegmentation
+            Segmentation::Receive
         );
     }
 
@@ -391,6 +387,19 @@ mod tests {
                 object,
                 PropertyIdentifier::PresentValue,
                 PropertyValue::Real(22.0),
+            )
+            .unwrap();
+        assert_eq!(
+            read_device_property(&service, PropertyIdentifier::DatabaseRevision),
+            vec![PropertyValue::Unsigned(2)]
+        );
+
+        service
+            .database()
+            .set_property(
+                object,
+                PropertyIdentifier::ObjectName,
+                PropertyValue::CharacterString("Renamed setpoint".to_string()),
             )
             .unwrap();
         assert_eq!(
@@ -437,5 +446,37 @@ mod tests {
                 "missing {property:?}"
             );
         }
+    }
+
+    #[test]
+    fn indexed_writes_distinguish_arrays_from_scalar_properties() {
+        let service = service_with_analog_value();
+        let object = ObjectIdentifier::new(ObjectType::AnalogValue, 1);
+        let mut request = WritePropertyRequest::new(
+            object,
+            PropertyIdentifier::PresentValue.into(),
+            vec![0x44, 0x41, 0xA0, 0x00, 0x00],
+        );
+        request.property_array_index = Some(1);
+
+        assert!(matches!(
+            service.write_property(&request),
+            Err(ObjectError::PropertyIsNotArray)
+        ));
+
+        request.property_identifier = PropertyIdentifier::PriorityArray.into();
+        assert!(matches!(
+            service.write_property(&request),
+            Err(ObjectError::OptionalFunctionalityNotSupported)
+        ));
+        request.property_array_index = Some(17);
+        assert!(matches!(
+            service.write_property(&request),
+            Err(ObjectError::InvalidArrayIndex)
+        ));
+        assert_eq!(
+            object_error_codes(&ObjectError::OptionalFunctionalityNotSupported),
+            (2, 45)
+        );
     }
 }
