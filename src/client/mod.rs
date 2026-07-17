@@ -232,7 +232,7 @@ impl BacnetClient {
 
         // Create and send message
         let message =
-            self.create_unconfirmed_message(UnconfirmedServiceChoice::WhoIs as u8, &buffer);
+            create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &buffer, false);
         self.socket.send_to(&message, target_addr)?;
 
         // Wait for I-Am response
@@ -244,7 +244,7 @@ impl BacnetClient {
                 Ok((len, source)) => {
                     if source == target_addr {
                         if let Some(device_info) =
-                            self.parse_iam_response(&recv_buffer[..len], source)
+                            parse_iam_response(&recv_buffer[..len], source)
                         {
                             return Ok(device_info);
                         }
@@ -307,7 +307,7 @@ impl BacnetClient {
     ) -> Result<Vec<DiscoveredRouter>, ClientError> {
         self.socket.set_broadcast(true)?;
         let frame =
-            self.create_who_is_router_frame(destination_network, is_broadcast_target(target_addr));
+            create_who_is_router_frame(destination_network, is_broadcast_target(target_addr));
         self.socket.send_to(&frame, target_addr)?;
         self.collect_router_responses()
     }
@@ -339,7 +339,7 @@ impl BacnetClient {
         let mut buffer = Vec::new();
         whois.encode(&mut buffer)?;
 
-        let message = self.create_unconfirmed_frame(
+        let message = create_unconfirmed_frame(
             UnconfirmedServiceChoice::WhoIs as u8,
             &buffer,
             is_broadcast_target(target_addr),
@@ -373,7 +373,7 @@ impl BacnetClient {
         let mut service_data = Vec::new();
         whois.encode(&mut service_data)?;
 
-        let message = self.create_who_is_network_frame(destination_network, &service_data);
+        let message = create_who_is_network_frame(destination_network, &service_data);
         self.socket.send_to(&message, router_addr)?;
 
         self.collect_iam_responses()
@@ -580,116 +580,111 @@ impl BacnetClient {
         Ok(())
     }
 
-    /// Create an unconfirmed message
-    fn create_unconfirmed_message(&self, service_choice: u8, service_data: &[u8]) -> Vec<u8> {
-        self.create_unconfirmed_frame(service_choice, service_data, false)
-    }
+}
 
-    /// Build a BACnet/IP frame for an unconfirmed request.
-    ///
-    /// `broadcast` selects the frame shape as a pair, matching YABE: a broadcast carries a global-broadcast NPDU
-    ///
-    /// (DNET `0xFFFF`, hop count 255) inside an Original-Broadcast-NPDU BVLC,
-    /// while a unicast carries a plain local NPDU inside Original-Unicast-NPDU.
-    fn create_unconfirmed_frame(
-        &self,
-        service_choice: u8,
-        service_data: &[u8],
-        broadcast: bool,
-    ) -> Vec<u8> {
-        let (npdu, bvlc_function) = if broadcast {
-            (Npdu::global_broadcast(), BVLC_ORIGINAL_BROADCAST)
+/// Build a BACnet/IP frame for an unconfirmed request.
+///
+/// `broadcast` selects the frame shape as a pair, matching YABE: a broadcast carries a global-broadcast NPDU
+///
+/// (DNET `0xFFFF`, hop count 255) inside an Original-Broadcast-NPDU BVLC,
+/// while a unicast carries a plain local NPDU inside Original-Unicast-NPDU.
+#[cfg(feature = "std")]
+fn create_unconfirmed_frame(service_choice: u8, service_data: &[u8], broadcast: bool) -> Vec<u8> {
+    let (npdu, bvlc_function) = if broadcast {
+        (Npdu::global_broadcast(), BVLC_ORIGINAL_BROADCAST)
+    } else {
+        let mut npdu = Npdu::new();
+        npdu.control.expecting_reply = false;
+        npdu.control.priority = 0;
+        (npdu, BVLC_ORIGINAL_UNICAST)
+    };
+
+    create_unconfirmed_frame_with_npdu(service_choice, service_data, npdu, bvlc_function)
+}
+
+/// Build an unconfirmed BACnet/IP frame from an explicitly addressed NPDU.
+#[cfg(feature = "std")]
+fn create_unconfirmed_frame_with_npdu(
+    service_choice: u8,
+    service_data: &[u8],
+    npdu: Npdu,
+    bvlc_function: u8,
+) -> Vec<u8> {
+    let npdu_buffer = npdu.encode();
+
+    // Create unconfirmed service request APDU
+    let mut apdu = vec![0x10]; // Unconfirmed-Request PDU type
+    apdu.push(service_choice);
+    apdu.extend_from_slice(service_data);
+
+    // Combine NPDU and APDU
+    let mut message = npdu_buffer;
+    message.extend_from_slice(&apdu);
+
+    // Wrap in BVLC header for BACnet/IP
+    let mut bvlc_message = vec![0x81, bvlc_function, 0x00, 0x00];
+    bvlc_message.extend_from_slice(&message);
+
+    // Update BVLC length
+    let total_len = bvlc_message.len() as u16;
+    bvlc_message[2] = (total_len >> 8) as u8;
+    bvlc_message[3] = (total_len & 0xFF) as u8;
+
+    bvlc_message
+}
+
+/// Build a Who-Is whose NPDU destination is a broadcast on `network`.
+#[cfg(feature = "std")]
+fn create_who_is_network_frame(network: u16, service_data: &[u8]) -> Vec<u8> {
+    // The IP packet is unicast to the known router. The NPDU destination,
+    // not the BVLC function or IP address, asks the router to broadcast the
+    // Who-Is on the downstream BACnet network. An empty DADR means every
+    // station on DNET.
+    let mut npdu = Npdu::new();
+    npdu.set_destination(NetworkAddress::new(network, Vec::new()));
+    npdu.hop_count = Some(255);
+
+    create_unconfirmed_frame_with_npdu(
+        UnconfirmedServiceChoice::WhoIs as u8,
+        service_data,
+        npdu,
+        BVLC_ORIGINAL_UNICAST,
+    )
+}
+
+/// Build a Who-Is-Router-To-Network network-layer message.
+#[cfg(feature = "std")]
+fn create_who_is_router_frame(destination_network: Option<u16>, broadcast: bool) -> Vec<u8> {
+    let mut npdu = Npdu::new();
+    npdu.control.network_message = true;
+
+    let message_data = destination_network.map(|network| network.to_be_bytes().to_vec());
+    let network_message =
+        NetworkLayerMessage::new(NetworkMessageType::WhoIsRouterToNetwork, message_data);
+
+    let mut payload = npdu.encode();
+    payload.extend_from_slice(&network_message.encode());
+    wrap_bvlc(
+        if broadcast {
+            BVLC_ORIGINAL_BROADCAST
         } else {
-            let mut npdu = Npdu::new();
-            npdu.control.expecting_reply = false;
-            npdu.control.priority = 0;
-            (npdu, BVLC_ORIGINAL_UNICAST)
-        };
+            BVLC_ORIGINAL_UNICAST
+        },
+        &payload,
+    )
+}
 
-        self.create_unconfirmed_frame_with_npdu(service_choice, service_data, npdu, bvlc_function)
-    }
+#[cfg(feature = "std")]
+fn wrap_bvlc(function: u8, payload: &[u8]) -> Vec<u8> {
+    let total_len = 4 + payload.len();
+    let mut frame = Vec::with_capacity(total_len);
+    frame.extend_from_slice(&[0x81, function, (total_len >> 8) as u8, total_len as u8]);
+    frame.extend_from_slice(payload);
+    frame
+}
 
-    /// Build an unconfirmed BACnet/IP frame from an explicitly addressed NPDU.
-    fn create_unconfirmed_frame_with_npdu(
-        &self,
-        service_choice: u8,
-        service_data: &[u8],
-        npdu: Npdu,
-        bvlc_function: u8,
-    ) -> Vec<u8> {
-        let npdu_buffer = npdu.encode();
-
-        // Create unconfirmed service request APDU
-        let mut apdu = vec![0x10]; // Unconfirmed-Request PDU type
-        apdu.push(service_choice);
-        apdu.extend_from_slice(service_data);
-
-        // Combine NPDU and APDU
-        let mut message = npdu_buffer;
-        message.extend_from_slice(&apdu);
-
-        // Wrap in BVLC header for BACnet/IP
-        let mut bvlc_message = vec![0x81, bvlc_function, 0x00, 0x00];
-        bvlc_message.extend_from_slice(&message);
-
-        // Update BVLC length
-        let total_len = bvlc_message.len() as u16;
-        bvlc_message[2] = (total_len >> 8) as u8;
-        bvlc_message[3] = (total_len & 0xFF) as u8;
-
-        bvlc_message
-    }
-
-    /// Build a Who-Is whose NPDU destination is a broadcast on `network`.
-    fn create_who_is_network_frame(&self, network: u16, service_data: &[u8]) -> Vec<u8> {
-        // The IP packet is unicast to the known router. The NPDU destination,
-        // not the BVLC function or IP address, asks the router to broadcast the
-        // Who-Is on the downstream BACnet network. An empty DADR means every
-        // station on DNET.
-        let mut npdu = Npdu::new();
-        npdu.set_destination(NetworkAddress::new(network, Vec::new()));
-        npdu.hop_count = Some(255);
-
-        self.create_unconfirmed_frame_with_npdu(
-            UnconfirmedServiceChoice::WhoIs as u8,
-            service_data,
-            npdu,
-            BVLC_ORIGINAL_UNICAST,
-        )
-    }
-
-    /// Build a Who-Is-Router-To-Network network-layer message.
-    fn create_who_is_router_frame(
-        &self,
-        destination_network: Option<u16>,
-        broadcast: bool,
-    ) -> Vec<u8> {
-        let mut npdu = Npdu::new();
-        npdu.control.network_message = true;
-
-        let message_data = destination_network.map(|network| network.to_be_bytes().to_vec());
-        let network_message =
-            NetworkLayerMessage::new(NetworkMessageType::WhoIsRouterToNetwork, message_data);
-
-        let mut payload = npdu.encode();
-        payload.extend_from_slice(&network_message.encode());
-        Self::wrap_bvlc(
-            if broadcast {
-                BVLC_ORIGINAL_BROADCAST
-            } else {
-                BVLC_ORIGINAL_UNICAST
-            },
-            &payload,
-        )
-    }
-
-    fn wrap_bvlc(function: u8, payload: &[u8]) -> Vec<u8> {
-        let total_len = 4 + payload.len();
-        let mut frame = Vec::with_capacity(total_len);
-        frame.extend_from_slice(&[0x81, function, (total_len >> 8) as u8, total_len as u8]);
-        frame.extend_from_slice(payload);
-        frame
-    }
+#[cfg(feature = "std")]
+impl BacnetClient {
 
     /// Collect and de-duplicate I-Am responses until the client timeout.
     fn collect_iam_responses(&self) -> Result<Vec<DeviceInfo>, ClientError> {
@@ -701,7 +696,7 @@ impl BacnetClient {
         while start_time.elapsed() < self.timeout {
             match self.socket.recv_from(&mut recv_buffer) {
                 Ok((len, source)) => {
-                    if let Some(info) = self.parse_iam_response(&recv_buffer[..len], source) {
+                    if let Some(info) = parse_iam_response(&recv_buffer[..len], source) {
                         if seen.insert(info.device_id) {
                             devices.push(info);
                         }
@@ -731,7 +726,7 @@ impl BacnetClient {
             match self.socket.recv_from(&mut recv_buffer) {
                 Ok((len, source)) => {
                     if let Some(response) =
-                        self.parse_i_am_router_response(&recv_buffer[..len], source)
+                        parse_i_am_router_response(&recv_buffer[..len], source)
                     {
                         if let Some(existing) = routers
                             .iter_mut()
@@ -841,110 +836,109 @@ impl BacnetClient {
 
         let mut message = npdu_data;
         message.extend_from_slice(apdu_data);
-        Self::wrap_bvlc(BVLC_ORIGINAL_UNICAST, &message)
+        wrap_bvlc(BVLC_ORIGINAL_UNICAST, &message)
+    }
+}
+
+/// Parse I-Am response
+#[cfg(feature = "std")]
+fn parse_iam_response(data: &[u8], source: SocketAddr) -> Option<DeviceInfo> {
+    let frame = decode_bacnet_ip_frame(data, source)?;
+    let apdu = frame.payload;
+
+    if apdu.len() < 2 || apdu[0] != 0x10 || apdu[1] != UnconfirmedServiceChoice::IAm as u8 {
+        return None;
     }
 
-    /// Parse I-Am response
-    fn parse_iam_response(&self, data: &[u8], source: SocketAddr) -> Option<DeviceInfo> {
-        let frame = Self::decode_bacnet_ip_frame(data, source)?;
-        let apdu = frame.payload;
+    match IAmRequest::decode(&apdu[2..]) {
+        Ok(iam) => {
+            let vendor_name = crate::vendor::get_vendor_name(iam.vendor_identifier)
+                .unwrap_or("Unknown Vendor")
+                .to_string();
 
-        if apdu.len() < 2 || apdu[0] != 0x10 || apdu[1] != UnconfirmedServiceChoice::IAm as u8 {
-            return None;
+            Some(DeviceInfo {
+                device_id: iam.device_identifier.instance,
+                address: frame.source,
+                route: frame.npdu.source,
+                vendor_id: iam.vendor_identifier,
+                vendor_name,
+                max_apdu: iam.max_apdu_length_accepted,
+                segmentation: iam.segmentation_supported,
+            })
         }
+        Err(_) => None,
+    }
+}
 
-        match IAmRequest::decode(&apdu[2..]) {
-            Ok(iam) => {
-                let vendor_name = crate::vendor::get_vendor_name(iam.vendor_identifier)
-                    .unwrap_or("Unknown Vendor")
-                    .to_string();
-
-                Some(DeviceInfo {
-                    device_id: iam.device_identifier.instance,
-                    address: frame.source,
-                    route: frame.npdu.source,
-                    vendor_id: iam.vendor_identifier,
-                    vendor_name,
-                    max_apdu: iam.max_apdu_length_accepted,
-                    segmentation: iam.segmentation_supported,
-                })
-            }
-            Err(_) => None,
-        }
+#[cfg(feature = "std")]
+fn parse_i_am_router_response(data: &[u8], source: SocketAddr) -> Option<DiscoveredRouter> {
+    let frame = decode_bacnet_ip_frame(data, source)?;
+    if !frame.npdu.is_network_message() {
+        return None;
     }
 
-    fn parse_i_am_router_response(
-        &self,
-        data: &[u8],
-        source: SocketAddr,
-    ) -> Option<DiscoveredRouter> {
-        let frame = Self::decode_bacnet_ip_frame(data, source)?;
-        if !frame.npdu.is_network_message() {
-            return None;
-        }
-
-        let message = NetworkLayerMessage::decode(frame.payload).ok()?;
-        if message.message_type != NetworkMessageType::IAmRouterToNetwork {
-            return None;
-        }
-
-        let bytes = message.data().unwrap_or_default();
-        if bytes.len() % 2 != 0 {
-            return None;
-        }
-        let mut networks: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-            .collect();
-        networks.sort_unstable();
-        networks.dedup();
-
-        Some(DiscoveredRouter {
-            address: frame.source,
-            networks,
-        })
+    let message = NetworkLayerMessage::decode(frame.payload).ok()?;
+    if message.message_type != NetworkMessageType::IAmRouterToNetwork {
+        return None;
     }
 
-    fn decode_bacnet_ip_frame(
-        data: &[u8],
-        udp_source: SocketAddr,
-    ) -> Option<DecodedBacnetIpFrame<'_>> {
-        if data.len() < 6 || data[0] != 0x81 {
-            return None;
-        }
-        let bvlc_length = u16::from_be_bytes([data[2], data[3]]) as usize;
-        if data.len() != bvlc_length {
-            return None;
-        }
+    let bytes = message.data().unwrap_or_default();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut networks: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect();
+    networks.sort_unstable();
+    networks.dedup();
 
-        // Forwarded-NPDU carries the original B/IP source between the BVLC
-        // header and NPDU. Other NPDU-bearing BVLC functions start at byte 4.
-        let (npdu_start, source) = if data[1] == 0x04 {
-            if data.len() < 12 {
-                return None;
-            }
-            let source = SocketAddr::from((
-                [data[4], data[5], data[6], data[7]],
-                u16::from_be_bytes([data[8], data[9]]),
-            ));
-            (10, source)
-        } else {
-            (4, udp_source)
-        };
+    Some(DiscoveredRouter {
+        address: frame.source,
+        networks,
+    })
+}
 
-        let (npdu, npdu_len) = Npdu::decode(&data[npdu_start..]).ok()?;
-        let payload_start = npdu_start + npdu_len;
-        if payload_start > data.len() {
-            return None;
-        }
-
-        Some(DecodedBacnetIpFrame {
-            source,
-            npdu,
-            payload: &data[payload_start..],
-        })
+#[cfg(feature = "std")]
+fn decode_bacnet_ip_frame(data: &[u8], udp_source: SocketAddr) -> Option<DecodedBacnetIpFrame<'_>> {
+    if data.len() < 6 || data[0] != 0x81 {
+        return None;
+    }
+    let bvlc_length = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if data.len() != bvlc_length {
+        return None;
     }
 
+    // Forwarded-NPDU carries the original B/IP source between the BVLC
+    // header and NPDU. Other NPDU-bearing BVLC functions start at byte 4.
+    let (npdu_start, source) = if data[1] == 0x04 {
+        if data.len() < 12 {
+            return None;
+        }
+        let source = SocketAddr::from((
+            [data[4], data[5], data[6], data[7]],
+            u16::from_be_bytes([data[8], data[9]]),
+        ));
+        (10, source)
+    } else {
+        (4, udp_source)
+    };
+
+    let (npdu, npdu_len) = Npdu::decode(&data[npdu_start..]).ok()?;
+    let payload_start = npdu_start + npdu_len;
+    if payload_start > data.len() {
+        return None;
+    }
+
+    Some(DecodedBacnetIpFrame {
+        source,
+        npdu,
+        payload: &data[payload_start..],
+    })
+}
+
+#[cfg(feature = "std")]
+impl BacnetClient {
     /// Interpret a received datalink frame as a response to `expected_invoke_id`.
     ///
     /// Returns:
@@ -966,7 +960,7 @@ impl BacnetClient {
         data: &[u8],
         expected_invoke_id: u8,
     ) -> Result<Option<Vec<u8>>, ClientError> {
-        let frame = match Self::decode_bacnet_ip_frame(data, SocketAddr::from(([0, 0, 0, 0], 0))) {
+        let frame = match decode_bacnet_ip_frame(data, SocketAddr::from(([0, 0, 0, 0], 0))) {
             Some(frame) => frame,
             None => return Ok(None),
         };
@@ -1141,9 +1135,7 @@ mod tests {
         // The frame YABE sends for a global
         // Who-Is (issue #58): Original-Broadcast-NPDU BVLC around an NPDU
         // with DNET 0xFFFF, DLEN 0, hop count 255.
-        let client = test_client();
-        let frame =
-            client.create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &[], true);
+        let frame = create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &[], true);
         assert_eq!(
             frame,
             [
@@ -1156,9 +1148,7 @@ mod tests {
 
     #[test]
     fn test_unicast_whois_frame_uses_local_npdu() {
-        let client = test_client();
-        let frame =
-            client.create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &[], false);
+        let frame = create_unconfirmed_frame(UnconfirmedServiceChoice::WhoIs as u8, &[], false);
         assert_eq!(
             frame,
             [
@@ -1171,8 +1161,7 @@ mod tests {
 
     #[test]
     fn test_network_whois_unicasts_to_router_with_downstream_broadcast_npdu() {
-        let client = test_client();
-        let frame = client.create_who_is_network_frame(200, &[]);
+        let frame = create_who_is_network_frame(200, &[]);
 
         assert_eq!(
             frame,
@@ -1186,12 +1175,11 @@ mod tests {
 
     #[test]
     fn test_network_whois_preserves_device_instance_range() {
-        let client = test_client();
         let request = WhoIsRequest::for_range(100, 200);
         let mut service_data = Vec::new();
         request.encode(&mut service_data).unwrap();
 
-        let frame = client.create_who_is_network_frame(300, &service_data);
+        let frame = create_who_is_network_frame(300, &service_data);
         let (npdu, npdu_len) = Npdu::decode(&frame[4..]).unwrap();
         assert_eq!(npdu.destination, Some(NetworkAddress::new(300, Vec::new())));
 
@@ -1202,10 +1190,8 @@ mod tests {
 
     #[test]
     fn test_who_is_router_frames_encode_optional_network() {
-        let client = test_client();
-
         assert_eq!(
-            client.create_who_is_router_frame(None, true),
+            create_who_is_router_frame(None, true),
             [
                 0x81, 0x0B, 0x00, 0x07, // BVLC Original-Broadcast-NPDU
                 0x01, 0x80, // NPDU network-layer message
@@ -1213,7 +1199,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            client.create_who_is_router_frame(Some(200), false),
+            create_who_is_router_frame(Some(200), false),
             [
                 0x81, 0x0A, 0x00, 0x09, // BVLC Original-Unicast-NPDU
                 0x01, 0x80, // NPDU network-layer message
@@ -1224,7 +1210,6 @@ mod tests {
 
     #[test]
     fn test_i_am_router_response_decodes_advertised_networks() {
-        let client = test_client();
         let frame = [
             0x81, 0x0A, 0x00, 0x0B, // BVLC Original-Unicast-NPDU
             0x01, 0x80, // NPDU network-layer message
@@ -1234,7 +1219,7 @@ mod tests {
         ];
         let source = "192.0.2.10:47808".parse().unwrap();
 
-        let router = client.parse_i_am_router_response(&frame, source).unwrap();
+        let router = parse_i_am_router_response(&frame, source).unwrap();
         assert_eq!(
             router,
             DiscoveredRouter {
@@ -1246,7 +1231,6 @@ mod tests {
 
     #[test]
     fn test_routed_i_am_preserves_router_and_npdu_source() {
-        let client = test_client();
         let route = NetworkAddress::new(200, vec![5]);
         let mut npdu = Npdu::new();
         npdu.set_source(route.clone());
@@ -1262,10 +1246,10 @@ mod tests {
         let mut payload = npdu.encode();
         payload.extend_from_slice(&[0x10, UnconfirmedServiceChoice::IAm as u8]);
         payload.extend_from_slice(&service_data);
-        let frame = BacnetClient::wrap_bvlc(BVLC_ORIGINAL_UNICAST, &payload);
+        let frame = wrap_bvlc(BVLC_ORIGINAL_UNICAST, &payload);
         let router: SocketAddr = "192.0.2.10:47808".parse().unwrap();
 
-        let device = client.parse_iam_response(&frame, router).unwrap();
+        let device = parse_iam_response(&frame, router).unwrap();
         assert_eq!(device.device_id, 1234);
         assert_eq!(device.address, router);
         assert_eq!(device.route, Some(route));
