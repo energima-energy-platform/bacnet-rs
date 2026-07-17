@@ -6,7 +6,11 @@
 //! and handles BVLC, NPDU, and APDU framing.
 
 mod bip;
+mod dispatcher;
+mod error;
 mod object_service;
 
-pub use bip::{BacnetIpServer, ServerError};
+pub use bip::BacnetIpServer;
+pub use dispatcher::{ServerDispatcher, ServerResponse};
+pub use error::ServerError;
 pub use object_service::ObjectService;

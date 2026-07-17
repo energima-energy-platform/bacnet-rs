@@ -1,46 +1,15 @@
 use std::{
-    io,
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
     sync::Arc,
 };
 
-use thiserror::Error;
+use crate::{app::Apdu, network::Npdu, object::database::ObjectDatabase};
 
-use crate::{
-    app::{Apdu, ApplicationError},
-    encoding::EncodingError,
-    network::{NetworkError, Npdu},
-    object::{database::ObjectDatabase, ObjectError},
-    service::{
-        AbortReason, ConfirmedServiceChoice, ReadPropertyRequest, RejectReason,
-        UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
-    },
-};
-
-use super::ObjectService;
+use super::{ObjectService, ServerDispatcher, ServerError};
 
 const BVLC_ORIGINAL_UNICAST: u8 = 0x0A;
 const BVLC_ORIGINAL_BROADCAST: u8 = 0x0B;
 const MAX_BACNET_IP_FRAME: usize = 65_535;
-
-/// Errors returned by a hosted BACnet/IP endpoint.
-#[derive(Debug, Error)]
-pub enum ServerError {
-    #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("encoding error: {0}")]
-    Encoding(#[from] EncodingError),
-
-    #[error("application-layer error: {0}")]
-    Application(#[from] ApplicationError),
-
-    #[error("network-layer error: {0}")]
-    Network(#[from] NetworkError),
-
-    #[error("hosted object error: {0}")]
-    Object(#[from] ObjectError),
-}
 
 /// A BACnet/IP endpoint serving one hosted [`ObjectDatabase`].
 ///
@@ -49,7 +18,7 @@ pub enum ServerError {
 /// loop without creating a socket per object or remote device.
 pub struct BacnetIpServer {
     socket: UdpSocket,
-    objects: ObjectService,
+    dispatcher: ServerDispatcher,
 }
 
 impl BacnetIpServer {
@@ -64,7 +33,7 @@ impl BacnetIpServer {
     pub fn from_socket(socket: UdpSocket, database: Arc<ObjectDatabase>) -> Self {
         Self {
             socket,
-            objects: ObjectService::new(database),
+            dispatcher: ServerDispatcher::new(ObjectService::new(database)),
         }
     }
 
@@ -77,7 +46,11 @@ impl BacnetIpServer {
     }
 
     pub fn object_service(&self) -> &ObjectService {
-        &self.objects
+        self.dispatcher.object_service()
+    }
+
+    pub fn dispatcher(&self) -> &ServerDispatcher {
+        &self.dispatcher
     }
 
     /// Receive and process one UDP datagram.
@@ -100,119 +73,13 @@ impl BacnetIpServer {
         let Some((request_npdu, apdu_data)) = decode_bacnet_ip_frame(data)? else {
             return Ok(None);
         };
-        if request_npdu.is_network_message() {
+        let request_apdu = Apdu::decode(apdu_data)?;
+        let Some(response) = self.dispatcher.dispatch(&request_npdu, request_apdu)? else {
             return Ok(None);
-        }
-
-        let apdu = Apdu::decode(apdu_data)?;
-        let response = match apdu {
-            Apdu::UnconfirmedRequest {
-                service_choice: UnconfirmedServiceChoice::WhoIs,
-                service_data,
-            } => {
-                let request = if service_data.is_empty() {
-                    WhoIsRequest::new()
-                } else {
-                    WhoIsRequest::decode(&service_data)?
-                };
-                let iam = self.objects.i_am()?;
-                if !request.matches(iam.device_identifier.instance) {
-                    return Ok(None);
-                }
-
-                let mut service_data = Vec::new();
-                iam.encode(&mut service_data)?;
-                Apdu::UnconfirmedRequest {
-                    service_choice: UnconfirmedServiceChoice::IAm,
-                    service_data,
-                }
-            }
-            Apdu::ConfirmedRequest {
-                segmented: true,
-                invoke_id,
-                ..
-            } => Apdu::Abort {
-                server: true,
-                invoke_id,
-                abort_reason: u8::from(AbortReason::SegmentationNotSupported),
-            },
-            Apdu::ConfirmedRequest {
-                segmented: false,
-                invoke_id,
-                service_choice: ConfirmedServiceChoice::ReadProperty,
-                service_data,
-                ..
-            } => match ReadPropertyRequest::decode(&service_data) {
-                Ok(request) => match self.objects.read_property(&request) {
-                    Ok(response) => {
-                        let mut service_data = Vec::new();
-                        response.encode(&mut service_data)?;
-                        Apdu::ComplexAck {
-                            segmented: false,
-                            more_follows: false,
-                            invoke_id,
-                            sequence_number: None,
-                            proposed_window_size: None,
-                            service_choice: ConfirmedServiceChoice::ReadProperty,
-                            service_data,
-                        }
-                    }
-                    Err(error) => {
-                        object_error_apdu(invoke_id, ConfirmedServiceChoice::ReadProperty, error)
-                    }
-                },
-                Err(_) => Apdu::Reject {
-                    invoke_id,
-                    reject_reason: RejectReason::InvalidTag,
-                },
-            },
-            Apdu::ConfirmedRequest {
-                segmented: false,
-                invoke_id,
-                service_choice: ConfirmedServiceChoice::WriteProperty,
-                service_data,
-                ..
-            } => match WritePropertyRequest::decode(&service_data) {
-                Ok(request) => match self.objects.write_property(&request) {
-                    Ok(()) => Apdu::SimpleAck {
-                        invoke_id,
-                        service_choice: ConfirmedServiceChoice::WriteProperty as u8,
-                    },
-                    Err(error) => {
-                        object_error_apdu(invoke_id, ConfirmedServiceChoice::WriteProperty, error)
-                    }
-                },
-                Err(_) => Apdu::Reject {
-                    invoke_id,
-                    reject_reason: RejectReason::InvalidTag,
-                },
-            },
-            Apdu::ConfirmedRequest {
-                invoke_id,
-                service_choice,
-                ..
-            } => Apdu::Reject {
-                invoke_id,
-                reject_reason: if matches!(
-                    service_choice,
-                    ConfirmedServiceChoice::ReadProperty | ConfirmedServiceChoice::WriteProperty
-                ) {
-                    RejectReason::InvalidParameterDataType
-                } else {
-                    RejectReason::UnrecognizedService
-                },
-            },
-            _ => return Ok(None),
         };
 
-        let mut response_npdu = Npdu::new();
-        if let Some(source) = request_npdu.source {
-            response_npdu.set_destination(source);
-            response_npdu.hop_count = Some(255);
-        }
-
-        let mut payload = response_npdu.encode();
-        payload.extend_from_slice(&response.encode());
+        let mut payload = response.npdu.encode();
+        payload.extend_from_slice(&response.apdu.encode());
         Ok(Some(wrap_bvlc(BVLC_ORIGINAL_UNICAST, &payload)))
     }
 }
@@ -240,29 +107,6 @@ fn wrap_bvlc(function: u8, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn object_error_apdu(
-    invoke_id: u8,
-    service_choice: ConfirmedServiceChoice,
-    error: ObjectError,
-) -> Apdu {
-    let (error_class, error_code) = match error {
-        ObjectError::NotFound | ObjectError::InstanceNotFound => (1, 31),
-        ObjectError::PropertyNotFound | ObjectError::UnknownProperty => (2, 32),
-        ObjectError::PropertyNotWritable | ObjectError::WriteAccessDenied => (2, 40),
-        ObjectError::InvalidPropertyType => (2, 9),
-        ObjectError::InvalidValue(_) => (2, 37),
-        ObjectError::PropertyIsNotArray => (2, 50),
-        ObjectError::InvalidArrayIndex => (2, 42),
-        ObjectError::TypeNotSupported | ObjectError::InvalidConfiguration(_) => (1, 0),
-    };
-    Apdu::Error {
-        invoke_id,
-        service_choice,
-        error_class,
-        error_code,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{thread, time::Duration};
@@ -272,6 +116,7 @@ mod tests {
         object::{
             AnalogValue, Device, ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue,
         },
+        service::{AbortReason, ConfirmedServiceChoice},
     };
 
     use super::*;
@@ -294,7 +139,7 @@ mod tests {
         let server = BacnetIpServer::from_socket(socket, Arc::clone(&database));
 
         let server_thread = thread::spawn(move || {
-            for _ in 0..6 {
+            for _ in 0..7 {
                 assert!(server.serve_once().unwrap());
             }
         });
@@ -331,6 +176,11 @@ mod tests {
                 .unwrap(),
             vec![PropertyValue::Real(21.5)]
         );
+
+        let objects = client.read_objects_properties(address, &[object]).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].object_name.as_deref(), Some("Setpoint"));
+        assert_eq!(objects[0].present_value, Some(PropertyValue::Real(21.5)));
 
         client
             .write_property(
