@@ -1064,6 +1064,8 @@ impl TryFrom<u8> for ApplicationTag {
             10 => Ok(ApplicationTag::Date),
             11 => Ok(ApplicationTag::Time),
             12 => Ok(ApplicationTag::ObjectIdentifier),
+            13 => Ok(ApplicationTag::Reserved13),
+            14 => Ok(ApplicationTag::Reserved14),
             _ => Err(EncodingError::InvalidTag),
         }
     }
