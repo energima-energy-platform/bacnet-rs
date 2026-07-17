@@ -11,8 +11,8 @@ use crate::{
         advanced::context::{encode_closing_tag, encode_opening_tag},
         decode_context_object_id, decode_context_tag, decode_context_unsigned,
         encode_context_enumerated, encode_context_object_id, encode_context_tag,
-        encode_context_unsigned, encode_octet_string, encode_unsigned, EncodingError,
-        Result as EncodingResult,
+        encode_context_unsigned, encode_object_identifier, encode_octet_string, encode_unsigned,
+        EncodingError, Result as EncodingResult,
     },
     object::{ObjectIdentifier, PropertyIdentifier},
     property::{decode_property_value, PropertyValue},
@@ -24,6 +24,23 @@ use crate::{
 pub struct BacnetAddress {
     pub network: u16,
     pub mac_address: Vec<u8>,
+}
+
+/// One BACnetAddressBinding entry from Device_Address_Binding.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressBindingValue {
+    pub device_identifier: ObjectIdentifier,
+    pub address: BacnetAddress,
+}
+
+impl AddressBindingValue {
+    pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
+        encode_object_identifier(buffer, self.device_identifier)?;
+        encode_unsigned(buffer, self.address.network.into())?;
+        encode_octet_string(buffer, &self.address.mac_address)?;
+        Ok(())
+    }
 }
 
 /// Recipient choice used by BACnetRecipientProcess.
@@ -116,6 +133,43 @@ pub(crate) fn decode_cov_subscriptions(data: &[u8]) -> EncodingResult<Vec<Proper
         subscriptions.push(PropertyValue::CovSubscription(subscription));
     }
     Ok(subscriptions)
+}
+
+pub(crate) fn decode_address_bindings(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
+    let mut bindings = Vec::new();
+    let mut consumed = 0;
+    while consumed < data.len() {
+        let (device_identifier, length) = decode_property_value(&data[consumed..])?;
+        consumed += length;
+        let PropertyValue::ObjectIdentifier(device_identifier) = device_identifier else {
+            return Err(EncodingError::InvalidFormat(
+                "address binding device is not an object identifier".into(),
+            ));
+        };
+        let (network, length) = decode_property_value(&data[consumed..])?;
+        consumed += length;
+        let PropertyValue::Unsigned(network) = network else {
+            return Err(EncodingError::InvalidFormat(
+                "address binding network is not unsigned".into(),
+            ));
+        };
+        let network = u16::try_from(network).map_err(|_| EncodingError::ValueOutOfRange)?;
+        let (mac_address, length) = decode_property_value(&data[consumed..])?;
+        consumed += length;
+        let PropertyValue::OctetString(mac_address) = mac_address else {
+            return Err(EncodingError::InvalidFormat(
+                "address binding MAC is not an octet string".into(),
+            ));
+        };
+        bindings.push(PropertyValue::AddressBinding(AddressBindingValue {
+            device_identifier,
+            address: BacnetAddress {
+                network,
+                mac_address,
+            },
+        }));
+    }
+    Ok(bindings)
 }
 
 fn encode_recipient_process(
@@ -352,5 +406,39 @@ mod tests {
 
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn decodes_address_binding_list_and_reencodes_entries() {
+        let bindings = vec![
+            AddressBindingValue {
+                device_identifier: ObjectIdentifier::new(ObjectType::Device, 904),
+                address: BacnetAddress {
+                    network: 412,
+                    mac_address: vec![7, 34, 168, 3, 186, 192],
+                },
+            },
+            AddressBindingValue {
+                device_identifier: ObjectIdentifier::new(ObjectType::Device, 5780),
+                address: BacnetAddress {
+                    network: 0,
+                    mac_address: vec![192, 168, 34, 7, 186, 192],
+                },
+            },
+        ];
+        let mut encoded = Vec::new();
+        for binding in &bindings {
+            binding.encode(&mut encoded).unwrap();
+        }
+
+        let decoded = decode_address_bindings(&encoded).unwrap();
+
+        assert_eq!(
+            decoded,
+            bindings
+                .into_iter()
+                .map(PropertyValue::AddressBinding)
+                .collect::<Vec<_>>()
+        );
     }
 }

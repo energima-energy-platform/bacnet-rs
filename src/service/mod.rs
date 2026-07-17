@@ -1392,6 +1392,9 @@ impl PropertyResult {
             let values = if property_identifier == PropertyIdentifier::ActiveCovSubscriptions {
                 crate::property::complex::decode_cov_subscriptions(encoded_values)
                     .or_else(|_| decode_property_result_values(encoded_values))?
+            } else if property_identifier == PropertyIdentifier::DeviceAddressBinding {
+                crate::property::complex::decode_address_bindings(encoded_values)
+                    .or_else(|_| decode_property_result_values(encoded_values))?
             } else {
                 decode_property_result_values(encoded_values)?
             };

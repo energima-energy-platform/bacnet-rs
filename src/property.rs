@@ -27,7 +27,8 @@ use crate::{
 
 pub mod complex;
 pub use complex::{
-    BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient, RecipientProcess,
+    AddressBindingValue, BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient,
+    RecipientProcess,
 };
 
 /// Decoded BACnet property value
@@ -64,6 +65,8 @@ pub enum PropertyValue {
     List(Vec<PropertyValue>),
     /// BACnetCOVSubscription constructed value.
     CovSubscription(CovSubscriptionValue),
+    /// BACnetAddressBinding composite value.
+    AddressBinding(AddressBindingValue),
     /// Null value
     Null,
     /// Unknown/unsupported value type
@@ -103,6 +106,7 @@ impl PropertyValue {
             PropertyValue::Array(values) => format_collection("Array", values),
             PropertyValue::List(values) => format_collection("List", values),
             PropertyValue::CovSubscription(value) => format!("{value:?}"),
+            PropertyValue::AddressBinding(value) => format!("{value:?}"),
             PropertyValue::Null => "Null".to_string(),
             PropertyValue::Unknown(_) => "Unknown".to_string(),
         }
@@ -253,6 +257,7 @@ pub fn encode_property_value(
             }
         }
         PropertyValue::CovSubscription(value) => value.encode(buffer)?,
+        PropertyValue::AddressBinding(value) => value.encode(buffer)?,
         PropertyValue::Null => encode_application_tag(buffer, ApplicationTag::Null, 0),
         PropertyValue::Unknown(data) => buffer.extend_from_slice(data),
     }
