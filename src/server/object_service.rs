@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     object::{
-        database::ObjectDatabase, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier,
-        PropertyValue, Segmentation,
+        database::ObjectDatabase, object_types_supported_bit_string, ObjectError, ObjectIdentifier,
+        ObjectType, PropertyIdentifier, PropertyValue, ProtocolServicesSupported, Segmentation,
     },
     service::{
         IAmRequest, PropertyReference, PropertyResult, ReadAccessResult,
@@ -113,17 +113,33 @@ impl ObjectService {
         property_identifier: PropertyIdentifier,
         property_array_index: Option<u32>,
     ) -> Result<Vec<PropertyValue>, ObjectError> {
+        let is_device = object_identifier == self.database.get_device_id();
         let value = match property_identifier {
-            PropertyIdentifier::ObjectList
-                if object_identifier == self.database.get_device_id() =>
-            {
-                PropertyValue::Array(
-                    self.database
-                        .get_all_objects()
-                        .into_iter()
-                        .map(PropertyValue::ObjectIdentifier)
-                        .collect(),
+            PropertyIdentifier::ObjectList if is_device => PropertyValue::Array(
+                self.database
+                    .get_all_objects()
+                    .into_iter()
+                    .map(PropertyValue::ObjectIdentifier)
+                    .collect(),
+            ),
+            PropertyIdentifier::ProtocolServicesSupported if is_device => {
+                let protocol_revision = self.device_protocol_revision()?;
+                PropertyValue::BitString(
+                    ProtocolServicesSupported::hosted_object_services()
+                        .to_bool_vec_for_revision(protocol_revision),
                 )
+            }
+            PropertyIdentifier::ProtocolObjectTypesSupported if is_device => {
+                PropertyValue::BitString(object_types_supported_bit_string(
+                    &self.database.object_types(),
+                    self.device_protocol_revision()?,
+                ))
+            }
+            PropertyIdentifier::SegmentationSupported if is_device => {
+                PropertyValue::Enumerated(Segmentation::NoSegmentation as u32)
+            }
+            PropertyIdentifier::DatabaseRevision if is_device => {
+                PropertyValue::Unsigned(self.database.revision().into())
             }
             PropertyIdentifier::PropertyList => {
                 let properties = self.properties_for(object_identifier)?;
@@ -140,6 +156,16 @@ impl ObjectService {
         };
 
         select_array_value(value, property_array_index)
+    }
+
+    fn device_protocol_revision(&self) -> Result<u8, ObjectError> {
+        unsigned_property(
+            &self.database,
+            self.database.get_device_id(),
+            PropertyIdentifier::ProtocolRevision,
+        )?
+        .try_into()
+        .map_err(|_| ObjectError::InvalidPropertyType)
     }
 
     fn properties_for(
@@ -215,8 +241,10 @@ impl ObjectService {
         let vendor =
             unsigned_property(&self.database, device, PropertyIdentifier::VendorIdentifier)?;
         let segmentation = match self
-            .database
-            .get_property(device, PropertyIdentifier::SegmentationSupported)?
+            .read_property_values(device, PropertyIdentifier::SegmentationSupported, None)?
+            .into_iter()
+            .next()
+            .ok_or(ObjectError::InvalidPropertyType)?
         {
             PropertyValue::Enumerated(value) => Segmentation::try_from(value)?,
             _ => return Err(ObjectError::InvalidPropertyType),
@@ -276,5 +304,138 @@ fn unsigned_property(
     match database.get_property(object, property)? {
         PropertyValue::Unsigned(value) => Ok(value),
         _ => Err(ObjectError::InvalidPropertyType),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{AnalogValue, BacnetObject, Device};
+
+    fn service_with_analog_value() -> ObjectService {
+        let database = Arc::new(ObjectDatabase::new(Device::new(
+            1234,
+            "Test device".to_string(),
+        )));
+        database
+            .add_object(Box::new(AnalogValue::new(1, "Setpoint".to_string())))
+            .unwrap();
+        ObjectService::new(database)
+    }
+
+    fn read_device_property(
+        service: &ObjectService,
+        property: PropertyIdentifier,
+    ) -> Vec<PropertyValue> {
+        service
+            .read_property(&ReadPropertyRequest::new(
+                service.database().get_device_id(),
+                property,
+            ))
+            .unwrap()
+            .property_values
+    }
+
+    #[test]
+    fn hosted_device_capabilities_follow_the_dispatcher_and_database() {
+        let service = service_with_analog_value();
+
+        let services_value =
+            read_device_property(&service, PropertyIdentifier::ProtocolServicesSupported);
+        let [PropertyValue::BitString(services)] = services_value.as_slice() else {
+            panic!("expected protocol services bit string")
+        };
+        assert_eq!(services.len(), 47);
+        assert_eq!(
+            services
+                .iter()
+                .enumerate()
+                .filter_map(|(index, enabled)| enabled.then_some(index))
+                .collect::<Vec<_>>(),
+            vec![12, 14, 15, 26, 34]
+        );
+
+        let object_types_value =
+            read_device_property(&service, PropertyIdentifier::ProtocolObjectTypesSupported);
+        let [PropertyValue::BitString(object_types)] = object_types_value.as_slice() else {
+            panic!("expected protocol object types bit string")
+        };
+        assert_eq!(object_types.len(), 63);
+        assert!(object_types[u32::from(ObjectType::AnalogValue) as usize]);
+        assert!(object_types[u32::from(ObjectType::Device) as usize]);
+
+        assert_eq!(
+            read_device_property(&service, PropertyIdentifier::SegmentationSupported),
+            vec![PropertyValue::Enumerated(
+                Segmentation::NoSegmentation as u32
+            )]
+        );
+        assert_eq!(
+            service.i_am().unwrap().segmentation_supported,
+            Segmentation::NoSegmentation
+        );
+    }
+
+    #[test]
+    fn database_revision_is_maintained_by_the_hosted_database() {
+        let service = service_with_analog_value();
+        assert_eq!(
+            read_device_property(&service, PropertyIdentifier::DatabaseRevision),
+            vec![PropertyValue::Unsigned(2)]
+        );
+
+        let object = ObjectIdentifier::new(ObjectType::AnalogValue, 1);
+        service
+            .database()
+            .set_property(
+                object,
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Real(22.0),
+            )
+            .unwrap();
+        assert_eq!(
+            read_device_property(&service, PropertyIdentifier::DatabaseRevision),
+            vec![PropertyValue::Unsigned(3)]
+        );
+    }
+
+    #[test]
+    fn hosted_profile_exposes_required_device_and_analog_value_properties() {
+        let service = service_with_analog_value();
+        let device_properties = service
+            .properties_for(service.database().get_device_id())
+            .unwrap();
+        for property in [
+            PropertyIdentifier::ProtocolServicesSupported,
+            PropertyIdentifier::ProtocolObjectTypesSupported,
+            PropertyIdentifier::ObjectList,
+            PropertyIdentifier::ApduTimeout,
+            PropertyIdentifier::NumberOfApduRetries,
+            PropertyIdentifier::DeviceAddressBinding,
+            PropertyIdentifier::DatabaseRevision,
+            PropertyIdentifier::PropertyList,
+        ] {
+            assert!(
+                device_properties.contains(&property),
+                "missing {property:?}"
+            );
+        }
+
+        let analog_value = AnalogValue::new(1, "Setpoint".to_string());
+        let analog_properties = analog_value.property_list();
+        for property in [
+            PropertyIdentifier::PresentValue,
+            PropertyIdentifier::StatusFlags,
+            PropertyIdentifier::EventState,
+            PropertyIdentifier::OutOfService,
+            PropertyIdentifier::Units,
+            PropertyIdentifier::PriorityArray,
+            PropertyIdentifier::RelinquishDefault,
+        ] {
+            assert!(
+                analog_properties.contains(&property),
+                "missing {property:?}"
+            );
+        }
     }
 }

@@ -235,7 +235,23 @@ impl ObjectDatabase {
     /// Get all object identifiers in the database
     pub fn get_all_objects(&self) -> Vec<ObjectIdentifier> {
         let objects = self.objects.read().unwrap();
-        objects.keys().cloned().collect()
+        let mut identifiers: Vec<_> = objects.keys().cloned().collect();
+        identifiers
+            .sort_by_key(|identifier| (u32::from(identifier.object_type), identifier.instance));
+        identifiers
+    }
+
+    /// Get every object type that currently has at least one object.
+    pub fn object_types(&self) -> Vec<ObjectType> {
+        let type_index = self.type_index.read().unwrap();
+        let mut object_types: Vec<_> = type_index
+            .iter()
+            .filter_map(|(object_type, identifiers)| {
+                (!identifiers.is_empty()).then_some(*object_type)
+            })
+            .collect();
+        object_types.sort_by_key(|object_type| u32::from(*object_type));
+        object_types
     }
 
     /// Get object count
@@ -475,6 +491,10 @@ mod tests {
         let objects = db.get_objects_by_type(ObjectType::AnalogValue);
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0], av_id);
+        assert_eq!(
+            db.object_types(),
+            vec![ObjectType::AnalogValue, ObjectType::Device]
+        );
     }
 
     #[test]
