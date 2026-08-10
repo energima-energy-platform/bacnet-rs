@@ -356,6 +356,15 @@ pub(crate) fn write_priority_slot<T: Copy>(
         .unwrap_or(relinquish_default))
 }
 
+/// The priority level currently supplying an object's present value, counting
+/// from 1, or `None` when every slot is null and the relinquish default applies.
+pub(crate) fn effective_priority<T>(priority_array: &[Option<T>; 16]) -> Option<u8> {
+    priority_array
+        .iter()
+        .position(|slot| slot.is_some())
+        .map(|index| index as u8 + 1)
+}
+
 /// BACnet date representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Date {

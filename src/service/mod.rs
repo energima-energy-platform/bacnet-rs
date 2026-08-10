@@ -832,28 +832,19 @@ impl WritePropertyRequest {
 
     /// Encode the Write Property request
     pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
-        // Object identifier - context tag 0
-        let object_id: u32 = self.object_identifier.try_into()?;
-        buffer.push(0x0C); // Context tag 0, length 4
-        buffer.extend_from_slice(&object_id.to_be_bytes());
-
-        // Property identifier - context tag 1
+        buffer.extend_from_slice(&encode_context_object_id(self.object_identifier, 0)?);
         buffer.extend_from_slice(&encode_context_enumerated(self.property_identifier, 1)?);
 
-        // Property array index - context tag 2 (optional)
         if let Some(array_index) = self.property_array_index {
             buffer.extend_from_slice(&encode_context_unsigned(array_index, 2)?);
         }
 
-        // Property value - context tag 3 (opening tag)
-        buffer.push(0x3E); // Context tag 3, opening tag
+        encode_opening_tag(buffer, 3)?;
         buffer.extend_from_slice(&self.property_value);
-        buffer.push(0x3F); // Context tag 3, closing tag
+        encode_closing_tag(buffer, 3)?;
 
-        // Priority - context tag 4 (optional)
         if let Some(priority) = self.priority {
-            buffer.push(0x49); // Context tag 4, length 1
-            buffer.push(priority);
+            buffer.extend_from_slice(&encode_context_unsigned(priority.into(), 4)?);
         }
 
         Ok(())
@@ -861,37 +852,23 @@ impl WritePropertyRequest {
 
     /// Decode a Write Property request
     pub fn decode(data: &[u8]) -> EncodingResult<Self> {
-        let mut pos = 0;
+        let (object_identifier, mut pos) = decode_context_object_id(data, 0)?;
 
-        // Decode object identifier - context tag 0
-        if pos + 5 > data.len() || data[pos] != 0x0C {
-            return Err(crate::encoding::EncodingError::InvalidTag);
-        }
-        pos += 1;
-
-        let object_id_bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
-        let object_id = u32::from_be_bytes(object_id_bytes);
-        let object_identifier = object_id.into();
-        pos += 4;
-
-        // Decode property identifier - context tag 1
         let (property_identifier, consumed) = decode_context_enumerated(&data[pos..], 1)?;
         pos += consumed;
 
-        // Property array index - context tag 2 (optional)
-        let property_array_index = match decode_context_unsigned(&data[pos..], 2) {
-            Ok((array_index, consumed)) => {
-                pos += consumed;
-                Some(array_index)
-            }
-            Err(_) => None,
+        // The optional fields are gated on their tag being present, so that a
+        // tag that is there but malformed fails the decode instead of being
+        // indistinguishable from one that was never sent.
+        let property_array_index = if is_context_tag(&data[pos..], 2) {
+            let (array_index, consumed) = decode_context_unsigned(&data[pos..], 2)?;
+            pos += consumed;
+            Some(array_index)
+        } else {
+            None
         };
 
-        // Property value - context tag 3 (opening tag)
-        if pos >= data.len() || data[pos] != 0x3E {
-            return Err(crate::encoding::EncodingError::InvalidTag);
-        }
-        pos += 1;
+        pos += decode_opening_tag(&data[pos..], 3)?;
 
         // Find the matching closing tag without interpreting bytes inside
         // application values as context tags.
@@ -899,16 +876,12 @@ impl WritePropertyRequest {
         let value_end = find_constructed_value_end(data, pos, 3)?;
 
         let property_value = data[value_start..value_end].to_vec();
-        pos = value_end + 1;
+        pos = value_end;
+        pos += decode_closing_tag(&data[pos..], 3)?;
 
-        // Priority - context tag 4 (optional)
-        let priority = if pos < data.len() && data[pos] == 0x49 {
-            pos += 1;
-            if pos < data.len() {
-                Some(data[pos])
-            } else {
-                None
-            }
+        let priority = if is_context_tag(&data[pos..], 4) {
+            let (priority, _) = decode_context_unsigned(&data[pos..], 4)?;
+            Some(u8::try_from(priority).map_err(|_| EncodingError::ValueOutOfRange)?)
         } else {
             None
         };
@@ -1524,6 +1497,48 @@ impl SubscribeCovRequest {
     /// Both optional fields absent is the BACnet idiom for cancelling a
     /// subscription rather than creating one, so they are only written when set.
     pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
+        SubscriptionHeader {
+            subscriber_process_identifier: self.subscriber_process_identifier,
+            monitored_object_identifier: self.monitored_object_identifier,
+            issue_confirmed_notifications: self.issue_confirmed_notifications,
+            lifetime: self.lifetime,
+        }
+        .encode(buffer)
+    }
+
+    /// Decode the SubscribeCOV service data.
+    ///
+    /// A request with neither `issue_confirmed_notifications` nor `lifetime` is a
+    /// cancellation; [`Self::is_cancellation`] reports that.
+    pub fn decode(data: &[u8]) -> EncodingResult<Self> {
+        let (header, _) = SubscriptionHeader::decode(data)?;
+
+        Ok(Self {
+            subscriber_process_identifier: header.subscriber_process_identifier,
+            monitored_object_identifier: header.monitored_object_identifier,
+            issue_confirmed_notifications: header.issue_confirmed_notifications,
+            lifetime: header.lifetime,
+        })
+    }
+
+    /// Whether this request cancels an existing subscription.
+    pub fn is_cancellation(&self) -> bool {
+        self.issue_confirmed_notifications.is_none() && self.lifetime.is_none()
+    }
+}
+
+/// The fields SubscribeCOV and SubscribeCOVProperty open with: who is
+/// subscribing, to which object, and the two optional fields whose joint
+/// absence marks the request as a cancellation.
+struct SubscriptionHeader {
+    subscriber_process_identifier: u32,
+    monitored_object_identifier: ObjectIdentifier,
+    issue_confirmed_notifications: Option<bool>,
+    lifetime: Option<u32>,
+}
+
+impl SubscriptionHeader {
+    fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
         buffer.extend_from_slice(&encode_context_unsigned(
             self.subscriber_process_identifier,
             0,
@@ -1544,11 +1559,7 @@ impl SubscribeCovRequest {
         Ok(())
     }
 
-    /// Decode the SubscribeCOV service data.
-    ///
-    /// A request with neither `issue_confirmed_notifications` nor `lifetime` is a
-    /// cancellation; [`Self::is_cancellation`] reports that.
-    pub fn decode(data: &[u8]) -> EncodingResult<Self> {
+    fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
         let (subscriber_process_identifier, mut offset) = decode_context_unsigned(data, 0)?;
         let (monitored_object_identifier, consumed) = decode_context_object_id(&data[offset..], 1)?;
         offset += consumed;
@@ -1562,21 +1573,20 @@ impl SubscribeCovRequest {
 
         let mut lifetime = None;
         if is_context_tag(&data[offset..], 3) {
-            let (value, _) = decode_context_unsigned(&data[offset..], 3)?;
+            let (value, consumed) = decode_context_unsigned(&data[offset..], 3)?;
             lifetime = Some(value);
+            offset += consumed;
         }
 
-        Ok(Self {
-            subscriber_process_identifier,
-            monitored_object_identifier,
-            issue_confirmed_notifications,
-            lifetime,
-        })
-    }
-
-    /// Whether this request cancels an existing subscription.
-    pub fn is_cancellation(&self) -> bool {
-        self.issue_confirmed_notifications.is_none() && self.lifetime.is_none()
+        Ok((
+            Self {
+                subscriber_process_identifier,
+                monitored_object_identifier,
+                issue_confirmed_notifications,
+                lifetime,
+            },
+            offset,
+        ))
     }
 }
 
@@ -1628,22 +1638,13 @@ impl SubscribeCovPropertyRequest {
     /// even when cancelling, because it is part of what identifies the
     /// subscription being cancelled.
     pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
-        buffer.extend_from_slice(&encode_context_unsigned(
-            self.subscriber_process_identifier,
-            0,
-        )?);
-        buffer.extend_from_slice(&encode_context_object_id(
-            self.monitored_object_identifier,
-            1,
-        )?);
-
-        if let Some(confirmed) = self.issue_confirmed_notifications {
-            encode_context_boolean(buffer, 2, confirmed)?;
+        SubscriptionHeader {
+            subscriber_process_identifier: self.subscriber_process_identifier,
+            monitored_object_identifier: self.monitored_object_identifier,
+            issue_confirmed_notifications: self.issue_confirmed_notifications,
+            lifetime: self.lifetime,
         }
-
-        if let Some(lifetime) = self.lifetime {
-            buffer.extend_from_slice(&encode_context_unsigned(lifetime, 3)?);
-        }
+        .encode(buffer)?;
 
         encode_opening_tag(buffer, 4)?;
         self.monitored_property.encode(buffer)?;
@@ -1658,23 +1659,7 @@ impl SubscribeCovPropertyRequest {
 
     /// Decode the SubscribeCOVProperty service data.
     pub fn decode(data: &[u8]) -> EncodingResult<Self> {
-        let (subscriber_process_identifier, mut offset) = decode_context_unsigned(data, 0)?;
-        let (monitored_object_identifier, consumed) = decode_context_object_id(&data[offset..], 1)?;
-        offset += consumed;
-
-        let mut issue_confirmed_notifications = None;
-        if is_context_tag(&data[offset..], 2) {
-            let (confirmed, consumed) = decode_context_boolean(&data[offset..], 2)?;
-            issue_confirmed_notifications = Some(confirmed);
-            offset += consumed;
-        }
-
-        let mut lifetime = None;
-        if is_context_tag(&data[offset..], 3) {
-            let (value, consumed) = decode_context_unsigned(&data[offset..], 3)?;
-            lifetime = Some(value);
-            offset += consumed;
-        }
+        let (header, mut offset) = SubscriptionHeader::decode(data)?;
 
         offset += decode_opening_tag(&data[offset..], 4)?;
 
@@ -1699,10 +1684,10 @@ impl SubscribeCovPropertyRequest {
         }
 
         Ok(Self {
-            subscriber_process_identifier,
-            monitored_object_identifier,
-            issue_confirmed_notifications,
-            lifetime,
+            subscriber_process_identifier: header.subscriber_process_identifier,
+            monitored_object_identifier: header.monitored_object_identifier,
+            issue_confirmed_notifications: header.issue_confirmed_notifications,
+            lifetime: header.lifetime,
             monitored_property,
             cov_increment,
         })

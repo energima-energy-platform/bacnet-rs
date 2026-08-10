@@ -682,17 +682,102 @@ pub fn decode_character_string(data: &[u8]) -> Result<(String, usize)> {
         return Err(EncodingError::BufferUnderflow);
     }
 
-    // Skip character set encoding byte
-    let _encoding = data[consumed];
+    let character_set = CharacterSet::try_from(data[consumed])?;
     consumed += 1;
 
     let string_data = &data[consumed..consumed + length - 1];
-    let value = String::from_utf8(string_data.to_vec())
-        .map_err(|_| EncodingError::InvalidFormat("Invalid UTF-8 string".to_string()))?;
+    let value = character_set.decode(string_data)?;
 
     consumed += length - 1;
 
     Ok((value, consumed))
+}
+
+/// The character set a BACnet CharacterString declares in its first octet
+/// (clause 20.2.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CharacterSet {
+    /// UTF-8. Revisions before 135-2008 called this ANSI X3.4, whose printable
+    /// range UTF-8 reproduces exactly, so the same octet covers both.
+    Utf8 = 0,
+    /// IBM/Microsoft DBCS. The code page is carried out of band, so the octets
+    /// cannot be interpreted here.
+    Dbcs = 1,
+    /// JIS X 0208.
+    JisX0208 = 2,
+    /// ISO 10646 (UCS-4), big-endian.
+    Ucs4 = 3,
+    /// ISO 10646 (UCS-2), big-endian.
+    Ucs2 = 4,
+    /// ISO 8859-1 (Latin-1).
+    Latin1 = 5,
+}
+
+impl TryFrom<u8> for CharacterSet {
+    type Error = EncodingError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(CharacterSet::Utf8),
+            1 => Ok(CharacterSet::Dbcs),
+            2 => Ok(CharacterSet::JisX0208),
+            3 => Ok(CharacterSet::Ucs4),
+            4 => Ok(CharacterSet::Ucs2),
+            5 => Ok(CharacterSet::Latin1),
+            _ => Err(EncodingError::InvalidFormat(
+                "unknown character set".to_string(),
+            )),
+        }
+    }
+}
+
+impl CharacterSet {
+    /// Decode `data` in this character set.
+    ///
+    /// The two multi-byte sets that need external tables to interpret -- DBCS
+    /// and JIS X 0208 -- report [`EncodingError::InvalidFormat`] rather than
+    /// being reinterpreted as something they are not.
+    pub fn decode(&self, data: &[u8]) -> Result<String> {
+        match self {
+            CharacterSet::Utf8 => String::from_utf8(data.to_vec())
+                .map_err(|_| EncodingError::InvalidFormat("Invalid UTF-8 string".to_string())),
+            CharacterSet::Latin1 => Ok(data.iter().map(|&byte| byte as char).collect()),
+            CharacterSet::Ucs2 => {
+                if !data.len().is_multiple_of(2) {
+                    return Err(EncodingError::InvalidFormat(
+                        "UCS-2 string has an odd octet count".to_string(),
+                    ));
+                }
+                let units = data
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+                char::decode_utf16(units)
+                    .collect::<core::result::Result<String, _>>()
+                    .map_err(|_| {
+                        EncodingError::InvalidFormat("Invalid UCS-2 string".to_string())
+                    })
+            }
+            CharacterSet::Ucs4 => {
+                if !data.len().is_multiple_of(4) {
+                    return Err(EncodingError::InvalidFormat(
+                        "UCS-4 string is not a whole number of code points".to_string(),
+                    ));
+                }
+                data.chunks_exact(4)
+                    .map(|quad| {
+                        char::from_u32(u32::from_be_bytes([quad[0], quad[1], quad[2], quad[3]]))
+                            .ok_or_else(|| {
+                                EncodingError::InvalidFormat("Invalid UCS-4 string".to_string())
+                            })
+                    })
+                    .collect()
+            }
+            CharacterSet::Dbcs | CharacterSet::JisX0208 => Err(EncodingError::InvalidFormat(
+                "character set needs an out-of-band code page".to_string(),
+            )),
+        }
+    }
 }
 
 /// Encode a BACnet enumerated value

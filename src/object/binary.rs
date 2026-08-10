@@ -9,7 +9,7 @@ use crate::object::{
         intrinsic_get, intrinsic_property_list, intrinsic_set, status_flags_bits, AlarmEvaluation,
         AlarmTrigger, IntrinsicReporting,
     },
-    reliability::Reliability,
+    effective_priority, reliability::Reliability,
     write_priority_slot, BacnetObject, ObjectError, ObjectIdentifier, ObjectType,
     PropertyIdentifier, PropertyValue, Result,
 };
@@ -445,12 +445,7 @@ impl BinaryOutput {
 
     /// Get the effective priority level for current present value
     pub fn get_effective_priority(&self) -> Option<u8> {
-        for (i, priority_value) in self.priority_array.iter().enumerate() {
-            if priority_value.is_some() {
-                return Some((i + 1) as u8);
-            }
-        }
-        None
+        effective_priority(&self.priority_array)
     }
 }
 
