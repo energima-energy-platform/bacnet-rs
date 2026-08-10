@@ -17,7 +17,7 @@ mod error;
 mod transaction;
 
 #[cfg(feature = "async")]
-pub use async_client::AsyncBacnetClient;
+pub use async_client::{AsyncBacnetClient, CovSubscription};
 pub use config::{ClientBuilder, ClientConfig, DEFAULT_HOST, DEFAULT_TIMEOUT};
 pub use error::ClientError;
 

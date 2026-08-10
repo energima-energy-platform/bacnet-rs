@@ -24,13 +24,14 @@ use tokio::{
 use crate::{
     app::{Apdu, MaxApduSize, MaxSegments},
     datalink::bip::BACNET_IP_PORT,
-    network::Npdu,
+    network::{NetworkAddress, Npdu},
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier},
     property::{encode_property_value, PropertyValue},
     service::{
-        AbortReason, ConfirmedServiceChoice, PropertyReference, ReadAccessSpecification,
-        ReadPropertyMultipleRequest, ReadPropertyMultipleResponse, ReadPropertyRequest,
-        ReadPropertyResponse, UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
+        cov_notification::CovNotification, AbortReason, ConfirmedServiceChoice,
+        PropertyReference, ReadAccessSpecification, ReadPropertyMultipleRequest,
+        ReadPropertyMultipleResponse, ReadPropertyRequest, ReadPropertyResponse, RejectReason,
+        SubscribeCovRequest, UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
     },
 };
 
@@ -409,6 +410,108 @@ impl AsyncBacnetClient {
             .map(property_read_result)
             .collect())
     }
+
+    /// Subscribe to Change-of-Value notifications for one object.
+    ///
+    /// `subscriber_process_identifier` is echoed back on every notification, so
+    /// the endpoint can route it to this subscription rather than another one
+    /// live on the same client. Once the device's SimpleAck confirms the
+    /// subscription, notifications arrive through [`CovSubscription::recv`]. A
+    /// confirmed notification is acknowledged back to the device automatically;
+    /// the caller only ever sees the decoded value.
+    pub async fn subscribe_cov<T>(
+        &self,
+        target: T,
+        subscriber_process_identifier: u32,
+        monitored_object_identifier: ObjectIdentifier,
+        issue_confirmed_notifications: Option<bool>,
+        lifetime: Option<u32>,
+    ) -> Result<CovSubscription, ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let target = target.into();
+        let request = SubscribeCovRequest {
+            subscriber_process_identifier,
+            monitored_object_identifier,
+            issue_confirmed_notifications,
+            lifetime,
+        };
+        let mut service_data = Vec::new();
+        request.encode(&mut service_data)?;
+
+        let (sink, notifications) = mpsc::unbounded_channel();
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(EndpointCommand::SubscribeCov {
+                target: target.clone(),
+                subscriber_process_identifier,
+                service_data,
+                sink,
+                response,
+            })
+            .await
+            .map_err(|_| ClientError::EndpointClosed)?;
+        let ack = receiver.await.map_err(|_| ClientError::EndpointClosed)?;
+        ack?;
+
+        Ok(CovSubscription {
+            subscriber_process_identifier,
+            monitored_object_identifier,
+            target,
+            client: self.clone(),
+            notifications,
+        })
+    }
+}
+
+/// A live Change-of-Value subscription.
+///
+/// Notifications arrive through [`Self::recv`] until the device's subscription
+/// lifetime lapses, the connection is lost, or [`Self::unsubscribe`] cancels it
+/// explicitly. Dropping this value without unsubscribing just lets the
+/// subscription lapse on its own; nothing tells the device to stop early.
+pub struct CovSubscription {
+    subscriber_process_identifier: u32,
+    monitored_object_identifier: ObjectIdentifier,
+    target: BacnetTarget,
+    client: AsyncBacnetClient,
+    notifications: mpsc::UnboundedReceiver<CovNotification>,
+}
+
+impl CovSubscription {
+    /// The object this subscription monitors.
+    pub fn monitored_object_identifier(&self) -> ObjectIdentifier {
+        self.monitored_object_identifier
+    }
+
+    /// Wait for the next notification.
+    ///
+    /// Returns `None` once the client endpoint has shut down.
+    pub async fn recv(&mut self) -> Option<CovNotification> {
+        self.notifications.recv().await
+    }
+
+    /// Cancel the subscription with the device.
+    ///
+    /// A SubscribeCOV request with neither `issue_confirmed_notifications` nor
+    /// `lifetime` set is the BACnet idiom for cancellation.
+    pub async fn unsubscribe(self) -> Result<(), ClientError> {
+        let request = SubscribeCovRequest::new(
+            self.subscriber_process_identifier,
+            self.monitored_object_identifier,
+        );
+        let mut service_data = Vec::new();
+        request.encode(&mut service_data)?;
+        self.client
+            .send_confirmed_request(
+                &self.target,
+                ConfirmedServiceChoice::SubscribeCOV,
+                service_data,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 enum EndpointCommand {
@@ -427,6 +530,13 @@ enum EndpointCommand {
         frame: Vec<u8>,
         destination: SocketAddr,
         sink: mpsc::UnboundedSender<Result<DiscoveredRouter, ClientError>>,
+    },
+    SubscribeCov {
+        target: BacnetTarget,
+        subscriber_process_identifier: u32,
+        service_data: Vec<u8>,
+        sink: mpsc::UnboundedSender<CovNotification>,
+        response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
     },
 }
 
@@ -452,6 +562,7 @@ struct Endpoint {
     pending: HashMap<u8, PendingTransaction>,
     device_discoveries: Vec<ActiveDiscovery<DeviceInfo>>,
     router_discoveries: Vec<ActiveDiscovery<DiscoveredRouter>>,
+    cov_subscribers: HashMap<u32, mpsc::UnboundedSender<CovNotification>>,
     next_invoke_id: u8,
     timeout: Duration,
     retries: u8,
@@ -471,6 +582,7 @@ impl Endpoint {
             pending: HashMap::new(),
             device_discoveries: Vec::new(),
             router_discoveries: Vec::new(),
+            cov_subscribers: HashMap::new(),
             next_invoke_id: 0,
             timeout,
             retries,
@@ -544,6 +656,24 @@ impl Endpoint {
                 if let Some(discovery) = self.start_discovery(&frame, destination, sink).await {
                     self.router_discoveries.push(discovery);
                 }
+            }
+            EndpointCommand::SubscribeCov {
+                target,
+                subscriber_process_identifier,
+                service_data,
+                sink,
+                response,
+            } => {
+                // Registered before the request goes out, so a notification
+                // that arrives right behind the SimpleAck is never missed.
+                self.cov_subscribers.insert(subscriber_process_identifier, sink);
+                self.handle_confirmed_command(
+                    target,
+                    ConfirmedServiceChoice::SubscribeCOV,
+                    service_data,
+                    response,
+                )
+                .await;
             }
         }
     }
@@ -635,12 +765,24 @@ impl Endpoint {
                 return;
             }
 
-            // Unconfirmed-Request PDU: only I-Am matters, for device discovery.
+            // Unconfirmed-Request PDU: I-Am matters for device discovery, an
+            // UnconfirmedCOVNotification for any live subscription.
             if frame.payload.first() == Some(&0x10) {
                 if !self.device_discoveries.is_empty() {
                     if let Some(device) = parse_iam_response(data, source) {
                         for discovery in &self.device_discoveries {
                             let _ = discovery.sink.send(Ok(device.clone()));
+                        }
+                    }
+                }
+                if !self.cov_subscribers.is_empty() {
+                    if let Ok(Apdu::UnconfirmedRequest {
+                        service_choice: UnconfirmedServiceChoice::UnconfirmedCOVNotification,
+                        service_data,
+                    }) = Apdu::decode(frame.payload)
+                    {
+                        if let Ok(notification) = CovNotification::decode(&service_data) {
+                            self.dispatch_cov_notification(notification);
                         }
                     }
                 }
@@ -650,6 +792,26 @@ impl Endpoint {
             let Ok(apdu) = Apdu::decode(frame.payload) else {
                 return;
             };
+
+            // A ConfirmedCOVNotification is a confirmed *request* aimed at us,
+            // not a response to one of ours - it needs its own ack, sent back
+            // to wherever the notification actually came from.
+            if let Apdu::ConfirmedRequest {
+                invoke_id,
+                service_choice: ConfirmedServiceChoice::ConfirmedCovNotification,
+                ref service_data,
+                ..
+            } = apdu
+            {
+                self.handle_confirmed_cov_notification(
+                    invoke_id,
+                    service_data,
+                    source,
+                    frame.npdu.source.clone(),
+                );
+                return;
+            }
+
             apdu
         };
         let invoke_id = match &apdu {
@@ -709,6 +871,53 @@ impl Endpoint {
         }
     }
 
+    /// Route a decoded notification to whichever subscription asked for it.
+    ///
+    /// A subscriber_process_identifier with no matching (or already-dropped)
+    /// subscription is silently ignored - the notification simply isn't ours
+    /// to deliver anywhere.
+    fn dispatch_cov_notification(&mut self, notification: CovNotification) {
+        if let Some(sink) = self
+            .cov_subscribers
+            .get(&notification.subscriber_process_identifier)
+        {
+            let _ = sink.send(notification);
+        }
+    }
+
+    /// Decode, dispatch, and acknowledge an inbound ConfirmedCOVNotification.
+    ///
+    /// The BACnet confirmed-service contract requires a reply regardless of
+    /// whether a local subscription still matches the notification's
+    /// subscriber_process_identifier - the device only needs to know its
+    /// notification was received, not what became of it here.
+    fn handle_confirmed_cov_notification(
+        &mut self,
+        invoke_id: u8,
+        service_data: &[u8],
+        source: SocketAddr,
+        npdu_source: Option<NetworkAddress>,
+    ) {
+        let ack = match CovNotification::decode(service_data) {
+            Ok(notification) => {
+                self.dispatch_cov_notification(notification);
+                Apdu::SimpleAck {
+                    invoke_id,
+                    service_choice: ConfirmedServiceChoice::ConfirmedCovNotification as u8,
+                }
+            }
+            Err(_) => Apdu::Reject {
+                invoke_id,
+                reject_reason: RejectReason::InvalidTag,
+            },
+        };
+        let frame = build_response_frame(&ack, npdu_source);
+        // Best-effort: handle_packet is synchronous, so this can't await the
+        // socket being writable. A dropped ack just means the device may
+        // retry the notification, which the caller sees as one more delivery.
+        let _ = self.socket.try_send_to(&frame, source);
+    }
+
     fn remove_cancelled(&mut self) {
         self.pending
             .retain(|_, pending| !pending.response.is_closed());
@@ -716,6 +925,7 @@ impl Endpoint {
             .retain(|discovery| !discovery.sink.is_closed());
         self.router_discoveries
             .retain(|discovery| !discovery.sink.is_closed());
+        self.cov_subscribers.retain(|_, sink| !sink.is_closed());
     }
 
     fn fail_all<F>(&mut self, mut error: F)
@@ -768,6 +978,23 @@ fn build_confirmed_frame(
         npdu.set_destination(route.clone());
         npdu.hop_count = Some(255);
     }
+    wrap_unicast(&npdu, &apdu)
+}
+
+/// Build a reply APDU (SimpleAck/Reject/...) addressed back at `route`, the
+/// network-layer source echoed from the request that prompted it - absent for
+/// a peer on the same IP subnet, since only a routed request carries one.
+fn build_response_frame(apdu: &Apdu, route: Option<NetworkAddress>) -> Vec<u8> {
+    let mut npdu = Npdu::new();
+    if let Some(route) = route {
+        npdu.set_destination(route);
+        npdu.hop_count = Some(255);
+    }
+    wrap_unicast(&npdu, apdu)
+}
+
+/// Wrap an NPDU + APDU pair in a unicast BACnet/IP (BVLC) header.
+fn wrap_unicast(npdu: &Npdu, apdu: &Apdu) -> Vec<u8> {
     let mut payload = npdu.encode();
     payload.extend_from_slice(&apdu.encode());
     let total_length = payload.len() + 4;
