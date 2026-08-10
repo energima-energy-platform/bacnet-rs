@@ -11,36 +11,15 @@
 //! so a subscriber learns the value and its reliability in one message.
 
 use crate::encoding::{
-    advanced::context::{encode_closing_tag, encode_opening_tag},
-    decode_context_object_id, decode_context_unsigned, encode_context_enumerated,
-    encode_context_object_id, encode_context_unsigned, EncodingError, Result as EncodingResult,
+    decode_context_object_id, decode_context_unsigned, encode_closing_tag, encode_context_enumerated,
+    encode_context_object_id, encode_context_unsigned, encode_opening_tag, is_closing_tag,
+    is_context_tag, is_opening_tag, EncodingError, Result as EncodingResult,
 };
 use crate::object::{ObjectIdentifier, PropertyIdentifier};
 use crate::property::{decode_property_value, encode_property_value, PropertyValue};
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
-
-/// Whether the next tag opens constructed context `tag`.
-///
-/// `decode_tag` reports both opening and closing tags as a plain context tag, so
-/// the length-value nibble - 6 to open, 7 to close - has to be read directly.
-fn opens(data: &[u8], tag: u8) -> bool {
-    data.first() == Some(&(0x0E | (tag << 4)))
-}
-
-/// Whether the next tag closes constructed context `tag`.
-fn closes(data: &[u8], tag: u8) -> bool {
-    data.first() == Some(&(0x0F | (tag << 4)))
-}
-
-/// Whether the next tag is context `tag` carrying a primitive value.
-fn is_context(data: &[u8], tag: u8) -> bool {
-    match data.first() {
-        Some(&byte) => byte & 0x08 != 0 && byte >> 4 == tag && (byte & 0x07) < 6,
-        None => false,
-    }
-}
 
 /// One `BACnetPropertyValue` entry in a COV notification's `listOfValues`.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,14 +120,14 @@ impl CovNotification {
 
         // listOfValues [4] is constructed; its opening and closing tags bracket a
         // sequence of BACnetPropertyValue with no count to rely on.
-        if !opens(&data[offset..], 4) {
+        if !is_opening_tag(&data[offset..], 4) {
             return Err(EncodingError::InvalidTag);
         }
         offset += 1;
 
         let mut list_of_values = Vec::new();
         loop {
-            if closes(&data[offset..], 4) {
+            if is_closing_tag(&data[offset..], 4) {
                 break;
             }
 
@@ -156,20 +135,20 @@ impl CovNotification {
             offset += consumed;
 
             let mut property_array_index = None;
-            if is_context(&data[offset..], 1) {
+            if is_context_tag(&data[offset..], 1) {
                 let (index, consumed) = decode_context_unsigned(&data[offset..], 1)?;
                 property_array_index = Some(index);
                 offset += consumed;
             }
 
-            if !opens(&data[offset..], 2) {
+            if !is_opening_tag(&data[offset..], 2) {
                 return Err(EncodingError::InvalidTag);
             }
             offset += 1;
 
             let mut values = Vec::new();
             loop {
-                if closes(&data[offset..], 2) {
+                if is_closing_tag(&data[offset..], 2) {
                     offset += 1;
                     break;
                 }
@@ -179,7 +158,7 @@ impl CovNotification {
             }
 
             let mut priority = None;
-            if is_context(&data[offset..], 3) {
+            if is_context_tag(&data[offset..], 3) {
                 let (value, consumed) = decode_context_unsigned(&data[offset..], 3)?;
                 priority = Some(value);
                 offset += consumed;

@@ -390,11 +390,12 @@ generate_custom_enum!(
 }, u8, 64..=255);
 
 use crate::encoding::{
-    advanced::context::{encode_closing_tag, encode_opening_tag},
-    decode_context_enumerated, decode_context_object_id, decode_context_tag,
-    decode_context_unsigned, decode_enumerated, decode_object_identifier, decode_tag,
-    decode_unsigned, encode_context_enumerated, encode_context_object_id, encode_context_tag,
-    encode_context_unsigned, encode_enumerated, encode_object_identifier, encode_unsigned,
+    decode_closing_tag, decode_context_boolean, decode_context_enumerated,
+    decode_context_object_id, decode_context_tag, decode_context_unsigned, decode_enumerated,
+    decode_object_identifier, decode_opening_tag, decode_tag, decode_unsigned,
+    encode_closing_tag, encode_context_boolean, encode_context_enumerated,
+    encode_context_object_id, encode_context_real, encode_context_unsigned,
+    encode_enumerated, encode_object_identifier, encode_opening_tag, encode_unsigned, is_context_tag,
     BACnetTag, Result as EncodingResult,
 };
 use crate::object::{
@@ -721,30 +722,18 @@ impl ReadPropertyResponse {
             Err(_) => None,
         };
 
-        let (tag, _, consumed) = decode_tag(&data[pos..])?;
-        pos += consumed;
+        pos += decode_opening_tag(&data[pos..], 3)?;
 
         // Read through to the closing tag and decode by property, rather than
         // taking application-tagged values until something else turns up: a
         // property whose value is a constructed type -- Active_COV_Subscriptions,
         // Recipient_List, a weekly schedule -- carries no application tag at all,
         // and the older loop read it as no values followed by a stray tag.
-        let property_values = if let BACnetTag::Context(3) = tag {
-            let value_end = find_constructed_value_end(data, pos, 3)?;
-            let values = decode_values_for(property_identifier.into(), &data[pos..value_end])?;
-            pos = value_end;
-            values
-        } else {
-            return Err(EncodingError::InvalidTag);
-        };
+        let value_end = find_constructed_value_end(data, pos, 3)?;
+        let property_values = decode_values_for(property_identifier.into(), &data[pos..value_end])?;
+        pos = value_end;
 
-        let (tag, _, _) = decode_tag(&data[pos..])?;
-
-        if let BACnetTag::Context(tag) = tag {
-            if tag != 3 {
-                return Err(EncodingError::InvalidTag);
-            }
-        }
+        decode_closing_tag(&data[pos..], 3)?;
 
         Ok(ReadPropertyResponse {
             object_identifier,
@@ -948,31 +937,29 @@ fn find_constructed_value_end(
                 let (_, consumed) = decode_property_value(&data[position..])?;
                 position += consumed;
             }
-            BACnetTag::Context(tag_number) => match data[position] & 0x07 {
-                6 => {
-                    open_tags.push(tag_number);
-                    position += header_length;
+            BACnetTag::Opening(tag_number) => {
+                open_tags.push(tag_number);
+                position += header_length;
+            }
+            BACnetTag::Closing(tag_number) => {
+                if open_tags.pop() != Some(tag_number) {
+                    return Err(EncodingError::InvalidTag);
                 }
-                7 => {
-                    if open_tags.pop() != Some(tag_number) {
-                        return Err(EncodingError::InvalidTag);
-                    }
-                    if open_tags.is_empty() {
-                        return Ok(position);
-                    }
-                    position += header_length;
+                if open_tags.is_empty() {
+                    return Ok(position);
                 }
-                _ => {
-                    let end = position
-                        .checked_add(header_length)
-                        .and_then(|position| position.checked_add(length))
-                        .ok_or(EncodingError::InvalidLength)?;
-                    if end > data.len() {
-                        return Err(EncodingError::BufferUnderflow);
-                    }
-                    position = end;
+                position += header_length;
+            }
+            BACnetTag::Context(_) => {
+                let end = position
+                    .checked_add(header_length)
+                    .and_then(|position| position.checked_add(length))
+                    .ok_or(EncodingError::InvalidLength)?;
+                if end > data.len() {
+                    return Err(EncodingError::BufferUnderflow);
                 }
-            },
+                position = end;
+            }
         }
     }
 
@@ -1055,25 +1042,27 @@ fn decode_property_result_values(data: &[u8]) -> EncodingResult<Vec<PropertyValu
                 position += consumed;
                 values.push(value);
             }
-            BACnetTag::Context(tag_number) => {
-                let kind = data[position] & 0x07;
-                let end = match kind {
-                    6 => {
-                        let content_start = position
-                            .checked_add(header_length)
-                            .ok_or(EncodingError::InvalidLength)?;
-                        let closing = find_constructed_value_end(data, content_start, tag_number)?;
-                        let (_, _, closing_length) = decode_tag(&data[closing..])?;
-                        closing
-                            .checked_add(closing_length)
-                            .ok_or(EncodingError::InvalidLength)?
-                    }
-                    7 => return Err(EncodingError::InvalidTag),
-                    _ => position
-                        .checked_add(header_length)
-                        .and_then(|position| position.checked_add(length))
-                        .ok_or(EncodingError::InvalidLength)?,
-                };
+            BACnetTag::Closing(_) => return Err(EncodingError::InvalidTag),
+            BACnetTag::Opening(tag_number) => {
+                let content_start = position
+                    .checked_add(header_length)
+                    .ok_or(EncodingError::InvalidLength)?;
+                let closing = find_constructed_value_end(data, content_start, tag_number)?;
+                let (_, _, closing_length) = decode_tag(&data[closing..])?;
+                let end = closing
+                    .checked_add(closing_length)
+                    .ok_or(EncodingError::InvalidLength)?;
+                let raw = data
+                    .get(position..end)
+                    .ok_or(EncodingError::BufferUnderflow)?;
+                values.push(PropertyValue::Unknown(raw.to_vec()));
+                position = end;
+            }
+            BACnetTag::Context(_) => {
+                let end = position
+                    .checked_add(header_length)
+                    .and_then(|position| position.checked_add(length))
+                    .ok_or(EncodingError::InvalidLength)?;
                 let raw = data
                     .get(position..end)
                     .ok_or(EncodingError::BufferUnderflow)?;
@@ -1187,17 +1176,12 @@ impl ReadAccessSpecification {
 
     fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
         let (object_identifier, mut consumed) = decode_context_object_id(data, 0)?;
-        let (tag, kind, tag_length) = decode_context_tag(&data[consumed..])?;
-        if tag != 1 || kind != 6 {
-            return Err(EncodingError::InvalidTag);
-        }
-        consumed += tag_length;
+        consumed += decode_opening_tag(&data[consumed..], 1)?;
 
         let mut property_references = Vec::new();
         loop {
-            let (tag, kind, _) = decode_context_tag(&data[consumed..])?;
-            if tag == 1 && kind == 7 {
-                consumed += 1;
+            if let Ok(closing) = decode_closing_tag(&data[consumed..], 1) {
+                consumed += closing;
                 break;
             }
 
@@ -1253,8 +1237,7 @@ impl PropertyReference {
     fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
         let (property_identifier, mut consumed) = decode_context_enumerated(data, 0)?;
         let property_array_index = if consumed < data.len() {
-            let (tag, kind, _) = decode_context_tag(&data[consumed..])?;
-            if tag == 1 && kind != 7 {
+            if is_context_tag(&data[consumed..], 1) {
                 let (array_index, array_index_length) =
                     decode_context_unsigned(&data[consumed..], 1)?;
                 consumed += array_index_length;
@@ -1342,29 +1325,17 @@ impl ReadAccessResult {
         let (object_id, consumed) = decode_context_object_id(data, 0)?;
         total_consumed += consumed;
 
-        let (context_id, context_size, consumed) = decode_context_tag(&data[total_consumed..])?;
-        total_consumed += consumed;
+        total_consumed += decode_opening_tag(&data[total_consumed..], 1)?;
 
-        if context_id == 1 && context_size == 6 {
-            let (mut context_id, _, _) = decode_context_tag(&data[total_consumed..])?;
-
-            while context_id != 1 {
-                let (result, consumed) = PropertyResult::decode(&data[total_consumed..])?;
-                total_consumed += consumed;
-                results.push(result);
-
-                let (id, _, _) = decode_context_tag(&data[total_consumed..])?;
-                context_id = id;
+        loop {
+            if let Ok(closing) = decode_closing_tag(&data[total_consumed..], 1) {
+                total_consumed += closing;
+                break;
             }
 
-            let (_, _, consumed) = decode_context_tag(&data[total_consumed..])?;
+            let (result, consumed) = PropertyResult::decode(&data[total_consumed..])?;
             total_consumed += consumed;
-
-            if context_id != 1 {
-                return Err(EncodingError::InvalidTag);
-            }
-        } else {
-            return Err(EncodingError::InvalidTag);
+            results.push(result);
         }
 
         Ok((
@@ -1442,9 +1413,7 @@ impl PropertyResult {
         let property_identifier = PropertyIdentifier::from(property_identifier);
         let mut total_consumed = consumed;
 
-        let (tag, _, _) = decode_tag(&bytes[total_consumed..])?;
-
-        let array_index = if let BACnetTag::Context(3) = tag {
+        let array_index = if is_context_tag(&bytes[total_consumed..], 3) {
             let (index, consumed) = decode_context_unsigned(&bytes[total_consumed..], 3)?;
             total_consumed += consumed;
             Some(index)
@@ -1455,32 +1424,27 @@ impl PropertyResult {
         let (tag, _, consumed) = decode_tag(&bytes[total_consumed..])?;
         total_consumed += consumed;
 
-        let value = if let BACnetTag::Context(4) = tag {
-            let value_end = find_constructed_value_end(bytes, total_consumed, 4)?;
-            let encoded_values = &bytes[total_consumed..value_end];
-            let values = decode_values_for(property_identifier, encoded_values)?;
-            total_consumed = value_end;
-            PropertyResultValue::Value(values)
-        } else if let BACnetTag::Context(5) = tag {
-            let (error_class, consumed) = decode_enumerated(&bytes[total_consumed..])?;
-            total_consumed += consumed;
-            let (error_code, consumed) = decode_enumerated(&bytes[total_consumed..])?;
-            total_consumed += consumed;
-            PropertyResultValue::Error(error_class, error_code)
-        } else {
-            return Err(EncodingError::InvalidTag);
+        // The value and the error form are alternatives, each bracketed by its
+        // own tag, so the closing tag has to match whichever one opened.
+        let (value, opened) = match tag {
+            BACnetTag::Opening(4) => {
+                let value_end = find_constructed_value_end(bytes, total_consumed, 4)?;
+                let encoded_values = &bytes[total_consumed..value_end];
+                let values = decode_values_for(property_identifier, encoded_values)?;
+                total_consumed = value_end;
+                (PropertyResultValue::Value(values), 4)
+            }
+            BACnetTag::Opening(5) => {
+                let (error_class, consumed) = decode_enumerated(&bytes[total_consumed..])?;
+                total_consumed += consumed;
+                let (error_code, consumed) = decode_enumerated(&bytes[total_consumed..])?;
+                total_consumed += consumed;
+                (PropertyResultValue::Error(error_class, error_code), 5)
+            }
+            _ => return Err(EncodingError::InvalidTag),
         };
 
-        let (tag, _, consumed) = decode_tag(&bytes[total_consumed..])?;
-        total_consumed += consumed;
-
-        if let BACnetTag::Context(tag) = tag {
-            if tag != 4 && tag != 5 {
-                return Err(EncodingError::InvalidTag);
-            }
-        } else {
-            return Err(EncodingError::InvalidTag);
-        }
+        total_consumed += decode_closing_tag(&bytes[total_consumed..], opened)?;
 
         Ok((
             Self {
@@ -1570,10 +1534,7 @@ impl SubscribeCovRequest {
         )?);
 
         if let Some(confirmed) = self.issue_confirmed_notifications {
-            // A context-tagged BOOLEAN carries its value in a one-byte payload,
-            // unlike the application form where the length field holds it.
-            buffer.push(0x29);
-            buffer.push(u8::from(confirmed));
+            encode_context_boolean(buffer, 2, confirmed)?;
         }
 
         if let Some(lifetime) = self.lifetime {
@@ -1593,17 +1554,14 @@ impl SubscribeCovRequest {
         offset += consumed;
 
         let mut issue_confirmed_notifications = None;
-        if data.get(offset).map(|byte| byte >> 4) == Some(2) {
-            let length = (data[offset] & 0x07) as usize;
-            if length != 1 || data.len() <= offset + 1 {
-                return Err(EncodingError::InvalidTag);
-            }
-            issue_confirmed_notifications = Some(data[offset + 1] != 0);
-            offset += 2;
+        if is_context_tag(&data[offset..], 2) {
+            let (confirmed, consumed) = decode_context_boolean(&data[offset..], 2)?;
+            issue_confirmed_notifications = Some(confirmed);
+            offset += consumed;
         }
 
         let mut lifetime = None;
-        if data.get(offset).map(|byte| byte >> 4) == Some(3) {
+        if is_context_tag(&data[offset..], 3) {
             let (value, _) = decode_context_unsigned(&data[offset..], 3)?;
             lifetime = Some(value);
         }
@@ -1680,8 +1638,7 @@ impl SubscribeCovPropertyRequest {
         )?);
 
         if let Some(confirmed) = self.issue_confirmed_notifications {
-            buffer.push(0x29);
-            buffer.push(u8::from(confirmed));
+            encode_context_boolean(buffer, 2, confirmed)?;
         }
 
         if let Some(lifetime) = self.lifetime {
@@ -1693,8 +1650,7 @@ impl SubscribeCovPropertyRequest {
         encode_closing_tag(buffer, 4)?;
 
         if let Some(increment) = self.cov_increment {
-            encode_context_tag(buffer, 5, 4)?;
-            buffer.extend_from_slice(&increment.to_be_bytes());
+            encode_context_real(buffer, 5, increment)?;
         }
 
         Ok(())
@@ -1707,36 +1663,25 @@ impl SubscribeCovPropertyRequest {
         offset += consumed;
 
         let mut issue_confirmed_notifications = None;
-        if data.get(offset).map(|byte| byte >> 4) == Some(2) {
-            let length = (data[offset] & 0x07) as usize;
-            if length != 1 || data.len() <= offset + 1 {
-                return Err(EncodingError::InvalidTag);
-            }
-            issue_confirmed_notifications = Some(data[offset + 1] != 0);
-            offset += 2;
+        if is_context_tag(&data[offset..], 2) {
+            let (confirmed, consumed) = decode_context_boolean(&data[offset..], 2)?;
+            issue_confirmed_notifications = Some(confirmed);
+            offset += consumed;
         }
 
         let mut lifetime = None;
-        if data.get(offset).map(|byte| byte >> 4) == Some(3) {
+        if is_context_tag(&data[offset..], 3) {
             let (value, consumed) = decode_context_unsigned(&data[offset..], 3)?;
             lifetime = Some(value);
             offset += consumed;
         }
 
-        let (tag, kind, tag_length) = decode_context_tag(&data[offset..])?;
-        if tag != 4 || kind != 6 {
-            return Err(EncodingError::InvalidTag);
-        }
-        offset += tag_length;
+        offset += decode_opening_tag(&data[offset..], 4)?;
 
         let (monitored_property, consumed) = PropertyReference::decode(&data[offset..])?;
         offset += consumed;
 
-        let (tag, kind, _) = decode_context_tag(&data[offset..])?;
-        if tag != 4 || kind != 7 {
-            return Err(EncodingError::InvalidTag);
-        }
-        offset += 1;
+        offset += decode_closing_tag(&data[offset..], 4)?;
 
         let mut cov_increment = None;
         if offset < data.len() {

@@ -10,7 +10,7 @@
 //! out-of-range and change-of-reliability.
 
 use crate::encoding::{
-    advanced::context::{encode_closing_tag, encode_opening_tag},
+    encode_closing_tag, encode_opening_tag,
     encode_context_enumerated, encode_context_object_id, encode_context_tag,
     encode_context_unsigned, Result as EncodingResult,
 };

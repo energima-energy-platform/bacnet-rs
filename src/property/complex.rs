@@ -9,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     encoding::{
         advanced::bitstring::encode_bit_string,
-        advanced::context::{encode_closing_tag, encode_opening_tag},
-        decode_context_object_id, decode_context_tag, decode_context_unsigned, decode_date,
-        encode_boolean, encode_context_enumerated, encode_context_object_id, encode_context_tag,
+        decode_closing_tag, decode_context_boolean, decode_context_object_id, decode_context_real,
+        decode_context_tag, decode_context_unsigned,
+        decode_date, decode_opening_tag, decode_tag, is_closing_tag, encode_boolean, encode_closing_tag,
+        encode_context_boolean, encode_context_enumerated, encode_context_object_id,
+        encode_context_real, encode_context_tag,
         encode_context_unsigned, encode_date, encode_object_identifier, encode_octet_string,
-        encode_time, encode_unsigned, EncodingError, Result as EncodingResult,
+        encode_opening_tag, encode_time, encode_unsigned, BACnetTag, EncodingError,
+        Result as EncodingResult,
     },
     object::{ObjectIdentifier, PropertyIdentifier},
     property::{decode_property_value, PropertyValue},
@@ -194,10 +197,10 @@ impl DailyScheduleValue {
     }
 
     pub fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
-        let mut consumed = expect_constructed_tag(data, 0, 6)?;
+        let mut consumed = decode_opening_tag(data, 0)?;
         let (time_values, length) = decode_time_values(&data[consumed..], 0)?;
         consumed += length;
-        consumed += expect_constructed_tag(&data[consumed..], 0, 7)?;
+        consumed += decode_closing_tag(&data[consumed..], 0)?;
         Ok((Self { time_values }, consumed))
     }
 }
@@ -246,19 +249,19 @@ impl CalendarEntryValue {
     }
 
     pub fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
-        let (tag, kind, header) = decode_context_tag(data)?;
-        match (tag, kind) {
-            (0, 4) => {
+        let (tag, length, header) = decode_tag(data)?;
+        match tag {
+            BACnetTag::Context(0) if length == 4 => {
                 let ((year, month, day, weekday), consumed) = decode_context_date(data, 0)?;
                 Ok((Self::Date(year, month, day, weekday), consumed))
             }
-            (1, 6) => {
+            BACnetTag::Opening(1) => {
                 let (range, length) = DateRangeValue::decode(&data[header..])?;
                 let mut consumed = header + length;
-                consumed += expect_constructed_tag(&data[consumed..], 1, 7)?;
+                consumed += decode_closing_tag(&data[consumed..], 1)?;
                 Ok((Self::DateRange(range), consumed))
             }
-            (2, 3) => {
+            BACnetTag::Context(2) if length == 3 => {
                 let week = data
                     .get(header..header + 3)
                     .ok_or(EncodingError::BufferUnderflow)?;
@@ -310,25 +313,25 @@ impl SpecialEventValue {
     }
 
     pub fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
-        let (tag, kind, header) = decode_context_tag(data)?;
-        let (period, mut consumed) = match (tag, kind) {
-            (0, 6) => {
+        let (tag, length, header) = decode_tag(data)?;
+        let (period, mut consumed) = match tag {
+            BACnetTag::Opening(0) => {
                 let (entry, length) = CalendarEntryValue::decode(&data[header..])?;
                 let mut consumed = header + length;
-                consumed += expect_constructed_tag(&data[consumed..], 0, 7)?;
+                consumed += decode_closing_tag(&data[consumed..], 0)?;
                 (SpecialEventPeriod::CalendarEntry(entry), consumed)
             }
-            (1, 4) => {
+            BACnetTag::Context(1) if length == 4 => {
                 let (calendar, consumed) = decode_context_object_id(data, 1)?;
                 (SpecialEventPeriod::CalendarReference(calendar), consumed)
             }
             _ => return Err(EncodingError::InvalidTag),
         };
 
-        consumed += expect_constructed_tag(&data[consumed..], 2, 6)?;
+        consumed += decode_opening_tag(&data[consumed..], 2)?;
         let (time_values, length) = decode_time_values(&data[consumed..], 2)?;
         consumed += length;
-        consumed += expect_constructed_tag(&data[consumed..], 2, 7)?;
+        consumed += decode_closing_tag(&data[consumed..], 2)?;
 
         let (priority, length) = decode_context_unsigned(&data[consumed..], 3)?;
         consumed += length;
@@ -496,9 +499,9 @@ impl TimestampValue {
     }
 
     pub fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
-        let (tag, kind, header) = decode_context_tag(data)?;
-        match (tag, kind) {
-            (0, 4) if data.len() >= header + 4 => Ok((
+        let (tag, length, header) = decode_tag(data)?;
+        match tag {
+            BACnetTag::Context(0) if length == 4 && data.len() >= header + 4 => Ok((
                 Self::Time(
                     data[header],
                     data[header + 1],
@@ -507,11 +510,11 @@ impl TimestampValue {
                 ),
                 header + 4,
             )),
-            (1, _) => {
+            BACnetTag::Context(1) => {
                 let (sequence, consumed) = decode_context_unsigned(data, 1)?;
                 Ok((Self::SequenceNumber(sequence), consumed))
             }
-            (2, 6) => {
+            BACnetTag::Opening(2) => {
                 let mut consumed = header;
                 let (date, length) = decode_property_value(&data[consumed..])?;
                 consumed += length;
@@ -523,7 +526,7 @@ impl TimestampValue {
                 let PropertyValue::Time(hour, minute, second, hundredths) = time else {
                     return Err(EncodingError::InvalidTag);
                 };
-                consumed += expect_constructed_tag(&data[consumed..], 2, 7)?;
+                consumed += decode_closing_tag(&data[consumed..], 2)?;
                 Ok((
                     Self::DateTime {
                         date: (year, month, day, weekday),
@@ -765,7 +768,7 @@ fn decode_recipient(data: &[u8]) -> EncodingResult<(Recipient, usize)> {
         let (device, consumed) = decode_context_object_id(data, 0)?;
         return Ok((Recipient::Device(device), consumed));
     }
-    let mut p = expect_constructed_tag(data, 1, 6)?;
+    let mut p = decode_opening_tag(data, 1)?;
     let (network, n) = decode_property_value(&data[p..])?;
     p += n;
     let PropertyValue::Unsigned(network) = network else {
@@ -777,7 +780,7 @@ fn decode_recipient(data: &[u8]) -> EncodingResult<(Recipient, usize)> {
     let PropertyValue::OctetString(mac_address) = mac else {
         return Err(EncodingError::InvalidTag);
     };
-    p += expect_constructed_tag(&data[p..], 1, 7)?;
+    p += decode_closing_tag(&data[p..], 1)?;
     Ok((
         Recipient::Address(BacnetAddress {
             network,
@@ -788,15 +791,15 @@ fn decode_recipient(data: &[u8]) -> EncodingResult<(Recipient, usize)> {
 }
 
 fn decode_recipient_process(data: &[u8], tag: u8) -> EncodingResult<(RecipientProcess, usize)> {
-    let mut consumed = expect_constructed_tag(data, tag, 6)?;
-    consumed += expect_constructed_tag(&data[consumed..], 0, 6)?;
+    let mut consumed = decode_opening_tag(data, tag)?;
+    consumed += decode_opening_tag(&data[consumed..], 0)?;
 
     let recipient = if context_tag_matches(&data[consumed..], 0, Some(4)) {
         let (device, length) = decode_context_object_id(&data[consumed..], 0)?;
         consumed += length;
         Recipient::Device(device)
     } else {
-        consumed += expect_constructed_tag(&data[consumed..], 1, 6)?;
+        consumed += decode_opening_tag(&data[consumed..], 1)?;
         let (network, length) = decode_property_value(&data[consumed..])?;
         consumed += length;
         let PropertyValue::Unsigned(network) = network else {
@@ -812,17 +815,17 @@ fn decode_recipient_process(data: &[u8], tag: u8) -> EncodingResult<(RecipientPr
                 "BACnetAddress MAC is not an octet string".into(),
             ));
         };
-        consumed += expect_constructed_tag(&data[consumed..], 1, 7)?;
+        consumed += decode_closing_tag(&data[consumed..], 1)?;
         Recipient::Address(BacnetAddress {
             network,
             mac_address,
         })
     };
 
-    consumed += expect_constructed_tag(&data[consumed..], 0, 7)?;
+    consumed += decode_closing_tag(&data[consumed..], 0)?;
     let (process_identifier, length) = decode_context_unsigned(&data[consumed..], 1)?;
     consumed += length;
-    consumed += expect_constructed_tag(&data[consumed..], tag, 7)?;
+    consumed += decode_closing_tag(&data[consumed..], tag)?;
 
     Ok((
         RecipientProcess {
@@ -848,49 +851,12 @@ fn decode_object_property_reference(
     data: &[u8],
     tag: u8,
 ) -> EncodingResult<(ObjectPropertyReference, usize)> {
-    let mut consumed = expect_constructed_tag(data, tag, 6)?;
+    let mut consumed = decode_opening_tag(data, tag)?;
     let (reference, length) = ObjectPropertyReference::decode(&data[consumed..])?;
     consumed += length;
-    consumed += expect_constructed_tag(&data[consumed..], tag, 7)?;
+    consumed += decode_closing_tag(&data[consumed..], tag)?;
 
     Ok((reference, consumed))
-}
-
-fn encode_context_boolean(buffer: &mut Vec<u8>, tag: u8, value: bool) -> EncodingResult<()> {
-    encode_context_tag(buffer, tag, 1)?;
-    buffer.push(u8::from(value));
-    Ok(())
-}
-
-fn decode_context_boolean(data: &[u8], tag: u8) -> EncodingResult<(bool, usize)> {
-    let (actual_tag, length, header) = decode_context_tag(data)?;
-    if actual_tag != tag || length != 1 || data.len() < header + 1 {
-        return Err(EncodingError::InvalidTag);
-    }
-    match data[header] {
-        0 => Ok((false, header + 1)),
-        1 => Ok((true, header + 1)),
-        _ => Err(EncodingError::InvalidFormat(
-            "context Boolean is not zero or one".into(),
-        )),
-    }
-}
-
-fn encode_context_real(buffer: &mut Vec<u8>, tag: u8, value: f32) -> EncodingResult<()> {
-    encode_context_tag(buffer, tag, 4)?;
-    buffer.extend_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-fn decode_context_real(data: &[u8], tag: u8) -> EncodingResult<(f32, usize)> {
-    let (actual_tag, length, header) = decode_context_tag(data)?;
-    if actual_tag != tag || length != 4 || data.len() < header + 4 {
-        return Err(EncodingError::InvalidTag);
-    }
-    Ok((
-        f32::from_be_bytes(data[header..header + 4].try_into().unwrap()),
-        header + 4,
-    ))
 }
 
 fn encode_time_values(out: &mut Vec<u8>, values: &[TimeValueValue]) -> EncodingResult<()> {
@@ -906,7 +872,7 @@ fn encode_time_values(out: &mut Vec<u8>, values: &[TimeValueValue]) -> EncodingR
 fn decode_time_values(data: &[u8], tag: u8) -> EncodingResult<(Vec<TimeValueValue>, usize)> {
     let mut time_values = Vec::new();
     let mut consumed = 0;
-    while !context_tag_matches(&data[consumed..], tag, Some(7)) {
+    while !is_closing_tag(&data[consumed..], tag) {
         let (time, length) = decode_property_value(&data[consumed..])?;
         consumed += length;
         let PropertyValue::Time(hour, minute, second, hundredths) = time else {
@@ -1023,15 +989,6 @@ fn is_leap_year(year: u16) -> bool {
     year != UNSPECIFIED_YEAR
         && year.is_multiple_of(4)
         && (!year.is_multiple_of(100) || year.is_multiple_of(400))
-}
-
-fn expect_constructed_tag(data: &[u8], tag: u8, kind: usize) -> EncodingResult<usize> {
-    let (actual_tag, actual_kind, consumed) = decode_context_tag(data)?;
-    if actual_tag == tag && actual_kind == kind {
-        Ok(consumed)
-    } else {
-        Err(EncodingError::InvalidTag)
-    }
 }
 
 fn context_tag_matches(data: &[u8], tag: u8, length: Option<usize>) -> bool {
