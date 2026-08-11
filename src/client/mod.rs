@@ -10,12 +10,16 @@
 //! interface, port, timeout, and retries. All methods return [`ClientError`] on
 //! failure.
 
+#[cfg(feature = "std")]
+pub mod address_cache;
 #[cfg(feature = "async")]
 mod async_client;
 mod config;
 mod error;
 mod transaction;
 
+#[cfg(feature = "std")]
+pub use address_cache::CachedDevice;
 #[cfg(feature = "async")]
 pub use async_client::{AsyncBacnetClient, CovSubscription};
 pub use config::{ClientBuilder, ClientConfig, DEFAULT_HOST, DEFAULT_TIMEOUT};
