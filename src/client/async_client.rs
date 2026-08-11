@@ -9,7 +9,7 @@
 //! window closes.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -461,6 +461,7 @@ impl AsyncBacnetClient {
             target,
             client: self.clone(),
             notifications,
+            carryover: VecDeque::new(),
         })
     }
 }
@@ -477,6 +478,7 @@ pub struct CovSubscription {
     target: BacnetTarget,
     client: AsyncBacnetClient,
     notifications: mpsc::UnboundedReceiver<CovNotification>,
+    carryover: VecDeque<CovNotification>,
 }
 
 impl CovSubscription {
@@ -489,7 +491,37 @@ impl CovSubscription {
     ///
     /// Returns `None` once the client endpoint has shut down.
     pub async fn recv(&mut self) -> Option<CovNotification> {
+        if let Some(notification) = self.carryover.pop_front() {
+            return Some(notification);
+        }
         self.notifications.recv().await
+    }
+
+    /// Refreshes the subscription before its lifetime lapses, re-sending
+    /// SubscribeCOV with the same identifiers so the device treats it as a
+    /// renewal rather than a competing second subscription. Anything that
+    /// arrived on the old channel during the round trip is preserved and
+    /// served before newer notifications. On error, `self` is unchanged.
+    pub async fn renew(
+        &mut self,
+        issue_confirmed_notifications: Option<bool>,
+        lifetime: Option<u32>,
+    ) -> Result<(), ClientError> {
+        let renewed = self
+            .client
+            .subscribe_cov(
+                self.target.clone(),
+                self.subscriber_process_identifier,
+                self.monitored_object_identifier,
+                issue_confirmed_notifications,
+                lifetime,
+            )
+            .await?;
+        while let Ok(notification) = self.notifications.try_recv() {
+            self.carryover.push_back(notification);
+        }
+        self.notifications = renewed.notifications;
+        Ok(())
     }
 
     /// Cancel the subscription with the device.
