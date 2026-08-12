@@ -25,7 +25,7 @@ use crate::{
     app::{Apdu, MaxApduSize, MaxSegments},
     datalink::bip::BACNET_IP_PORT,
     network::{NetworkAddress, Npdu},
-    object::{ObjectIdentifier, ObjectType, PropertyIdentifier},
+    object::{ObjectIdentifier, ObjectType, PropertyIdentifier, Segmentation},
     property::{encode_property_value, PropertyValue},
     service::{
         cov_notification::CovNotification, AbortReason, ConfirmedServiceChoice,
@@ -830,6 +830,7 @@ impl Endpoint {
             // to wherever the notification actually came from.
             if let Apdu::ConfirmedRequest {
                 invoke_id,
+                segmented,
                 service_choice: ConfirmedServiceChoice::ConfirmedCovNotification,
                 ref service_data,
                 ..
@@ -837,6 +838,7 @@ impl Endpoint {
             {
                 self.handle_confirmed_cov_notification(
                     invoke_id,
+                    segmented,
                     service_data,
                     source,
                     frame.npdu.source.clone(),
@@ -923,25 +925,39 @@ impl Endpoint {
     /// whether a local subscription still matches the notification's
     /// subscriber_process_identifier - the device only needs to know its
     /// notification was received, not what became of it here.
+    ///
+    /// A segmented notification is aborted rather than decoded: reassembly
+    /// isn't implemented, and attempting to decode one segment's worth of
+    /// bytes as a complete notification would misread it as malformed data
+    /// instead of failing honestly.
     fn handle_confirmed_cov_notification(
         &mut self,
         invoke_id: u8,
+        segmented: bool,
         service_data: &[u8],
         source: SocketAddr,
         npdu_source: Option<NetworkAddress>,
     ) {
-        let ack = match CovNotification::decode(service_data) {
-            Ok(notification) => {
-                self.dispatch_cov_notification(notification);
-                Apdu::SimpleAck {
-                    invoke_id,
-                    service_choice: ConfirmedServiceChoice::ConfirmedCovNotification as u8,
-                }
-            }
-            Err(_) => Apdu::Reject {
+        let ack = if segmented {
+            Apdu::Abort {
+                server: true,
                 invoke_id,
-                reject_reason: RejectReason::InvalidTag,
-            },
+                abort_reason: AbortReason::SegmentationNotSupported,
+            }
+        } else {
+            match CovNotification::decode(service_data) {
+                Ok(notification) => {
+                    self.dispatch_cov_notification(notification);
+                    Apdu::SimpleAck {
+                        invoke_id,
+                        service_choice: ConfirmedServiceChoice::ConfirmedCovNotification as u8,
+                    }
+                }
+                Err(_) => Apdu::Reject {
+                    invoke_id,
+                    reject_reason: RejectReason::InvalidTag,
+                },
+            }
         };
         let frame = build_response_frame(&ack, npdu_source);
         // Best-effort: handle_packet is synchronous, so this can't await the
@@ -992,12 +1008,19 @@ fn build_confirmed_frame(
     service_choice: ConfirmedServiceChoice,
     service_data: Vec<u8>,
 ) -> Vec<u8> {
+    let (max_response_size, segmented_response_accepted) = match &target.capabilities {
+        Some(caps) => (
+            MaxApduSize::at_most(caps.max_apdu),
+            matches!(caps.segmentation, Segmentation::Both | Segmentation::Transmit),
+        ),
+        None => (MaxApduSize::Up1476, true),
+    };
     let apdu = Apdu::ConfirmedRequest {
         segmented: false,
         more_follows: false,
-        segmented_response_accepted: true,
+        segmented_response_accepted,
         max_segments: MaxSegments::Unspecified,
-        max_response_size: MaxApduSize::Up1476,
+        max_response_size,
         invoke_id,
         sequence_number: None,
         proposed_window_size: None,

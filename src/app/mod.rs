@@ -217,6 +217,21 @@ impl MaxApduSize {
             MaxApduSize::Up1476 => 1476,
         }
     }
+
+    /// The largest variant that does not exceed `bytes`, floored at `Up50`.
+    pub fn at_most(bytes: u32) -> Self {
+        let bytes = bytes as usize;
+        [
+            MaxApduSize::Up1476,
+            MaxApduSize::Up1024,
+            MaxApduSize::Up480,
+            MaxApduSize::Up206,
+            MaxApduSize::Up128,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.size() <= bytes)
+        .unwrap_or(MaxApduSize::Up50)
+    }
 }
 
 /// Transaction state for confirmed services

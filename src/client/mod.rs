@@ -97,11 +97,23 @@ pub struct DiscoveredRouter {
     pub networks: Vec<u16>,
 }
 
+/// What a device declared it can handle, from its I-Am response.
+///
+/// `None` on a [`BacnetTarget`] means unknown, not "fully capable" - callers
+/// that build a target without going through [`DeviceInfo`] (a direct IP:port
+/// a human typed in, for instance) have nothing to report here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceCapabilities {
+    pub max_apdu: u32,
+    pub segmentation: Segmentation,
+}
+
 /// Physical next hop plus an optional BACnet network-layer destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacnetTarget {
     pub address: SocketAddr,
     pub route: Option<NetworkAddress>,
+    pub capabilities: Option<DeviceCapabilities>,
 }
 
 impl BacnetTarget {
@@ -109,6 +121,7 @@ impl BacnetTarget {
         Self {
             address,
             route: None,
+            capabilities: None,
         }
     }
 
@@ -116,6 +129,7 @@ impl BacnetTarget {
         Self {
             address,
             route: Some(route),
+            capabilities: None,
         }
     }
 }
@@ -131,6 +145,10 @@ impl From<&DeviceInfo> for BacnetTarget {
         Self {
             address: device.address,
             route: device.route.clone(),
+            capabilities: Some(DeviceCapabilities {
+                max_apdu: device.max_apdu,
+                segmentation: device.segmentation,
+            }),
         }
     }
 }

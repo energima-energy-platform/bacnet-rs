@@ -4,9 +4,9 @@
 
 use std::{fs, io, net::SocketAddr, path::Path};
 
-use crate::network::NetworkAddress;
+use crate::{network::NetworkAddress, object::Segmentation};
 
-use super::BacnetTarget;
+use super::{BacnetTarget, DeviceCapabilities};
 
 /// One cached device binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub struct CachedDevice {
     pub device_id: u32,
     pub target: BacnetTarget,
     pub max_apdu: u32,
+    pub segmentation: Segmentation,
 }
 
 /// Load every entry from an address-cache file.
@@ -48,6 +49,14 @@ fn parse_line(line: &str) -> Option<CachedDevice> {
     let snet: u16 = fields.next()?.parse().ok()?;
     let sadr = fields.next()?;
     let max_apdu = fields.next()?.parse().ok()?;
+    // Absent or unrecognized (an older cache, or a real bacnet-stack file,
+    // neither of which carries this column) defaults to the conservative
+    // choice - assuming less capability than a device has costs a few extra
+    // round trips, assuming more is the failure mode this exists to avoid.
+    let segmentation = fields
+        .next()
+        .map(segmentation_from_str)
+        .unwrap_or(Segmentation::NoSegmentation);
 
     let route = (snet != 0)
         .then(|| parse_hex_bytes(sadr).map(|bytes| NetworkAddress::new(snet, bytes)))
@@ -55,8 +64,16 @@ fn parse_line(line: &str) -> Option<CachedDevice> {
 
     Some(CachedDevice {
         device_id,
-        target: BacnetTarget { address, route },
+        target: BacnetTarget {
+            address,
+            route,
+            capabilities: Some(DeviceCapabilities {
+                max_apdu,
+                segmentation,
+            }),
+        },
         max_apdu,
+        segmentation,
     })
 }
 
@@ -66,9 +83,30 @@ fn format_line(device: &CachedDevice) -> String {
         None => (0, "0".to_string()),
     };
     format!(
-        "{} {} {snet} {sadr} {}",
-        device.device_id, device.target.address, device.max_apdu
+        "{} {} {snet} {sadr} {} {}",
+        device.device_id,
+        device.target.address,
+        device.max_apdu,
+        segmentation_to_str(device.segmentation)
     )
+}
+
+fn segmentation_to_str(segmentation: Segmentation) -> &'static str {
+    match segmentation {
+        Segmentation::Both => "both",
+        Segmentation::Transmit => "transmit",
+        Segmentation::Receive => "receive",
+        Segmentation::NoSegmentation => "none",
+    }
+}
+
+fn segmentation_from_str(text: &str) -> Segmentation {
+    match text {
+        "both" => Segmentation::Both,
+        "transmit" => Segmentation::Transmit,
+        "receive" => Segmentation::Receive,
+        _ => Segmentation::NoSegmentation,
+    }
 }
 
 fn parse_hex_bytes(text: &str) -> Option<Vec<u8>> {
@@ -101,8 +139,13 @@ mod tests {
             target: BacnetTarget {
                 address: "127.0.0.1:47808".parse().unwrap(),
                 route: None,
+                capabilities: Some(DeviceCapabilities {
+                    max_apdu: 1476,
+                    segmentation: Segmentation::Both,
+                }),
             },
             max_apdu: 1476,
+            segmentation: Segmentation::Both,
         }
     }
 
@@ -115,8 +158,13 @@ mod tests {
                     26001,
                     vec![0xc0, 0xa8, 0x00, 0x18, 0xba, 0xc0],
                 )),
+                capabilities: Some(DeviceCapabilities {
+                    max_apdu: 50,
+                    segmentation: Segmentation::NoSegmentation,
+                }),
             },
             max_apdu: 50,
+            segmentation: Segmentation::NoSegmentation,
         }
     }
 
@@ -132,7 +180,7 @@ mod tests {
     #[test]
     fn skips_malformed_lines_without_failing() {
         let path = std::env::temp_dir().join("bacnet_rs_address_cache_malformed.txt");
-        fs::write(&path, "not a valid line\n4001 127.0.0.1:47808 0 0 1476\n").unwrap();
+        fs::write(&path, "not a valid line\n4001 127.0.0.1:47808 0 0 1476 both\n").unwrap();
         assert_eq!(load(&path).expect("load"), vec![direct_device()]);
         let _ = fs::remove_file(&path);
     }
@@ -141,5 +189,14 @@ mod tests {
     fn a_missing_file_is_an_error_not_an_empty_cache() {
         let path = std::env::temp_dir().join("bacnet_rs_address_cache_does_not_exist.txt");
         assert!(load(&path).is_err());
+    }
+
+    #[test]
+    fn a_missing_segmentation_column_defaults_conservatively() {
+        let path = std::env::temp_dir().join("bacnet_rs_address_cache_no_segmentation_column.txt");
+        fs::write(&path, "4001 127.0.0.1:47808 0 0 1476\n").unwrap();
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded[0].segmentation, Segmentation::NoSegmentation);
+        let _ = fs::remove_file(&path);
     }
 }
