@@ -8,15 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     encoding::{
-        advanced::bitstring::encode_bit_string,
-        decode_closing_tag, decode_context_boolean, decode_context_object_id, decode_context_real,
-        decode_context_tag, decode_context_unsigned,
-        decode_date, decode_opening_tag, decode_tag, is_closing_tag, encode_boolean, encode_closing_tag,
+        advanced::bitstring::encode_bit_string, decode_closing_tag, decode_context_boolean,
+        decode_context_object_id, decode_context_real, decode_context_tag, decode_context_unsigned,
+        decode_date, decode_opening_tag, decode_tag, encode_boolean, encode_closing_tag,
         encode_context_boolean, encode_context_enumerated, encode_context_object_id,
-        encode_context_real, encode_context_tag,
-        encode_context_unsigned, encode_date, encode_object_identifier, encode_octet_string,
-        encode_opening_tag, encode_time, encode_unsigned, BACnetTag, EncodingError,
-        Result as EncodingResult,
+        encode_context_real, encode_context_tag, encode_context_unsigned, encode_date,
+        encode_object_identifier, encode_octet_string, encode_opening_tag, encode_time,
+        encode_unsigned, is_closing_tag, BACnetTag, EncodingError, Result as EncodingResult,
     },
     object::{ObjectIdentifier, PropertyIdentifier},
     property::{decode_property_value, PropertyValue},

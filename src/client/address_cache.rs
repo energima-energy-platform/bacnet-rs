@@ -180,7 +180,11 @@ mod tests {
     #[test]
     fn skips_malformed_lines_without_failing() {
         let path = std::env::temp_dir().join("bacnet_rs_address_cache_malformed.txt");
-        fs::write(&path, "not a valid line\n4001 127.0.0.1:47808 0 0 1476 both\n").unwrap();
+        fs::write(
+            &path,
+            "not a valid line\n4001 127.0.0.1:47808 0 0 1476 both\n",
+        )
+        .unwrap();
         assert_eq!(load(&path).expect("load"), vec![direct_device()]);
         let _ = fs::remove_file(&path);
     }

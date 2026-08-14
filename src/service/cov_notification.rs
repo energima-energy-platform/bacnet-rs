@@ -11,9 +11,10 @@
 //! so a subscriber learns the value and its reliability in one message.
 
 use crate::encoding::{
-    decode_context_object_id, decode_context_unsigned, encode_closing_tag, encode_context_enumerated,
-    encode_context_object_id, encode_context_unsigned, encode_opening_tag, is_closing_tag,
-    is_context_tag, is_opening_tag, EncodingError, Result as EncodingResult,
+    decode_context_object_id, decode_context_unsigned, encode_closing_tag,
+    encode_context_enumerated, encode_context_object_id, encode_context_unsigned,
+    encode_opening_tag, is_closing_tag, is_context_tag, is_opening_tag, EncodingError,
+    Result as EncodingResult,
 };
 use crate::object::{ObjectIdentifier, PropertyIdentifier};
 use crate::property::{decode_property_value, encode_property_value, PropertyValue};

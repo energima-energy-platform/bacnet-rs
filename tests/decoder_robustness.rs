@@ -5,8 +5,8 @@
 //! CharacterString may declare but that were all read as UTF-8.
 
 use bacnet_rs::encoding::{
-    encode_character_string, encode_context_unsigned, encode_real, CharacterSet,
-    decode_character_string, EncodingError,
+    decode_character_string, encode_character_string, encode_context_unsigned, encode_real,
+    CharacterSet, EncodingError,
 };
 use bacnet_rs::object::{ObjectIdentifier, ObjectType};
 use bacnet_rs::service::{SubscribeCovPropertyRequest, SubscribeCovRequest, WritePropertyRequest};
@@ -143,7 +143,10 @@ fn subscribe_cov_round_trips_through_the_shared_header() {
         assert_eq!(decoded.monitored_object_identifier, analog_value(9));
         assert_eq!(decoded.issue_confirmed_notifications, confirmed);
         assert_eq!(decoded.lifetime, lifetime);
-        assert_eq!(decoded.is_cancellation(), confirmed.is_none() && lifetime.is_none());
+        assert_eq!(
+            decoded.is_cancellation(),
+            confirmed.is_none() && lifetime.is_none()
+        );
     }
 }
 
@@ -226,7 +229,10 @@ fn a_latin1_character_string_is_not_read_as_utf8() {
 
 #[test]
 fn a_ucs4_character_string_decodes() {
-    let payload: Vec<u8> = "Ok✓".chars().flat_map(|c| (c as u32).to_be_bytes()).collect();
+    let payload: Vec<u8> = "Ok✓"
+        .chars()
+        .flat_map(|c| (c as u32).to_be_bytes())
+        .collect();
     let encoded = character_string(CharacterSet::Ucs4 as u8, &payload);
 
     let (value, _) = decode_character_string(&encoded).unwrap();

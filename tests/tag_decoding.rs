@@ -5,9 +5,10 @@
 //! tag, and tag numbers above 14 that this library could encode but not decode.
 
 use bacnet_rs::encoding::{
-    decode_application_tag, decode_closing_tag, decode_context_tag, decode_opening_tag, decode_tag,
-    decode_signed64, decode_unsigned64, encode_closing_tag, encode_context_tag, encode_opening_tag,
-    is_closing_tag, is_context_tag, is_opening_tag, ApplicationTag, BACnetTag, EncodingError,
+    decode_application_tag, decode_closing_tag, decode_context_tag, decode_opening_tag,
+    decode_signed64, decode_tag, decode_unsigned64, encode_closing_tag, encode_context_tag,
+    encode_opening_tag, is_closing_tag, is_context_tag, is_opening_tag, ApplicationTag, BACnetTag,
+    EncodingError,
 };
 
 /// An application UnsignedInt whose extended length says `length` octets follow,
@@ -25,10 +26,7 @@ fn an_unsigned_longer_than_eight_octets_is_rejected_not_fatal() {
     for length in 9..=32u8 {
         let data = application_integer(ApplicationTag::UnsignedInt as u8, length);
         assert!(
-            matches!(
-                decode_unsigned64(&data),
-                Err(EncodingError::InvalidLength)
-            ),
+            matches!(decode_unsigned64(&data), Err(EncodingError::InvalidLength)),
             "unsigned of {length} octets should be rejected, not panic"
         );
     }
@@ -82,7 +80,10 @@ fn a_negative_signed_sign_extends_at_every_width() {
         data.extend(std::iter::repeat_n(0x00, length as usize - 1));
 
         let (value, _) = decode_signed64(&data).expect("legal width");
-        assert!(value > 0, "width {length} should stay positive, got {value}");
+        assert!(
+            value > 0,
+            "width {length} should stay positive, got {value}"
+        );
     }
 }
 

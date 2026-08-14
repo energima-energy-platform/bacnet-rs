@@ -392,11 +392,10 @@ generate_custom_enum!(
 use crate::encoding::{
     decode_closing_tag, decode_context_boolean, decode_context_enumerated,
     decode_context_object_id, decode_context_tag, decode_context_unsigned, decode_enumerated,
-    decode_object_identifier, decode_opening_tag, decode_tag, decode_unsigned,
-    encode_closing_tag, encode_context_boolean, encode_context_enumerated,
-    encode_context_object_id, encode_context_real, encode_context_unsigned,
-    encode_enumerated, encode_object_identifier, encode_opening_tag, encode_unsigned, is_context_tag,
-    BACnetTag, Result as EncodingResult,
+    decode_object_identifier, decode_opening_tag, decode_tag, decode_unsigned, encode_closing_tag,
+    encode_context_boolean, encode_context_enumerated, encode_context_object_id,
+    encode_context_real, encode_context_unsigned, encode_enumerated, encode_object_identifier,
+    encode_opening_tag, encode_unsigned, is_context_tag, BACnetTag, Result as EncodingResult,
 };
 use crate::object::{
     ObjectError, ObjectIdentifier, PropertyIdentifier, PropertyValue, Segmentation,

@@ -589,7 +589,11 @@ pub fn decode_signed64(data: &[u8]) -> Result<(i64, usize)> {
 
     // Sign-extend into the unused leading octets so any width from one to eight
     // reconstructs the same way.
-    let sign_extend = if data[consumed] & 0x80 != 0 { 0xFF } else { 0x00 };
+    let sign_extend = if data[consumed] & 0x80 != 0 {
+        0xFF
+    } else {
+        0x00
+    };
     let mut bytes = [sign_extend; 8];
     bytes[8 - length..].copy_from_slice(&data[consumed..consumed + length]);
     let value = i64::from_be_bytes(bytes);
@@ -754,9 +758,7 @@ impl CharacterSet {
                     .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
                 char::decode_utf16(units)
                     .collect::<core::result::Result<String, _>>()
-                    .map_err(|_| {
-                        EncodingError::InvalidFormat("Invalid UCS-2 string".to_string())
-                    })
+                    .map_err(|_| EncodingError::InvalidFormat("Invalid UCS-2 string".to_string()))
             }
             CharacterSet::Ucs4 => {
                 if !data.len().is_multiple_of(4) {

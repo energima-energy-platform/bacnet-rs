@@ -28,10 +28,10 @@ use crate::{
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier, Segmentation},
     property::{encode_property_value, PropertyValue},
     service::{
-        cov_notification::CovNotification, AbortReason, ConfirmedServiceChoice,
-        PropertyReference, ReadAccessSpecification, ReadPropertyMultipleRequest,
-        ReadPropertyMultipleResponse, ReadPropertyRequest, ReadPropertyResponse, RejectReason,
-        SubscribeCovRequest, UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
+        cov_notification::CovNotification, AbortReason, ConfirmedServiceChoice, PropertyReference,
+        ReadAccessSpecification, ReadPropertyMultipleRequest, ReadPropertyMultipleResponse,
+        ReadPropertyRequest, ReadPropertyResponse, RejectReason, SubscribeCovRequest,
+        UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
     },
 };
 
@@ -698,7 +698,8 @@ impl Endpoint {
             } => {
                 // Registered before the request goes out, so a notification
                 // that arrives right behind the SimpleAck is never missed.
-                self.cov_subscribers.insert(subscriber_process_identifier, sink);
+                self.cov_subscribers
+                    .insert(subscriber_process_identifier, sink);
                 self.handle_confirmed_command(
                     target,
                     ConfirmedServiceChoice::SubscribeCOV,
@@ -1011,7 +1012,10 @@ fn build_confirmed_frame(
     let (max_response_size, segmented_response_accepted) = match &target.capabilities {
         Some(caps) => (
             MaxApduSize::at_most(caps.max_apdu),
-            matches!(caps.segmentation, Segmentation::Both | Segmentation::Transmit),
+            matches!(
+                caps.segmentation,
+                Segmentation::Both | Segmentation::Transmit
+            ),
         ),
         None => (MaxApduSize::Up1476, true),
     };
