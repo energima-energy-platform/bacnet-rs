@@ -1480,17 +1480,17 @@ impl SubscribeCovRequest {
     pub fn with_lifetime(
         subscriber_process_identifier: u32,
         monitored_object_identifier: ObjectIdentifier,
+        issue_confirmed_notifications: bool,
         lifetime: u32,
     ) -> Self {
         Self {
             subscriber_process_identifier,
             monitored_object_identifier,
-            issue_confirmed_notifications: None,
+            issue_confirmed_notifications: Some(issue_confirmed_notifications),
             lifetime: Some(lifetime),
         }
     }
 
-    /// Encode the Subscribe COV request
     /// Encode the SubscribeCOV service data.
     ///
     /// Both optional fields absent is the BACnet idiom for cancelling a
@@ -1695,66 +1695,6 @@ impl SubscribeCovPropertyRequest {
     /// Whether this request cancels an existing subscription.
     pub fn is_cancellation(&self) -> bool {
         self.issue_confirmed_notifications.is_none() && self.lifetime.is_none()
-    }
-}
-
-/// COV Notification request (unconfirmed service)
-#[derive(Debug, Clone)]
-pub struct CovNotificationRequest {
-    /// Subscriber process identifier
-    pub subscriber_process_identifier: u32,
-    /// Initiating device identifier
-    pub initiating_device_identifier: ObjectIdentifier,
-    /// Monitored object identifier
-    pub monitored_object_identifier: ObjectIdentifier,
-    /// Time remaining (seconds)
-    pub time_remaining: u32,
-    /// List of values (property-value pairs)
-    pub list_of_values: Vec<PropertyValue>,
-}
-
-impl CovNotificationRequest {
-    /// Create a new COV Notification request
-    pub fn new(
-        subscriber_process_identifier: u32,
-        initiating_device_identifier: ObjectIdentifier,
-        monitored_object_identifier: ObjectIdentifier,
-        time_remaining: u32,
-        list_of_values: Vec<PropertyValue>,
-    ) -> Self {
-        Self {
-            subscriber_process_identifier,
-            initiating_device_identifier,
-            monitored_object_identifier,
-            time_remaining,
-            list_of_values,
-        }
-    }
-
-    /// Encode the COV Notification request
-    pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
-        // Subscriber process identifier - context tag 0
-        buffer.push(0x09); // Context tag 0, length 1
-        buffer.push(self.subscriber_process_identifier as u8);
-
-        // Initiating device identifier - context tag 1
-        let device_id: u32 = self.initiating_device_identifier.try_into()?;
-        buffer.push(0x1C); // Context tag 1, length 4
-        buffer.extend_from_slice(&device_id.to_be_bytes());
-
-        // Monitored object identifier - context tag 2
-        let object_id: u32 = self.monitored_object_identifier.try_into()?;
-        buffer.push(0x2C); // Context tag 2, length 4
-        buffer.extend_from_slice(&object_id.to_be_bytes());
-
-        // Time remaining - context tag 3
-        buffer.push(0x39); // Context tag 3, length 1
-        buffer.push(self.time_remaining as u8);
-
-        // List of values would be encoded here in a real implementation
-        // This is complex as it involves encoding property-value pairs
-
-        Ok(())
     }
 }
 
@@ -2771,7 +2711,8 @@ mod tests {
         assert_eq!(cov_confirmed.issue_confirmed_notifications, Some(true));
 
         // Test with lifetime
-        let cov_lifetime = SubscribeCovRequest::with_lifetime(123, object_id, 3600);
+        let cov_lifetime = SubscribeCovRequest::with_lifetime(123, object_id, true, 3600);
+        assert_eq!(cov_lifetime.issue_confirmed_notifications, Some(true));
         assert_eq!(cov_lifetime.lifetime, Some(3600));
 
         // Test encoding
@@ -2891,29 +2832,6 @@ mod tests {
 
         manager.cleanup_expired();
         assert_eq!(manager.subscriptions.len(), 0);
-    }
-
-    #[test]
-    fn test_cov_notification_request() {
-        let device_id = ObjectIdentifier::new(ObjectType::Device, 1);
-        let object_id = ObjectIdentifier::new(ObjectType::AnalogInput, 1);
-        let values = vec![
-            crate::object::PropertyValue::Real(25.5), // Present Value
-            crate::object::PropertyValue::Boolean(false), // Status Flags
-        ];
-
-        let notification = CovNotificationRequest::new(123, device_id, object_id, 3600, values);
-
-        assert_eq!(notification.subscriber_process_identifier, 123);
-        assert_eq!(notification.initiating_device_identifier, device_id);
-        assert_eq!(notification.monitored_object_identifier, object_id);
-        assert_eq!(notification.time_remaining, 3600);
-        assert_eq!(notification.list_of_values.len(), 2);
-
-        // Test encoding
-        let mut buffer = Vec::new();
-        notification.encode(&mut buffer).unwrap();
-        assert!(!buffer.is_empty());
     }
 
     #[test]
