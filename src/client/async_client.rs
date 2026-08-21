@@ -419,24 +419,29 @@ impl AsyncBacnetClient {
     /// subscription, notifications arrive through [`CovSubscription::recv`]. A
     /// confirmed notification is acknowledged back to the device automatically;
     /// the caller only ever sees the decoded value.
+    ///
+    /// `lifetime` is `None` for a subscription that does not expire. The
+    /// confirmation preference is not optional: ASHRAE 135 clause 13.14.1.4
+    /// requires it whenever a lifetime is present, and a request with neither is
+    /// the cancellation form, which is [`CovSubscription::unsubscribe`]'s job.
     pub async fn subscribe_cov<T>(
         &self,
         target: T,
         subscriber_process_identifier: u32,
         monitored_object_identifier: ObjectIdentifier,
-        issue_confirmed_notifications: Option<bool>,
+        issue_confirmed_notifications: bool,
         lifetime: Option<u32>,
     ) -> Result<CovSubscription, ClientError>
     where
         T: Into<BacnetTarget>,
     {
         let target = target.into();
-        let request = SubscribeCovRequest {
+        let request = SubscribeCovRequest::subscribe(
             subscriber_process_identifier,
             monitored_object_identifier,
             issue_confirmed_notifications,
             lifetime,
-        };
+        );
         let mut service_data = Vec::new();
         request.encode(&mut service_data)?;
 
@@ -504,7 +509,7 @@ impl CovSubscription {
     /// served before newer notifications. On error, `self` is unchanged.
     pub async fn renew(
         &mut self,
-        issue_confirmed_notifications: Option<bool>,
+        issue_confirmed_notifications: bool,
         lifetime: Option<u32>,
     ) -> Result<(), ClientError> {
         let renewed = self

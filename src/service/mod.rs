@@ -1436,7 +1436,7 @@ pub enum PropertyResultValue {
 }
 
 /// Subscribe COV request (confirmed service)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeCovRequest {
     /// Subscriber process identifier
     pub subscriber_process_identifier: u32,
@@ -1473,6 +1473,27 @@ impl SubscribeCovRequest {
             monitored_object_identifier,
             issue_confirmed_notifications: Some(issue_confirmed_notifications),
             lifetime: None,
+        }
+    }
+
+    /// A subscription request, with or without an expiry.
+    ///
+    /// ASHRAE 135 clause 13.14.1.4 requires `issueConfirmedNotifications`
+    /// whenever `lifetime` is present, so this takes the flag as a plain `bool`
+    /// rather than an option: a request carrying a lifetime but no flag is
+    /// neither a valid subscription nor the cancellation form, and there is no
+    /// reason to be able to build one. Use [`Self::new`] to cancel.
+    pub fn subscribe(
+        subscriber_process_identifier: u32,
+        monitored_object_identifier: ObjectIdentifier,
+        issue_confirmed_notifications: bool,
+        lifetime: Option<u32>,
+    ) -> Self {
+        Self {
+            subscriber_process_identifier,
+            monitored_object_identifier,
+            issue_confirmed_notifications: Some(issue_confirmed_notifications),
+            lifetime,
         }
     }
 
@@ -2719,6 +2740,45 @@ mod tests {
         let mut buffer = Vec::new();
         cov_req.encode(&mut buffer).unwrap();
         assert!(!buffer.is_empty());
+    }
+
+    /// Clause 13.14.1.4 requires issueConfirmedNotifications whenever a lifetime
+    /// is present. A request carrying only the lifetime is neither a valid
+    /// subscription nor the cancellation form, so devices are free to reject it;
+    /// `subscribe` takes a plain bool so that combination cannot be expressed.
+    #[test]
+    fn subscribe_always_states_the_confirmation_flag() {
+        let object_id = ObjectIdentifier::new(ObjectType::AnalogInput, 1);
+
+        for lifetime in [None, Some(0), Some(3600)] {
+            let request = SubscribeCovRequest::subscribe(123, object_id, true, lifetime);
+            assert_eq!(
+                request.issue_confirmed_notifications,
+                Some(true),
+                "lifetime {lifetime:?}"
+            );
+            assert_eq!(request.lifetime, lifetime);
+            assert!(!request.is_cancellation(), "lifetime {lifetime:?}");
+        }
+    }
+
+    #[test]
+    fn a_subscription_and_a_cancellation_round_trip_differently() {
+        let object_id = ObjectIdentifier::new(ObjectType::AnalogInput, 1);
+        let subscribe = SubscribeCovRequest::subscribe(123, object_id, false, Some(600));
+        let cancel = SubscribeCovRequest::new(123, object_id);
+
+        for request in [&subscribe, &cancel] {
+            let mut encoded = Vec::new();
+            request.encode(&mut encoded).expect("encode");
+            assert_eq!(
+                &SubscribeCovRequest::decode(&encoded).expect("decode"),
+                request
+            );
+        }
+
+        assert!(!subscribe.is_cancellation());
+        assert!(cancel.is_cancellation());
     }
 
     fn subscribe_cov_property_request() -> SubscribeCovPropertyRequest {
