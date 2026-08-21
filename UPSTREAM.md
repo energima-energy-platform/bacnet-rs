@@ -64,7 +64,11 @@ or decline the change if the fork already covers the service.
 
 Not caused by any merge; do not treat them as merge regressions.
 
-- `transport::tests::test_timeout_tracking` — binds a fixed port, fails with
-  `AddrInUse`.
-- `cargo build --no-default-features` — 132 errors, missing `alloc` imports for
-  `vec!` and `format!` in the `no_std` configuration.
+- `cargo build --no-default-features` — around 130 errors, missing `alloc`
+  imports for `vec!` and `format!` in the `no_std` configuration. The `no_std`
+  build has not worked for some time; it is not a merge regression, so check it
+  against the pre-merge commit before blaming an integration.
+
+Tests should otherwise pass in full. If one fails after a merge, compare against
+the pre-merge commit before assuming upstream caused it — and if the failure is
+environmental rather than upstream's, fix the test.
