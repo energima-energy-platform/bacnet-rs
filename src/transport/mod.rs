@@ -1089,11 +1089,21 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn test_timeout_tracking() {
-        let config = BacnetIpConfig::default();
+        // Bind an ephemeral loopback port rather than the default, which is the
+        // registered BACnet port 47808 and so fails wherever a real BACnet
+        // service already holds it. This test only exercises invoke-id
+        // bookkeeping, so the port it lands on does not matter.
+        let config = BacnetIpConfig {
+            bind_address: "127.0.0.1:0".parse().expect("valid address"),
+            broadcast_enabled: false,
+            ..BacnetIpConfig::default()
+        };
         let mut transport = BacnetIpTransport::new(config).unwrap();
 
-        // Test invoke ID generation
-        let target = "127.0.0.1:47808".parse().unwrap();
+        // Send to a socket this test owns, so the requests do not reach a
+        // BACnet service that happens to be listening on the host.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        let target = peer.local_addr().expect("peer address");
         let data = &[0x01, 0x02, 0x03];
 
         let invoke_id1 = transport
