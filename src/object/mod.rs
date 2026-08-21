@@ -365,6 +365,125 @@ pub(crate) fn effective_priority<T>(priority_array: &[Option<T>; 16]) -> Option<
         .map(|index| index as u8 + 1)
 }
 
+/// The identity and status properties every object type with intrinsic state
+/// exposes, borrowed from whichever object is answering.
+///
+/// The analog, binary, and multi-state families each add their own properties on
+/// top — Units, Active_Text, State_Text — but they all answer these eight
+/// identically, so they answer them from here.
+pub(crate) struct CommonView<'a> {
+    pub identifier: ObjectIdentifier,
+    pub object_type: ObjectType,
+    pub object_name: &'a str,
+    pub description: &'a str,
+    pub event_state: crate::object::event_state::EventState,
+    pub reliability: crate::object::reliability::Reliability,
+    pub out_of_service: bool,
+    pub overridden: bool,
+}
+
+/// Read one of the properties common to every stateful object type.
+///
+/// `None` means the property is not one of the eight, so the caller falls
+/// through to its own arms.
+pub(crate) fn common_get(
+    view: &CommonView<'_>,
+    property: PropertyIdentifier,
+) -> Option<Result<PropertyValue>> {
+    let value = match property {
+        PropertyIdentifier::ObjectIdentifier => PropertyValue::ObjectIdentifier(view.identifier),
+        PropertyIdentifier::ObjectName => {
+            PropertyValue::CharacterString(view.object_name.to_owned())
+        }
+        PropertyIdentifier::ObjectType => PropertyValue::Enumerated(u32::from(view.object_type)),
+        PropertyIdentifier::Description => {
+            PropertyValue::CharacterString(view.description.to_owned())
+        }
+        PropertyIdentifier::StatusFlags => {
+            PropertyValue::BitString(crate::object::intrinsic::status_flags_bits(
+                view.event_state,
+                view.reliability,
+                view.out_of_service,
+                view.overridden,
+            ))
+        }
+        PropertyIdentifier::EventState => {
+            PropertyValue::Enumerated(u16::from(view.event_state).into())
+        }
+        PropertyIdentifier::Reliability => PropertyValue::Enumerated(view.reliability.into()),
+        PropertyIdentifier::OutOfService => PropertyValue::Boolean(view.out_of_service),
+        _ => return None,
+    };
+
+    Some(Ok(value))
+}
+
+/// The writable fields common to every stateful object type.
+pub(crate) struct CommonWritable<'a> {
+    pub object_name: &'a mut String,
+    pub description: &'a mut String,
+    pub reliability: &'a mut crate::object::reliability::Reliability,
+    pub out_of_service: &'a mut bool,
+}
+
+/// What [`common_set`] did with a property write.
+pub(crate) enum CommonWrite {
+    /// The property is one of the shared four; this is the result of writing it.
+    Handled(Result<()>),
+    /// Not a shared property. The value comes back untouched so the caller can
+    /// go on to offer it to its own arms.
+    Unclaimed(PropertyValue),
+}
+
+/// Write one of the properties common to every stateful object type.
+pub(crate) fn common_set(
+    fields: CommonWritable<'_>,
+    property: PropertyIdentifier,
+    value: PropertyValue,
+) -> CommonWrite {
+    let CommonWritable {
+        object_name,
+        description,
+        reliability,
+        out_of_service,
+    } = fields;
+
+    let result = match property {
+        PropertyIdentifier::ObjectName => match value {
+            PropertyValue::CharacterString(name) => {
+                *object_name = name;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidPropertyType),
+        },
+        PropertyIdentifier::Description => match value {
+            PropertyValue::CharacterString(text) => {
+                *description = text;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidPropertyType),
+        },
+        // Writable so a simulated device can be driven into a fault state.
+        PropertyIdentifier::Reliability => match value {
+            PropertyValue::Enumerated(raw) => {
+                *reliability = crate::object::reliability::Reliability::from(raw);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidPropertyType),
+        },
+        PropertyIdentifier::OutOfService => match value {
+            PropertyValue::Boolean(flag) => {
+                *out_of_service = flag;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidPropertyType),
+        },
+        _ => return CommonWrite::Unclaimed(value),
+    };
+
+    CommonWrite::Handled(result)
+}
+
 /// BACnet date representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Date {

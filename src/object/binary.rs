@@ -4,15 +4,15 @@
 //! as defined in ASHRAE 135. These objects represent binary (two-state) values in BACnet.
 
 use crate::object::{
-    effective_priority,
+    common_get, common_set, effective_priority,
     event_state::EventState,
     intrinsic::{
         intrinsic_get, intrinsic_property_list, intrinsic_set, status_flags_bits, AlarmEvaluation,
         AlarmTrigger, IntrinsicReporting,
     },
     reliability::Reliability,
-    write_priority_slot, BacnetObject, ObjectError, ObjectIdentifier, ObjectType,
-    PropertyIdentifier, PropertyValue, Result,
+    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, ObjectError,
+    ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue, Result,
 };
 
 #[cfg(not(feature = "std"))]
@@ -190,6 +190,191 @@ fn evaluate_binary(
 }
 
 /// The intrinsic reporting trait methods shared by all binary object types.
+/// The state every binary object type answers from, borrowed from whichever
+/// object is answering.
+struct BinaryView<'a> {
+    identifier: ObjectIdentifier,
+    object_type: ObjectType,
+    object_name: &'a str,
+    description: &'a str,
+    present_value: BinaryPV,
+    overridden: bool,
+    event_state: EventState,
+    reliability: Reliability,
+    out_of_service: bool,
+    inactive_text: &'a str,
+    active_text: &'a str,
+    alarm_value: BinaryPV,
+    alarm: Option<&'a IntrinsicReporting>,
+}
+
+/// Read a property common to every binary object type.
+///
+/// Returns `None` for properties belonging to a single type (device type,
+/// priority array) so callers fall through to their own arms.
+fn shared_get(view: BinaryView<'_>, property: PropertyIdentifier) -> Option<Result<PropertyValue>> {
+    if let Some(result) = common_get(
+        &CommonView {
+            identifier: view.identifier,
+            object_type: view.object_type,
+            object_name: view.object_name,
+            description: view.description,
+            event_state: view.event_state,
+            reliability: view.reliability,
+            out_of_service: view.out_of_service,
+            overridden: view.overridden,
+        },
+        property,
+    ) {
+        return Some(result);
+    }
+
+    let value = match property {
+        PropertyIdentifier::PresentValue => PropertyValue::Enumerated(view.present_value as u32),
+        PropertyIdentifier::InactiveText => {
+            PropertyValue::CharacterString(view.inactive_text.to_owned())
+        }
+        PropertyIdentifier::ActiveText => {
+            PropertyValue::CharacterString(view.active_text.to_owned())
+        }
+        _ => return binary_alarm_get(view.alarm_value, view.alarm, property),
+    };
+
+    Some(Ok(value))
+}
+
+/// The writable fields shared by every binary object type.
+struct BinaryWritable<'a> {
+    object_name: &'a mut String,
+    description: &'a mut String,
+    reliability: &'a mut Reliability,
+    out_of_service: &'a mut bool,
+    alarm_value: &'a mut BinaryPV,
+    alarm: Option<&'a mut IntrinsicReporting>,
+}
+
+/// Write a property common to every binary object type. `None` means the
+/// property is not one this helper owns.
+fn shared_set(
+    fields: BinaryWritable<'_>,
+    property: PropertyIdentifier,
+    value: PropertyValue,
+) -> Option<Result<()>> {
+    let BinaryWritable {
+        object_name,
+        description,
+        reliability,
+        out_of_service,
+        alarm_value,
+        alarm,
+    } = fields;
+
+    let value = match common_set(
+        CommonWritable {
+            object_name,
+            description,
+            reliability,
+            out_of_service,
+        },
+        property,
+        value,
+    ) {
+        CommonWrite::Handled(result) => return Some(result),
+        CommonWrite::Unclaimed(value) => value,
+    };
+
+    binary_alarm_set(alarm_value, alarm, property, value)
+}
+
+/// Whether a property shared by every binary object type accepts writes.
+fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool {
+    matches!(
+        property,
+        PropertyIdentifier::ObjectName
+            | PropertyIdentifier::Description
+            | PropertyIdentifier::OutOfService
+            | PropertyIdentifier::Reliability
+    ) || binary_alarm_writable(property, alarm_configured)
+}
+
+/// Properties every binary object exposes, in the order they are reported.
+///
+/// `trailing` carries the per-type additions, which sit inside the shared order
+/// rather than after it: Priority_Array follows Out_Of_Service.
+fn shared_property_list(
+    trailing: &[PropertyIdentifier],
+    alarm: Option<&IntrinsicReporting>,
+) -> Vec<PropertyIdentifier> {
+    let mut properties = vec![
+        PropertyIdentifier::ObjectIdentifier,
+        PropertyIdentifier::ObjectName,
+        PropertyIdentifier::ObjectType,
+        PropertyIdentifier::PresentValue,
+        PropertyIdentifier::OutOfService,
+    ];
+    properties.extend_from_slice(trailing);
+    properties.extend([
+        PropertyIdentifier::Description,
+        PropertyIdentifier::StatusFlags,
+        PropertyIdentifier::EventState,
+        PropertyIdentifier::Reliability,
+        PropertyIdentifier::InactiveText,
+        PropertyIdentifier::ActiveText,
+    ]);
+    properties.extend(binary_alarm_property_list(alarm));
+    properties
+}
+
+/// The Priority_Array property of a commandable binary object.
+fn priority_array_value(priority_array: &[Option<BinaryPV>; 16]) -> PropertyValue {
+    PropertyValue::Array(
+        priority_array
+            .iter()
+            .map(|slot| match slot {
+                Some(state) => PropertyValue::Enumerated(*state as u32),
+                None => PropertyValue::Null,
+            })
+            .collect(),
+    )
+}
+
+/// Generate the borrowed views the shared binary handlers take.
+///
+/// All three binary types hold this state under the same field names, but on
+/// three separate structs, so only the object type differs between them.
+macro_rules! binary_views {
+    ($object_type:expr) => {
+        fn view(&self) -> BinaryView<'_> {
+            BinaryView {
+                identifier: self.identifier,
+                object_type: $object_type,
+                object_name: &self.object_name,
+                description: &self.description,
+                present_value: self.present_value,
+                overridden: self.overridden,
+                event_state: self.event_state,
+                reliability: self.reliability,
+                out_of_service: self.out_of_service,
+                inactive_text: &self.inactive_text,
+                active_text: &self.active_text,
+                alarm_value: self.alarm_value,
+                alarm: self.alarm.as_ref(),
+            }
+        }
+
+        fn writable(&mut self) -> BinaryWritable<'_> {
+            BinaryWritable {
+                object_name: &mut self.object_name,
+                description: &mut self.description,
+                reliability: &mut self.reliability,
+                out_of_service: &mut self.out_of_service,
+                alarm_value: &mut self.alarm_value,
+                alarm: self.alarm.as_mut(),
+            }
+        }
+    };
+}
+
 macro_rules! binary_intrinsic_methods {
     () => {
         fn intrinsic(&self) -> Option<&IntrinsicReporting> {
@@ -394,6 +579,8 @@ impl BinaryInput {
         );
         (bits[0], bits[1], bits[2], bits[3])
     }
+
+    binary_views!(ObjectType::BinaryInput);
 }
 
 impl BinaryOutput {
@@ -448,6 +635,8 @@ impl BinaryOutput {
     pub fn get_effective_priority(&self) -> Option<u8> {
         effective_priority(&self.priority_array)
     }
+
+    binary_views!(ObjectType::BinaryOutput);
 }
 
 impl BinaryValue {
@@ -493,6 +682,8 @@ impl BinaryValue {
         )?;
         Ok(())
     }
+
+    binary_views!(ObjectType::BinaryValue);
 }
 
 impl BacnetObject for BinaryInput {
@@ -501,112 +692,20 @@ impl BacnetObject for BinaryInput {
     }
 
     fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
-        match property {
-            PropertyIdentifier::ObjectIdentifier => {
-                Ok(PropertyValue::ObjectIdentifier(self.identifier))
-            }
-            PropertyIdentifier::ObjectName => {
-                Ok(PropertyValue::CharacterString(self.object_name.clone()))
-            }
-            PropertyIdentifier::ObjectType => Ok(PropertyValue::Enumerated(u32::from(
-                ObjectType::BinaryInput,
-            ))),
-            PropertyIdentifier::PresentValue => {
-                Ok(PropertyValue::Enumerated(self.present_value as u32))
-            }
-            PropertyIdentifier::OutOfService => Ok(PropertyValue::Boolean(self.out_of_service)),
-            PropertyIdentifier::Description => {
-                Ok(PropertyValue::CharacterString(self.description.clone()))
-            }
-            PropertyIdentifier::StatusFlags => Ok(PropertyValue::BitString(status_flags_bits(
-                self.event_state,
-                self.reliability,
-                self.out_of_service,
-                self.overridden,
-            ))),
-            PropertyIdentifier::EventState => Ok(PropertyValue::Enumerated(
-                u16::from(self.event_state).into(),
-            )),
-            PropertyIdentifier::Reliability => {
-                Ok(PropertyValue::Enumerated(self.reliability.into()))
-            }
-            PropertyIdentifier::InactiveText => {
-                Ok(PropertyValue::CharacterString(self.inactive_text.clone()))
-            }
-            PropertyIdentifier::ActiveText => {
-                Ok(PropertyValue::CharacterString(self.active_text.clone()))
-            }
-            _ => binary_alarm_get(self.alarm_value, self.alarm.as_ref(), property)
-                .unwrap_or(Err(ObjectError::UnknownProperty)),
-        }
+        shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty))
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
-        match property {
-            PropertyIdentifier::ObjectName => {
-                if let PropertyValue::CharacterString(name) = value {
-                    self.object_name = name;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::Description => {
-                if let PropertyValue::CharacterString(text) = value {
-                    self.description = text;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            // Writable so a simulated device can be driven into a fault state.
-            PropertyIdentifier::Reliability => {
-                if let PropertyValue::Enumerated(raw) = value {
-                    self.reliability = Reliability::from(raw);
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::OutOfService => {
-                if let PropertyValue::Boolean(oos) = value {
-                    self.out_of_service = oos;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            _ => binary_alarm_set(&mut self.alarm_value, self.alarm.as_mut(), property, value)
-                .unwrap_or(Err(ObjectError::PropertyNotWritable)),
-        }
+        shared_set(self.writable(), property, value)
+            .unwrap_or(Err(ObjectError::PropertyNotWritable))
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        ) || binary_alarm_writable(property, self.alarm.is_some())
+        shared_writable(property, self.alarm.is_some())
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = vec![
-            PropertyIdentifier::ObjectIdentifier,
-            PropertyIdentifier::ObjectName,
-            PropertyIdentifier::ObjectType,
-            PropertyIdentifier::PresentValue,
-            PropertyIdentifier::OutOfService,
-            PropertyIdentifier::Description,
-            PropertyIdentifier::StatusFlags,
-            PropertyIdentifier::EventState,
-            PropertyIdentifier::Reliability,
-            PropertyIdentifier::InactiveText,
-            PropertyIdentifier::ActiveText,
-        ];
-        properties.extend(binary_alarm_property_list(self.alarm.as_ref()));
-        properties
+        shared_property_list(&[], self.alarm.as_ref())
     }
 
     /// An input reflects a physical contact, so its Present_Value has no
@@ -626,297 +725,68 @@ impl BacnetObject for BinaryInput {
     binary_intrinsic_methods!();
 }
 
-impl BacnetObject for BinaryOutput {
-    fn identifier(&self) -> ObjectIdentifier {
-        self.identifier
-    }
+/// The whole `BacnetObject` impl for a commandable binary object.
+///
+/// Binary Output and Binary Value answer every property identically — both are a
+/// commanded state with a priority array behind it, and neither exposes anything
+/// the other does not — so the impl is written once here rather than twice.
+macro_rules! commandable_binary_object {
+    ($object:ty) => {
+        impl BacnetObject for $object {
+            fn identifier(&self) -> ObjectIdentifier {
+                self.identifier
+            }
 
-    fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
-        match property {
-            PropertyIdentifier::ObjectIdentifier => {
-                Ok(PropertyValue::ObjectIdentifier(self.identifier))
+            fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
+                if property == PropertyIdentifier::PriorityArray {
+                    return Ok(priority_array_value(&self.priority_array));
+                }
+
+                shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty))
             }
-            PropertyIdentifier::ObjectName => {
-                Ok(PropertyValue::CharacterString(self.object_name.clone()))
+
+            fn set_property(
+                &mut self,
+                property: PropertyIdentifier,
+                value: PropertyValue,
+            ) -> Result<()> {
+                if property == PropertyIdentifier::PresentValue {
+                    return self.set_property_with_priority(property, value, None);
+                }
+
+                shared_set(self.writable(), property, value)
+                    .unwrap_or(Err(ObjectError::PropertyNotWritable))
             }
-            PropertyIdentifier::ObjectType => Ok(PropertyValue::Enumerated(u32::from(
-                ObjectType::BinaryOutput,
-            ))),
-            PropertyIdentifier::PresentValue => {
-                Ok(PropertyValue::Enumerated(self.present_value as u32))
+
+            fn set_property_with_priority(
+                &mut self,
+                property: PropertyIdentifier,
+                value: PropertyValue,
+                priority: Option<u8>,
+            ) -> Result<()> {
+                if property != PropertyIdentifier::PresentValue {
+                    return self.set_property(property, value);
+                }
+
+                self.write_priority(priority.unwrap_or(16), commandable_binary(value)?)
             }
-            PropertyIdentifier::OutOfService => Ok(PropertyValue::Boolean(self.out_of_service)),
-            PropertyIdentifier::Description => {
-                Ok(PropertyValue::CharacterString(self.description.clone()))
+
+            fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
+                property == PropertyIdentifier::PresentValue
+                    || shared_writable(property, self.alarm.is_some())
             }
-            PropertyIdentifier::StatusFlags => Ok(PropertyValue::BitString(status_flags_bits(
-                self.event_state,
-                self.reliability,
-                self.out_of_service,
-                self.overridden,
-            ))),
-            PropertyIdentifier::EventState => Ok(PropertyValue::Enumerated(
-                u16::from(self.event_state).into(),
-            )),
-            PropertyIdentifier::Reliability => {
-                Ok(PropertyValue::Enumerated(self.reliability.into()))
+
+            fn property_list(&self) -> Vec<PropertyIdentifier> {
+                shared_property_list(&[PropertyIdentifier::PriorityArray], self.alarm.as_ref())
             }
-            PropertyIdentifier::InactiveText => {
-                Ok(PropertyValue::CharacterString(self.inactive_text.clone()))
-            }
-            PropertyIdentifier::ActiveText => {
-                Ok(PropertyValue::CharacterString(self.active_text.clone()))
-            }
-            PropertyIdentifier::PriorityArray => {
-                let array: Vec<PropertyValue> = self
-                    .priority_array
-                    .iter()
-                    .map(|&v| match v {
-                        Some(val) => PropertyValue::Enumerated(val as u32),
-                        None => PropertyValue::Null,
-                    })
-                    .collect();
-                Ok(PropertyValue::Array(array))
-            }
-            _ => binary_alarm_get(self.alarm_value, self.alarm.as_ref(), property)
-                .unwrap_or(Err(ObjectError::UnknownProperty)),
+
+            binary_intrinsic_methods!();
         }
-    }
-
-    fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
-        match property {
-            PropertyIdentifier::ObjectName => {
-                if let PropertyValue::CharacterString(name) = value {
-                    self.object_name = name;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::Description => {
-                if let PropertyValue::CharacterString(text) = value {
-                    self.description = text;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            // Writable so a simulated device can be driven into a fault state.
-            PropertyIdentifier::Reliability => {
-                if let PropertyValue::Enumerated(raw) = value {
-                    self.reliability = Reliability::from(raw);
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::PresentValue => {
-                self.set_property_with_priority(property, value, None)
-            }
-            PropertyIdentifier::OutOfService => {
-                if let PropertyValue::Boolean(oos) = value {
-                    self.out_of_service = oos;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            _ => binary_alarm_set(&mut self.alarm_value, self.alarm.as_mut(), property, value)
-                .unwrap_or(Err(ObjectError::PropertyNotWritable)),
-        }
-    }
-
-    fn set_property_with_priority(
-        &mut self,
-        property: PropertyIdentifier,
-        value: PropertyValue,
-        priority: Option<u8>,
-    ) -> Result<()> {
-        if property != PropertyIdentifier::PresentValue {
-            return self.set_property(property, value);
-        }
-
-        self.write_priority(priority.unwrap_or(16), commandable_binary(value)?)
-    }
-
-    fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::PresentValue
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        ) || binary_alarm_writable(property, self.alarm.is_some())
-    }
-
-    fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = vec![
-            PropertyIdentifier::ObjectIdentifier,
-            PropertyIdentifier::ObjectName,
-            PropertyIdentifier::ObjectType,
-            PropertyIdentifier::PresentValue,
-            PropertyIdentifier::OutOfService,
-            PropertyIdentifier::PriorityArray,
-            PropertyIdentifier::Description,
-            PropertyIdentifier::StatusFlags,
-            PropertyIdentifier::EventState,
-            PropertyIdentifier::Reliability,
-            PropertyIdentifier::InactiveText,
-            PropertyIdentifier::ActiveText,
-        ];
-        properties.extend(binary_alarm_property_list(self.alarm.as_ref()));
-        properties
-    }
-
-    binary_intrinsic_methods!();
+    };
 }
 
-impl BacnetObject for BinaryValue {
-    fn identifier(&self) -> ObjectIdentifier {
-        self.identifier
-    }
-
-    fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
-        match property {
-            PropertyIdentifier::ObjectIdentifier => {
-                Ok(PropertyValue::ObjectIdentifier(self.identifier))
-            }
-            PropertyIdentifier::ObjectName => {
-                Ok(PropertyValue::CharacterString(self.object_name.clone()))
-            }
-            PropertyIdentifier::ObjectType => Ok(PropertyValue::Enumerated(u32::from(
-                ObjectType::BinaryValue,
-            ))),
-            PropertyIdentifier::PresentValue => {
-                Ok(PropertyValue::Enumerated(self.present_value as u32))
-            }
-            PropertyIdentifier::OutOfService => Ok(PropertyValue::Boolean(self.out_of_service)),
-            PropertyIdentifier::Description => {
-                Ok(PropertyValue::CharacterString(self.description.clone()))
-            }
-            PropertyIdentifier::StatusFlags => Ok(PropertyValue::BitString(status_flags_bits(
-                self.event_state,
-                self.reliability,
-                self.out_of_service,
-                self.overridden,
-            ))),
-            PropertyIdentifier::EventState => Ok(PropertyValue::Enumerated(
-                u16::from(self.event_state).into(),
-            )),
-            PropertyIdentifier::Reliability => {
-                Ok(PropertyValue::Enumerated(self.reliability.into()))
-            }
-            PropertyIdentifier::InactiveText => {
-                Ok(PropertyValue::CharacterString(self.inactive_text.clone()))
-            }
-            PropertyIdentifier::ActiveText => {
-                Ok(PropertyValue::CharacterString(self.active_text.clone()))
-            }
-            PropertyIdentifier::PriorityArray => {
-                let array: Vec<PropertyValue> = self
-                    .priority_array
-                    .iter()
-                    .map(|&v| match v {
-                        Some(val) => PropertyValue::Enumerated(val as u32),
-                        None => PropertyValue::Null,
-                    })
-                    .collect();
-                Ok(PropertyValue::Array(array))
-            }
-            _ => binary_alarm_get(self.alarm_value, self.alarm.as_ref(), property)
-                .unwrap_or(Err(ObjectError::UnknownProperty)),
-        }
-    }
-
-    fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
-        match property {
-            PropertyIdentifier::ObjectName => {
-                if let PropertyValue::CharacterString(name) = value {
-                    self.object_name = name;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::Description => {
-                if let PropertyValue::CharacterString(text) = value {
-                    self.description = text;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            // Writable so a simulated device can be driven into a fault state.
-            PropertyIdentifier::Reliability => {
-                if let PropertyValue::Enumerated(raw) = value {
-                    self.reliability = Reliability::from(raw);
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::PresentValue => {
-                self.set_property_with_priority(property, value, None)
-            }
-            PropertyIdentifier::OutOfService => {
-                if let PropertyValue::Boolean(oos) = value {
-                    self.out_of_service = oos;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            _ => binary_alarm_set(&mut self.alarm_value, self.alarm.as_mut(), property, value)
-                .unwrap_or(Err(ObjectError::PropertyNotWritable)),
-        }
-    }
-
-    fn set_property_with_priority(
-        &mut self,
-        property: PropertyIdentifier,
-        value: PropertyValue,
-        priority: Option<u8>,
-    ) -> Result<()> {
-        if property != PropertyIdentifier::PresentValue {
-            return self.set_property(property, value);
-        }
-
-        self.write_priority(priority.unwrap_or(16), commandable_binary(value)?)
-    }
-
-    fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::PresentValue
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        ) || binary_alarm_writable(property, self.alarm.is_some())
-    }
-
-    fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = vec![
-            PropertyIdentifier::ObjectIdentifier,
-            PropertyIdentifier::ObjectName,
-            PropertyIdentifier::ObjectType,
-            PropertyIdentifier::PresentValue,
-            PropertyIdentifier::OutOfService,
-            PropertyIdentifier::PriorityArray,
-            PropertyIdentifier::Description,
-            PropertyIdentifier::StatusFlags,
-            PropertyIdentifier::EventState,
-            PropertyIdentifier::Reliability,
-            PropertyIdentifier::InactiveText,
-            PropertyIdentifier::ActiveText,
-        ];
-        properties.extend(binary_alarm_property_list(self.alarm.as_ref()));
-        properties
-    }
-
-    binary_intrinsic_methods!();
-}
+commandable_binary_object!(BinaryOutput);
+commandable_binary_object!(BinaryValue);
 
 #[cfg(test)]
 mod tests {

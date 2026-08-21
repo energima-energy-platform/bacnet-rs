@@ -4,15 +4,15 @@
 //! object types as defined in ASHRAE 135. These objects represent multi-position values.
 
 use crate::object::{
-    effective_priority,
+    common_get, common_set, effective_priority,
     event_state::EventState,
     intrinsic::{
-        intrinsic_get, intrinsic_property_list, intrinsic_set, status_flags_bits, AlarmEvaluation,
-        AlarmTrigger, IntrinsicReporting,
+        intrinsic_get, intrinsic_property_list, intrinsic_set, AlarmEvaluation, AlarmTrigger,
+        IntrinsicReporting,
     },
     reliability::Reliability,
-    write_priority_slot, BacnetObject, ObjectError, ObjectIdentifier, ObjectType,
-    PropertyIdentifier, PropertyValue, Result,
+    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, ObjectError,
+    ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue, Result,
 };
 
 #[cfg(not(feature = "std"))]
@@ -54,27 +54,24 @@ fn shared_get(
     view: MultistateView<'_>,
     property: PropertyIdentifier,
 ) -> Option<Result<PropertyValue>> {
+    if let Some(result) = common_get(
+        &CommonView {
+            identifier: view.identifier,
+            object_type: view.object_type,
+            object_name: view.object_name,
+            description: view.description,
+            event_state: view.event_state,
+            reliability: view.reliability,
+            out_of_service: view.out_of_service,
+            overridden: view.overridden,
+        },
+        property,
+    ) {
+        return Some(result);
+    }
+
     let value = match property {
-        PropertyIdentifier::ObjectIdentifier => PropertyValue::ObjectIdentifier(view.identifier),
-        PropertyIdentifier::ObjectName => {
-            PropertyValue::CharacterString(view.object_name.to_owned())
-        }
-        PropertyIdentifier::ObjectType => PropertyValue::Enumerated(u32::from(view.object_type)),
         PropertyIdentifier::PresentValue => PropertyValue::Unsigned(view.present_value.into()),
-        PropertyIdentifier::Description => {
-            PropertyValue::CharacterString(view.description.to_owned())
-        }
-        PropertyIdentifier::StatusFlags => PropertyValue::BitString(status_flags_bits(
-            view.event_state,
-            view.reliability,
-            view.out_of_service,
-            view.overridden,
-        )),
-        PropertyIdentifier::EventState => {
-            PropertyValue::Enumerated(u16::from(view.event_state).into())
-        }
-        PropertyIdentifier::Reliability => PropertyValue::Enumerated(view.reliability.into()),
-        PropertyIdentifier::OutOfService => PropertyValue::Boolean(view.out_of_service),
         PropertyIdentifier::NumberOfStates => PropertyValue::Unsigned(view.number_of_states.into()),
         PropertyIdentifier::StateText => PropertyValue::Array(
             view.state_text
@@ -122,36 +119,21 @@ fn shared_set(
         alarm,
     } = fields;
 
+    let value = match common_set(
+        CommonWritable {
+            object_name,
+            description,
+            reliability,
+            out_of_service,
+        },
+        property,
+        value,
+    ) {
+        CommonWrite::Handled(result) => return Some(result),
+        CommonWrite::Unclaimed(value) => value,
+    };
+
     let result = match property {
-        PropertyIdentifier::ObjectName => match value {
-            PropertyValue::CharacterString(name) => {
-                *object_name = name;
-                Ok(())
-            }
-            _ => Err(ObjectError::InvalidPropertyType),
-        },
-        PropertyIdentifier::Description => match value {
-            PropertyValue::CharacterString(text) => {
-                *description = text;
-                Ok(())
-            }
-            _ => Err(ObjectError::InvalidPropertyType),
-        },
-        PropertyIdentifier::OutOfService => match value {
-            PropertyValue::Boolean(flag) => {
-                *out_of_service = flag;
-                Ok(())
-            }
-            _ => Err(ObjectError::InvalidPropertyType),
-        },
-        // Writable so a simulated device can be driven into a fault state.
-        PropertyIdentifier::Reliability => match value {
-            PropertyValue::Enumerated(raw) => {
-                *reliability = Reliability::from(raw);
-                Ok(())
-            }
-            _ => Err(ObjectError::InvalidPropertyType),
-        },
         PropertyIdentifier::AlarmValues => match value {
             PropertyValue::List(states) | PropertyValue::Array(states) => states
                 .into_iter()

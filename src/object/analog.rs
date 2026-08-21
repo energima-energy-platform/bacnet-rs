@@ -4,7 +4,7 @@
 //! as defined in ASHRAE 135. These objects represent analog (continuous) values in BACnet.
 
 use crate::object::{
-    effective_priority,
+    common_get, common_set, effective_priority,
     engineering_units::EngineeringUnits,
     event_state::EventState,
     intrinsic::{
@@ -12,8 +12,8 @@ use crate::object::{
         AlarmTrigger, IntrinsicReporting,
     },
     reliability::Reliability,
-    write_priority_slot, BacnetObject, ObjectError, ObjectIdentifier, ObjectType,
-    PropertyIdentifier, PropertyValue, Result,
+    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, ObjectError,
+    ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue, Result,
 };
 
 #[cfg(not(feature = "std"))]
@@ -242,6 +242,209 @@ fn evaluate_analog(
 }
 
 /// The intrinsic reporting trait methods shared by all analog object types.
+/// The state every analog object type answers from, borrowed from whichever
+/// object is answering.
+struct AnalogView<'a> {
+    identifier: ObjectIdentifier,
+    object_type: ObjectType,
+    object_name: &'a str,
+    description: &'a str,
+    present_value: f32,
+    overridden: bool,
+    event_state: EventState,
+    reliability: Reliability,
+    out_of_service: bool,
+    units: EngineeringUnits,
+    high_limit: Option<f32>,
+    low_limit: Option<f32>,
+    deadband: f32,
+    alarm: Option<&'a IntrinsicReporting>,
+}
+
+/// Read a property common to every analog object type.
+///
+/// Returns `None` for properties belonging to a single type (device type,
+/// priority array, relinquish default, COV increment) so callers fall through to
+/// their own arms.
+fn shared_get(view: AnalogView<'_>, property: PropertyIdentifier) -> Option<Result<PropertyValue>> {
+    if let Some(result) = common_get(
+        &CommonView {
+            identifier: view.identifier,
+            object_type: view.object_type,
+            object_name: view.object_name,
+            description: view.description,
+            event_state: view.event_state,
+            reliability: view.reliability,
+            out_of_service: view.out_of_service,
+            overridden: view.overridden,
+        },
+        property,
+    ) {
+        return Some(result);
+    }
+
+    let value = match property {
+        PropertyIdentifier::PresentValue => PropertyValue::Real(view.present_value),
+        PropertyIdentifier::Units => PropertyValue::Enumerated(view.units.into()),
+        _ => {
+            return analog_alarm_get(
+                view.high_limit,
+                view.low_limit,
+                view.deadband,
+                view.alarm,
+                property,
+            )
+        }
+    };
+
+    Some(Ok(value))
+}
+
+/// The writable fields shared by every analog object type.
+struct AnalogWritable<'a> {
+    object_name: &'a mut String,
+    description: &'a mut String,
+    reliability: &'a mut Reliability,
+    out_of_service: &'a mut bool,
+    high_limit: &'a mut Option<f32>,
+    low_limit: &'a mut Option<f32>,
+    deadband: &'a mut f32,
+    alarm: Option<&'a mut IntrinsicReporting>,
+}
+
+/// Write a property common to every analog object type. `None` means the
+/// property is not one this helper owns.
+fn shared_set(
+    fields: AnalogWritable<'_>,
+    property: PropertyIdentifier,
+    value: PropertyValue,
+) -> Option<Result<()>> {
+    let AnalogWritable {
+        object_name,
+        description,
+        reliability,
+        out_of_service,
+        high_limit,
+        low_limit,
+        deadband,
+        alarm,
+    } = fields;
+
+    let value = match common_set(
+        CommonWritable {
+            object_name,
+            description,
+            reliability,
+            out_of_service,
+        },
+        property,
+        value,
+    ) {
+        CommonWrite::Handled(result) => return Some(result),
+        CommonWrite::Unclaimed(value) => value,
+    };
+
+    analog_alarm_set(high_limit, low_limit, deadband, alarm, property, value)
+}
+
+/// Whether a property shared by every analog object type accepts writes.
+fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool {
+    matches!(
+        property,
+        PropertyIdentifier::ObjectName
+            | PropertyIdentifier::Description
+            | PropertyIdentifier::OutOfService
+            | PropertyIdentifier::Reliability
+    ) || analog_alarm_writable(property, alarm_configured)
+}
+
+/// Properties every analog object exposes, in the order they are reported.
+///
+/// The per-type additions sit inside that order rather than after it: Device_Type
+/// between Description and Status_Flags, and the commandable and COV properties
+/// in `trailing`, straight after Units.
+fn shared_property_list(
+    device_type: bool,
+    trailing: &[PropertyIdentifier],
+    high_limit: Option<f32>,
+    low_limit: Option<f32>,
+    alarm: Option<&IntrinsicReporting>,
+) -> Vec<PropertyIdentifier> {
+    let mut properties = vec![
+        PropertyIdentifier::ObjectIdentifier,
+        PropertyIdentifier::ObjectName,
+        PropertyIdentifier::ObjectType,
+        PropertyIdentifier::PresentValue,
+        PropertyIdentifier::Description,
+    ];
+    if device_type {
+        properties.push(PropertyIdentifier::DeviceType);
+    }
+    properties.extend([
+        PropertyIdentifier::StatusFlags,
+        PropertyIdentifier::EventState,
+        PropertyIdentifier::Reliability,
+        PropertyIdentifier::OutOfService,
+        PropertyIdentifier::Units,
+    ]);
+    properties.extend_from_slice(trailing);
+    properties.extend(analog_alarm_property_list(high_limit, low_limit, alarm));
+    properties
+}
+
+/// The Priority_Array property of a commandable analog object.
+fn priority_array_value(priority_array: &[Option<f32>; 16]) -> PropertyValue {
+    PropertyValue::Array(
+        priority_array
+            .iter()
+            .map(|slot| match slot {
+                Some(value) => PropertyValue::Real(*value),
+                None => PropertyValue::Null,
+            })
+            .collect(),
+    )
+}
+
+/// Generate the borrowed views the shared analog handlers take.
+///
+/// All three analog types hold this state under the same field names, but on
+/// three separate structs, so only the object type differs between them.
+macro_rules! analog_views {
+    ($object_type:expr) => {
+        fn view(&self) -> AnalogView<'_> {
+            AnalogView {
+                identifier: self.identifier,
+                object_type: $object_type,
+                object_name: &self.object_name,
+                description: &self.description,
+                present_value: self.present_value,
+                overridden: self.overridden,
+                event_state: self.event_state,
+                reliability: self.reliability,
+                out_of_service: self.out_of_service,
+                units: self.units,
+                high_limit: self.high_limit,
+                low_limit: self.low_limit,
+                deadband: self.deadband,
+                alarm: self.alarm.as_ref(),
+            }
+        }
+
+        fn writable(&mut self) -> AnalogWritable<'_> {
+            AnalogWritable {
+                object_name: &mut self.object_name,
+                description: &mut self.description,
+                reliability: &mut self.reliability,
+                out_of_service: &mut self.out_of_service,
+                high_limit: &mut self.high_limit,
+                low_limit: &mut self.low_limit,
+                deadband: &mut self.deadband,
+                alarm: self.alarm.as_mut(),
+            }
+        }
+    };
+}
+
 macro_rules! analog_intrinsic_methods {
     () => {
         fn intrinsic(&self) -> Option<&IntrinsicReporting> {
@@ -467,6 +670,8 @@ impl AnalogInput {
         );
         (bits[0], bits[1], bits[2], bits[3])
     }
+
+    analog_views!(ObjectType::AnalogInput);
 }
 
 impl AnalogOutput {
@@ -532,6 +737,8 @@ impl AnalogOutput {
     pub fn get_effective_priority(&self) -> Option<u8> {
         effective_priority(&self.priority_array)
     }
+
+    analog_views!(ObjectType::AnalogOutput);
 }
 
 impl AnalogValue {
@@ -588,6 +795,8 @@ impl AnalogValue {
         )?;
         Ok(())
     }
+
+    analog_views!(ObjectType::AnalogValue);
 }
 
 impl BacnetObject for AnalogInput {
@@ -596,125 +805,30 @@ impl BacnetObject for AnalogInput {
     }
 
     fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
-        match property {
-            PropertyIdentifier::ObjectIdentifier => {
-                Ok(PropertyValue::ObjectIdentifier(self.identifier))
-            }
-            PropertyIdentifier::ObjectName => {
-                Ok(PropertyValue::CharacterString(self.object_name.clone()))
-            }
-            PropertyIdentifier::ObjectType => Ok(PropertyValue::Enumerated(u32::from(
-                ObjectType::AnalogInput,
-            ))),
-            PropertyIdentifier::PresentValue => Ok(PropertyValue::Real(self.present_value)),
-            PropertyIdentifier::Description => {
-                Ok(PropertyValue::CharacterString(self.description.clone()))
-            }
-            PropertyIdentifier::DeviceType => {
-                Ok(PropertyValue::CharacterString(self.device_type.clone()))
-            }
-            PropertyIdentifier::StatusFlags => Ok(PropertyValue::BitString(status_flags_bits(
-                self.event_state,
-                self.reliability,
-                self.out_of_service,
-                self.overridden,
-            ))),
-            PropertyIdentifier::EventState => Ok(PropertyValue::Enumerated(
-                u16::from(self.event_state).into(),
-            )),
-            PropertyIdentifier::Reliability => {
-                Ok(PropertyValue::Enumerated(self.reliability.into()))
-            }
-            PropertyIdentifier::OutOfService => Ok(PropertyValue::Boolean(self.out_of_service)),
-            PropertyIdentifier::Units => Ok(PropertyValue::Enumerated(self.units.into())),
-            _ => analog_alarm_get(
-                self.high_limit,
-                self.low_limit,
-                self.deadband,
-                self.alarm.as_ref(),
-                property,
-            )
-            .unwrap_or(Err(ObjectError::UnknownProperty)),
+        if property == PropertyIdentifier::DeviceType {
+            return Ok(PropertyValue::CharacterString(self.device_type.clone()));
         }
+
+        shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty))
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
-        match property {
-            PropertyIdentifier::ObjectName => {
-                if let PropertyValue::CharacterString(name) = value {
-                    self.object_name = name;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::Description => {
-                if let PropertyValue::CharacterString(text) = value {
-                    self.description = text;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            // Writable so a simulated device can be driven into a fault state.
-            PropertyIdentifier::Reliability => {
-                if let PropertyValue::Enumerated(raw) = value {
-                    self.reliability = Reliability::from(raw);
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::OutOfService => {
-                if let PropertyValue::Boolean(oos) = value {
-                    self.out_of_service = oos;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            _ => analog_alarm_set(
-                &mut self.high_limit,
-                &mut self.low_limit,
-                &mut self.deadband,
-                self.alarm.as_mut(),
-                property,
-                value,
-            )
-            .unwrap_or(Err(ObjectError::PropertyNotWritable)),
-        }
+        shared_set(self.writable(), property, value)
+            .unwrap_or(Err(ObjectError::PropertyNotWritable))
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        ) || analog_alarm_writable(property, self.alarm.is_some())
+        shared_writable(property, self.alarm.is_some())
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = vec![
-            PropertyIdentifier::ObjectIdentifier,
-            PropertyIdentifier::ObjectName,
-            PropertyIdentifier::ObjectType,
-            PropertyIdentifier::PresentValue,
-            PropertyIdentifier::Description,
-            PropertyIdentifier::DeviceType,
-            PropertyIdentifier::StatusFlags,
-            PropertyIdentifier::EventState,
-            PropertyIdentifier::Reliability,
-            PropertyIdentifier::OutOfService,
-            PropertyIdentifier::Units,
-        ];
-        properties.extend(analog_alarm_property_list(
+        shared_property_list(
+            true,
+            &[],
             self.high_limit,
             self.low_limit,
             self.alarm.as_ref(),
-        ));
-        properties
+        )
     }
 
     /// An input reflects a sensor, so its Present_Value has no priority array
@@ -739,109 +853,24 @@ impl BacnetObject for AnalogOutput {
 
     fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
         match property {
-            PropertyIdentifier::ObjectIdentifier => {
-                Ok(PropertyValue::ObjectIdentifier(self.identifier))
-            }
-            PropertyIdentifier::ObjectName => {
-                Ok(PropertyValue::CharacterString(self.object_name.clone()))
-            }
-            PropertyIdentifier::ObjectType => Ok(PropertyValue::Enumerated(u32::from(
-                ObjectType::AnalogOutput,
-            ))),
-            PropertyIdentifier::PresentValue => Ok(PropertyValue::Real(self.present_value)),
-            PropertyIdentifier::Description => {
-                Ok(PropertyValue::CharacterString(self.description.clone()))
-            }
             PropertyIdentifier::DeviceType => {
                 Ok(PropertyValue::CharacterString(self.device_type.clone()))
             }
-            PropertyIdentifier::StatusFlags => Ok(PropertyValue::BitString(status_flags_bits(
-                self.event_state,
-                self.reliability,
-                self.out_of_service,
-                self.overridden,
-            ))),
-            PropertyIdentifier::EventState => Ok(PropertyValue::Enumerated(
-                u16::from(self.event_state).into(),
-            )),
-            PropertyIdentifier::Reliability => {
-                Ok(PropertyValue::Enumerated(self.reliability.into()))
-            }
-            PropertyIdentifier::OutOfService => Ok(PropertyValue::Boolean(self.out_of_service)),
-            PropertyIdentifier::Units => Ok(PropertyValue::Enumerated(self.units.into())),
-            PropertyIdentifier::PriorityArray => {
-                let array: Vec<PropertyValue> = self
-                    .priority_array
-                    .iter()
-                    .map(|&v| match v {
-                        Some(val) => PropertyValue::Real(val),
-                        None => PropertyValue::Null,
-                    })
-                    .collect();
-                Ok(PropertyValue::Array(array))
-            }
+            PropertyIdentifier::PriorityArray => Ok(priority_array_value(&self.priority_array)),
             PropertyIdentifier::RelinquishDefault => {
                 Ok(PropertyValue::Real(self.relinquish_default))
             }
-            _ => analog_alarm_get(
-                self.high_limit,
-                self.low_limit,
-                self.deadband,
-                self.alarm.as_ref(),
-                property,
-            )
-            .unwrap_or(Err(ObjectError::UnknownProperty)),
+            _ => shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty)),
         }
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
-        match property {
-            PropertyIdentifier::ObjectName => {
-                if let PropertyValue::CharacterString(name) = value {
-                    self.object_name = name;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::Description => {
-                if let PropertyValue::CharacterString(text) = value {
-                    self.description = text;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            // Writable so a simulated device can be driven into a fault state.
-            PropertyIdentifier::Reliability => {
-                if let PropertyValue::Enumerated(raw) = value {
-                    self.reliability = Reliability::from(raw);
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::PresentValue => {
-                self.set_property_with_priority(property, value, None)
-            }
-            PropertyIdentifier::OutOfService => {
-                if let PropertyValue::Boolean(oos) = value {
-                    self.out_of_service = oos;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            _ => analog_alarm_set(
-                &mut self.high_limit,
-                &mut self.low_limit,
-                &mut self.deadband,
-                self.alarm.as_mut(),
-                property,
-                value,
-            )
-            .unwrap_or(Err(ObjectError::PropertyNotWritable)),
+        if property == PropertyIdentifier::PresentValue {
+            return self.set_property_with_priority(property, value, None);
         }
+
+        shared_set(self.writable(), property, value)
+            .unwrap_or(Err(ObjectError::PropertyNotWritable))
     }
 
     fn set_property_with_priority(
@@ -858,38 +887,21 @@ impl BacnetObject for AnalogOutput {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::PresentValue
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        ) || analog_alarm_writable(property, self.alarm.is_some())
+        property == PropertyIdentifier::PresentValue
+            || shared_writable(property, self.alarm.is_some())
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = vec![
-            PropertyIdentifier::ObjectIdentifier,
-            PropertyIdentifier::ObjectName,
-            PropertyIdentifier::ObjectType,
-            PropertyIdentifier::PresentValue,
-            PropertyIdentifier::Description,
-            PropertyIdentifier::DeviceType,
-            PropertyIdentifier::StatusFlags,
-            PropertyIdentifier::EventState,
-            PropertyIdentifier::Reliability,
-            PropertyIdentifier::OutOfService,
-            PropertyIdentifier::Units,
-            PropertyIdentifier::PriorityArray,
-            PropertyIdentifier::RelinquishDefault,
-        ];
-        properties.extend(analog_alarm_property_list(
+        shared_property_list(
+            true,
+            &[
+                PropertyIdentifier::PriorityArray,
+                PropertyIdentifier::RelinquishDefault,
+            ],
             self.high_limit,
             self.low_limit,
             self.alarm.as_ref(),
-        ));
-        properties
+        )
     }
 
     analog_intrinsic_methods!();
@@ -902,44 +914,7 @@ impl BacnetObject for AnalogValue {
 
     fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
         match property {
-            PropertyIdentifier::ObjectIdentifier => {
-                Ok(PropertyValue::ObjectIdentifier(self.identifier))
-            }
-            PropertyIdentifier::ObjectName => {
-                Ok(PropertyValue::CharacterString(self.object_name.clone()))
-            }
-            PropertyIdentifier::ObjectType => Ok(PropertyValue::Enumerated(u32::from(
-                ObjectType::AnalogValue,
-            ))),
-            PropertyIdentifier::PresentValue => Ok(PropertyValue::Real(self.present_value)),
-            PropertyIdentifier::Description => {
-                Ok(PropertyValue::CharacterString(self.description.clone()))
-            }
-            PropertyIdentifier::StatusFlags => Ok(PropertyValue::BitString(status_flags_bits(
-                self.event_state,
-                self.reliability,
-                self.out_of_service,
-                self.overridden,
-            ))),
-            PropertyIdentifier::EventState => Ok(PropertyValue::Enumerated(
-                u16::from(self.event_state).into(),
-            )),
-            PropertyIdentifier::Reliability => {
-                Ok(PropertyValue::Enumerated(self.reliability.into()))
-            }
-            PropertyIdentifier::OutOfService => Ok(PropertyValue::Boolean(self.out_of_service)),
-            PropertyIdentifier::Units => Ok(PropertyValue::Enumerated(self.units.into())),
-            PropertyIdentifier::PriorityArray => {
-                let array: Vec<PropertyValue> = self
-                    .priority_array
-                    .iter()
-                    .map(|&v| match v {
-                        Some(val) => PropertyValue::Real(val),
-                        None => PropertyValue::Null,
-                    })
-                    .collect();
-                Ok(PropertyValue::Array(array))
-            }
+            PropertyIdentifier::PriorityArray => Ok(priority_array_value(&self.priority_array)),
             PropertyIdentifier::RelinquishDefault => {
                 Ok(PropertyValue::Real(self.relinquish_default))
             }
@@ -947,65 +922,17 @@ impl BacnetObject for AnalogValue {
                 .cov_increment
                 .map(PropertyValue::Real)
                 .ok_or(ObjectError::UnknownProperty),
-            _ => analog_alarm_get(
-                self.high_limit,
-                self.low_limit,
-                self.deadband,
-                self.alarm.as_ref(),
-                property,
-            )
-            .unwrap_or(Err(ObjectError::UnknownProperty)),
+            _ => shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty)),
         }
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
-        match property {
-            PropertyIdentifier::ObjectName => {
-                if let PropertyValue::CharacterString(name) = value {
-                    self.object_name = name;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::Description => {
-                if let PropertyValue::CharacterString(text) = value {
-                    self.description = text;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            // Writable so a simulated device can be driven into a fault state.
-            PropertyIdentifier::Reliability => {
-                if let PropertyValue::Enumerated(raw) = value {
-                    self.reliability = Reliability::from(raw);
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            PropertyIdentifier::PresentValue => {
-                self.set_property_with_priority(property, value, None)
-            }
-            PropertyIdentifier::OutOfService => {
-                if let PropertyValue::Boolean(oos) = value {
-                    self.out_of_service = oos;
-                    Ok(())
-                } else {
-                    Err(ObjectError::InvalidPropertyType)
-                }
-            }
-            _ => analog_alarm_set(
-                &mut self.high_limit,
-                &mut self.low_limit,
-                &mut self.deadband,
-                self.alarm.as_mut(),
-                property,
-                value,
-            )
-            .unwrap_or(Err(ObjectError::PropertyNotWritable)),
+        if property == PropertyIdentifier::PresentValue {
+            return self.set_property_with_priority(property, value, None);
         }
+
+        shared_set(self.writable(), property, value)
+            .unwrap_or(Err(ObjectError::PropertyNotWritable))
     }
 
     fn set_property_with_priority(
@@ -1022,40 +949,26 @@ impl BacnetObject for AnalogValue {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::PresentValue
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        ) || analog_alarm_writable(property, self.alarm.is_some())
+        property == PropertyIdentifier::PresentValue
+            || shared_writable(property, self.alarm.is_some())
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = vec![
-            PropertyIdentifier::ObjectIdentifier,
-            PropertyIdentifier::ObjectName,
-            PropertyIdentifier::ObjectType,
-            PropertyIdentifier::PresentValue,
-            PropertyIdentifier::Description,
-            PropertyIdentifier::StatusFlags,
-            PropertyIdentifier::EventState,
-            PropertyIdentifier::Reliability,
-            PropertyIdentifier::OutOfService,
-            PropertyIdentifier::Units,
+        let mut trailing = vec![
             PropertyIdentifier::PriorityArray,
             PropertyIdentifier::RelinquishDefault,
         ];
         if self.cov_increment.is_some() {
-            properties.push(PropertyIdentifier::CovIncrement);
+            trailing.push(PropertyIdentifier::CovIncrement);
         }
-        properties.extend(analog_alarm_property_list(
+
+        shared_property_list(
+            false,
+            &trailing,
             self.high_limit,
             self.low_limit,
             self.alarm.as_ref(),
-        ));
-        properties
+        )
     }
 
     analog_intrinsic_methods!();
