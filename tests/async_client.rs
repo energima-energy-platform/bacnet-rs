@@ -392,3 +392,123 @@ async fn hosted_server_supports_async_object_inspection_and_writes() {
     shutdown.send(()).unwrap();
     server_task.await.unwrap().unwrap();
 }
+
+/// Answer every request promptly, reporting the invoke ID each one carried.
+///
+/// Used to walk the endpoint's invoke ID counter all the way round, which is
+/// the only way a previously-abandoned ID comes up for reuse.
+fn quick_responder(device: UdpSocket, count: usize) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut buffer = [0_u8; 1500];
+        let mut seen = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (length, source) = device.recv_from(&mut buffer).await.unwrap();
+            let request = parse_confirmed_request(&buffer[..length]);
+            if let Apdu::ConfirmedRequest { invoke_id, .. } = &request {
+                seen.push(*invoke_id);
+            }
+            let (_, frame) = read_property_ack(request);
+            device.send_to(&frame, source).await.unwrap();
+        }
+        seen
+    })
+}
+
+/// A device that answers after the client has given up must not have its
+/// answer handed to whatever question came next.
+///
+/// The invoke ID is the only thing the endpoint routes a response on, so an ID
+/// that comes back into circulation makes a late response indistinguishable
+/// from the right one: same peer, same service choice, same ID. The counter
+/// advances monotonically, so this only bites once it has been all the way
+/// round - which on a busy client takes no time at all. Hence the 256 requests
+/// here: without them the IDs differ for a reason that has nothing to do with
+/// the quarantine, and the test would pass whether or not it worked.
+#[tokio::test]
+async fn an_abandoned_invoke_id_is_skipped_when_the_counter_comes_round() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = device.local_addr().unwrap();
+
+    let ignored = tokio::spawn(async move {
+        let mut buffer = [0_u8; 1500];
+        let (length, _) = device.recv_from(&mut buffer).await.unwrap();
+        let request = parse_confirmed_request(&buffer[..length]);
+        let Apdu::ConfirmedRequest { invoke_id, .. } = request else {
+            unreachable!()
+        };
+        (device, invoke_id)
+    });
+
+    // Long enough that the quarantine is still in force while the 256 requests
+    // below run - they are loopback round trips and take a few tens of ms.
+    let client = test_client(Duration::from_millis(500), 0).await;
+    let abandoned = ObjectIdentifier::new(ObjectType::AnalogValue, 11);
+    assert!(
+        client
+            .read_property(address, abandoned, PropertyIdentifier::PresentValue)
+            .await
+            .is_err(),
+        "the unanswered request should time out"
+    );
+    let (device, abandoned_id) = ignored.await.unwrap();
+
+    let responder = quick_responder(device, 256);
+    let object = ObjectIdentifier::new(ObjectType::AnalogValue, 3);
+    for _ in 0..256 {
+        client
+            .read_property(address, object, PropertyIdentifier::PresentValue)
+            .await
+            .unwrap();
+    }
+
+    let used = responder.await.unwrap();
+    assert!(
+        !used.contains(&abandoned_id),
+        "invoke id {abandoned_id} was reissued while its transaction could still \
+         be answered late, so that answer would be delivered as another request's"
+    );
+}
+
+/// And it comes back afterwards, so a device having a bad minute does not
+/// permanently shrink a 256-entry pool.
+#[tokio::test]
+async fn a_quarantined_invoke_id_returns_once_its_budget_passes() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = device.local_addr().unwrap();
+
+    let ignored = tokio::spawn(async move {
+        let mut buffer = [0_u8; 1500];
+        let (length, _) = device.recv_from(&mut buffer).await.unwrap();
+        let request = parse_confirmed_request(&buffer[..length]);
+        let Apdu::ConfirmedRequest { invoke_id, .. } = request else {
+            unreachable!()
+        };
+        (device, invoke_id)
+    });
+
+    let client = test_client(Duration::from_millis(40), 0).await;
+    let abandoned = ObjectIdentifier::new(ObjectType::AnalogValue, 11);
+    let _ = client
+        .read_property(address, abandoned, PropertyIdentifier::PresentValue)
+        .await;
+    let (device, abandoned_id) = ignored.await.unwrap();
+
+    // Past the 40ms budget, so the hold has lapsed.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let responder = quick_responder(device, 256);
+    let object = ObjectIdentifier::new(ObjectType::AnalogValue, 3);
+    for _ in 0..256 {
+        client
+            .read_property(address, object, PropertyIdentifier::PresentValue)
+            .await
+            .unwrap();
+    }
+
+    let used = responder.await.unwrap();
+    assert!(
+        used.contains(&abandoned_id),
+        "invoke id {abandoned_id} never came back, so a timing-out device would \
+         whittle the pool away a transaction at a time"
+    );
+}

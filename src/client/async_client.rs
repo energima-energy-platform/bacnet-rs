@@ -597,6 +597,20 @@ struct Endpoint {
     socket: UdpSocket,
     commands: mpsc::Receiver<EndpointCommand>,
     pending: HashMap<u8, PendingTransaction>,
+    /// Invoke IDs that timed out, and the instant each may be issued again.
+    ///
+    /// A device that answers after we have given up sends its response with
+    /// the invoke ID we gave up on. If that ID has already been reissued, the
+    /// late response matches the new transaction: same peer, same service
+    /// choice, same ID. It is then delivered as the answer to a question it
+    /// was never asked - and for a client that reads the same objects from
+    /// the same device on a cycle, the stale answer can be structurally
+    /// indistinguishable from the right one.
+    ///
+    /// Holding the ID back for one full transaction budget after it fails
+    /// means the late response arrives when nothing is listening, which is
+    /// where it belongs.
+    quarantined: HashMap<u8, Instant>,
     device_discoveries: Vec<ActiveDiscovery<DeviceInfo>>,
     router_discoveries: Vec<ActiveDiscovery<DiscoveredRouter>>,
     cov_subscribers: HashMap<u32, mpsc::UnboundedSender<CovNotification>>,
@@ -617,6 +631,7 @@ impl Endpoint {
             socket,
             commands,
             pending: HashMap::new(),
+            quarantined: HashMap::new(),
             device_discoveries: Vec::new(),
             router_discoveries: Vec::new(),
             cov_subscribers: HashMap::new(),
@@ -775,14 +790,29 @@ impl Endpoint {
     }
 
     fn reserve_invoke_id(&mut self) -> Option<u8> {
+        let now = Instant::now();
+        self.quarantined.retain(|_, until| *until > now);
         for _ in 0..=u8::MAX {
             let invoke_id = self.next_invoke_id;
             self.next_invoke_id = self.next_invoke_id.wrapping_add(1);
-            if !self.pending.contains_key(&invoke_id) {
+            if !self.pending.contains_key(&invoke_id) && !self.quarantined.contains_key(&invoke_id)
+            {
                 return Some(invoke_id);
             }
         }
         None
+    }
+
+    /// How long one transaction may take before it is abandoned: the initial
+    /// attempt plus every retransmission, each with its own timeout.
+    ///
+    /// Also how long a failed invoke ID stays quarantined. A device that has
+    /// not answered within its whole budget is unlikely to answer after
+    /// another one, and holding the ID longer would shrink the pool for no
+    /// further protection.
+    fn transaction_budget(&self) -> Duration {
+        self.timeout
+            .saturating_mul(u32::from(self.retries).saturating_add(1))
     }
 
     fn handle_packet(&mut self, length: usize, source: SocketAddr) {
@@ -863,6 +893,12 @@ impl Endpoint {
             _ => return,
         };
         let Some(pending) = self.pending.get(&invoke_id) else {
+            // Worth a line rather than a silent drop: a response on a
+            // quarantined ID is this device answering after we gave up on it,
+            // which is the thing you want to know when a site looks slow.
+            if self.quarantined.contains_key(&invoke_id) {
+                log::debug!("late response from {source} on invoke id {invoke_id}, discarded");
+            }
             return;
         };
         if pending.peer != source || !response_matches_service(&apdu, pending.service_choice) {
@@ -896,6 +932,8 @@ impl Endpoint {
             if pending.retries_remaining == 0 {
                 if let Some(pending) = self.pending.remove(&invoke_id) {
                     let _ = pending.response.send(Err(ClientError::Timeout));
+                    self.quarantined
+                        .insert(invoke_id, Instant::now() + self.transaction_budget());
                 }
                 continue;
             }
@@ -922,7 +960,19 @@ impl Endpoint {
             .get(&notification.subscriber_process_identifier)
         {
             let _ = sink.send(notification);
+            return;
         }
+        // Nothing is listening on this process identifier. Usually a
+        // subscription this client established before a restart and the device
+        // has not yet let lapse, but it is also how a device sending an
+        // identifier that was never ours looks. Either way the notification is
+        // dropped - saying so is what stops a caller's count of them being a
+        // silent underestimate.
+        log::debug!(
+            "COV notification for process id {} from device {}, which nothing subscribed; discarded",
+            notification.subscriber_process_identifier,
+            notification.initiating_device.instance
+        );
     }
 
     /// Decode, dispatch, and acknowledge an inbound ConfirmedCOVNotification.
