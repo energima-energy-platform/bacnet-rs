@@ -6,7 +6,7 @@
 //! rejects/aborts, per-property errors, etc.) instead of inspecting strings.
 
 use crate::encoding::EncodingError;
-use crate::service::{AbortReason, RejectReason};
+use crate::service::{AbortReason, ErrorClass, ErrorCode, RejectReason};
 use crate::util::describe_bacnet_error;
 use thiserror::Error;
 
@@ -52,12 +52,19 @@ pub enum ClientError {
 
     /// The device returned a BACnet `Error` PDU (or a per-property error inside
     /// a ReadPropertyMultiple result), identified by its error class and code.
+    ///
+    /// Typed rather than numeric so a caller deciding what to do about a
+    /// refusal matches on a name. The distinction usually matters: an
+    /// [`ErrorCode::UnknownObject`] means the point is gone and asking again
+    /// is pointless, while a resource error means the device was merely busy.
+    /// Codes this crate does not name still round-trip through the enums'
+    /// `Reserved`/`Custom` arms, so nothing a device can say is lost.
     #[error("{}", describe_bacnet_error(*class, *code))]
     PropertyError {
         /// BACnet error class.
-        class: u32,
+        class: ErrorClass,
         /// BACnet error code.
-        code: u32,
+        code: ErrorCode,
     },
 
     /// A supplied address could not be parsed or resolved.

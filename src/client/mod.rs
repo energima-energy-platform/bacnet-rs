@@ -1001,8 +1001,8 @@ impl BacnetClient {
                 error_code,
                 ..
             } if invoke_id == expected_invoke_id => Err(ClientError::PropertyError {
-                class: error_class,
-                code: error_code,
+                class: error_class.into(),
+                code: error_code.into(),
             }),
             Apdu::Reject {
                 invoke_id,
@@ -1079,6 +1079,7 @@ fn is_broadcast_target(addr: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::{ErrorClass, ErrorCode};
 
     #[test]
     fn test_object_id_encoding() {
@@ -1303,23 +1304,30 @@ mod tests {
         assert_eq!(ClientError::Timeout.to_string(), "request timed out");
 
         // Known class + code are named, with the raw numbers retained.
-        let known = ClientError::PropertyError { class: 1, code: 31 };
+        let known = ClientError::PropertyError {
+            class: ErrorClass::Object,
+            code: ErrorCode::UnknownObject,
+        };
         assert_eq!(
             known.to_string(),
             "unknown-object (class object[1], code 31)"
         );
 
         // Property/write-access-denied — the case seen against real hardware.
-        let denied = ClientError::PropertyError { class: 2, code: 40 };
+        let denied = ClientError::PropertyError {
+            class: ErrorClass::Property,
+            code: ErrorCode::WriteAccessDenied,
+        };
         assert_eq!(
             denied.to_string(),
             "write-access-denied (class property[2], code 40)"
         );
 
-        // Unknown code falls back to the numeric form.
+        // A code with no variant still describes itself by number rather than
+        // being flattened to "other" - the device meant something specific.
         let unknown = ClientError::PropertyError {
-            class: 2,
-            code: 222,
+            class: ErrorClass::Property,
+            code: ErrorCode::from(222),
         };
         assert_eq!(
             unknown.to_string(),

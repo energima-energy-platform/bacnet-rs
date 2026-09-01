@@ -389,6 +389,61 @@ generate_custom_enum!(
     ApduTooLong = 11,
 }, u8, 64..=255);
 
+generate_custom_enum!(
+    /// Error class of a BACnet `Error` PDU (ASHRAE 135 `BACnetErrorClass`).
+    ///
+    /// Which *kind* of thing went wrong, where the code says what. The pair is
+    /// what a device answers a request it will not satisfy - a property that
+    /// does not exist, an object that is not there, a service it does not
+    /// implement - and callers routinely need to tell one from another to
+    /// decide whether asking again could ever help.
+    ///
+    /// ASHRAE reserves classes below 64 for itself and leaves 64 and above to
+    /// vendors, so an unnamed class surfaces as `Reserved` or `Custom`
+    /// accordingly. Either way the number is preserved, because a class this
+    /// table has never heard of is still a class the device meant.
+    ErrorClass{
+    Device = 0,
+    Object = 1,
+    Property = 2,
+    Resources = 3,
+    Security = 4,
+    Services = 5,
+    Vt = 6,
+    Communication = 7,
+}, u32, 64..=u32::MAX);
+
+generate_custom_enum!(
+    /// Error code of a BACnet `Error` PDU (ASHRAE 135 `BACnetErrorCode`).
+    ///
+    /// Named here are the codes this crate has a reason to distinguish -
+    /// notably [`ErrorCode::UnknownObject`] and [`ErrorCode::UnknownProperty`],
+    /// which are how a device says a point has gone rather than that something
+    /// failed. The standard defines many more; an unnamed one round-trips
+    /// through `Reserved` (at or below 255, ASHRAE's range) or `Custom` (above
+    /// it, proprietary) with its number intact, so nothing is lost by this
+    /// list being partial - and adding a variant is a one-line change that
+    /// turns a number a caller was matching by hand into a name.
+    ErrorCode{
+    Other = 0,
+    InvalidDataType = 9,
+    NoSpaceToWriteProperty = 20,
+    ObjectDeletionNotPermitted = 23,
+    ReadAccessDenied = 27,
+    ServiceRequestDenied = 29,
+    Timeout = 30,
+    UnknownObject = 31,
+    UnknownProperty = 32,
+    ValueOutOfRange = 37,
+    WriteAccessDenied = 40,
+    InvalidArrayIndex = 42,
+    NotCovProperty = 44,
+    OptionalFunctionalityNotSupported = 45,
+    DatatypeNotSupported = 47,
+    PropertyIsNotAnArray = 50,
+    UnknownDevice = 70,
+}, u32, 256..=u32::MAX);
+
 use crate::encoding::{
     decode_closing_tag, decode_context_boolean, decode_context_enumerated,
     decode_context_object_id, decode_context_tag, decode_context_unsigned, decode_enumerated,
@@ -3278,5 +3333,38 @@ mod tests {
         response.encode(&mut encoded).unwrap();
         assert_eq!(encoded.len(), data.len());
         assert_eq!(encoded, data);
+    }
+
+    /// A code the enum names and a code it does not must both survive the
+    /// trip to a number and back. The gateway above this crate keys decisions
+    /// on these - "the point is gone" versus "the device is busy" - and a code
+    /// flattened to `Other` on the way through would answer the wrong one.
+    #[test]
+    fn an_error_code_round_trips_whether_or_not_it_is_named() {
+        for code in [0_u32, 31, 32, 70, 99, 255, 256, 4242] {
+            assert_eq!(
+                u32::from(ErrorCode::from(code)),
+                code,
+                "error code {code} did not survive the round trip"
+            );
+        }
+        assert_eq!(ErrorCode::from(31), ErrorCode::UnknownObject);
+        assert_eq!(ErrorCode::from(32), ErrorCode::UnknownProperty);
+    }
+
+    #[test]
+    fn an_error_class_round_trips_whether_or_not_it_is_named() {
+        for class in [0_u32, 2, 7, 8, 63, 64, 9000] {
+            assert_eq!(u32::from(ErrorClass::from(class)), class);
+        }
+        assert_eq!(ErrorClass::from(1), ErrorClass::Object);
+        assert_eq!(ErrorClass::from(2), ErrorClass::Property);
+    }
+
+    /// Two different unnamed codes must not compare equal just because
+    /// neither has a variant - they are different refusals.
+    #[test]
+    fn two_unnamed_codes_are_not_the_same_code() {
+        assert_ne!(ErrorCode::from(200), ErrorCode::from(201));
     }
 }

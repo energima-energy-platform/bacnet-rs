@@ -413,12 +413,22 @@ impl AsyncBacnetClient {
 
     /// Subscribe to Change-of-Value notifications for one object.
     ///
-    /// `subscriber_process_identifier` is echoed back on every notification, so
-    /// the endpoint can route it to this subscription rather than another one
-    /// live on the same client. Once the device's SimpleAck confirms the
-    /// subscription, notifications arrive through [`CovSubscription::recv`]. A
-    /// confirmed notification is acknowledged back to the device automatically;
-    /// the caller only ever sees the decoded value.
+    /// `device_instance` is the instance number of the device being subscribed
+    /// to - not the address it is reached at. It and
+    /// `monitored_object_identifier` are how arriving notifications are routed
+    /// back to this subscription, because they are what a notification says
+    /// about itself. Once the device's SimpleAck confirms the subscription,
+    /// notifications arrive through [`CovSubscription::recv`]. A confirmed
+    /// notification is acknowledged back to the device automatically; the
+    /// caller only ever sees the decoded value.
+    ///
+    /// `subscriber_process_identifier` goes on the wire and is echoed back, but
+    /// nothing here routes on it. Pick one derived from the object's identity
+    /// rather than from a counter: a device keys a subscription on the
+    /// subscriber's address and that number, so a client that restarts and asks
+    /// again with the same one is renewing what the device already holds, while
+    /// a fresh number leaves a duplicate subscription in place until its
+    /// lifetime lapses. Two objects picking the same number is harmless.
     ///
     /// `lifetime` is `None` for a subscription that does not expire. The
     /// confirmation preference is not optional: ASHRAE 135 clause 13.14.1.4
@@ -427,6 +437,7 @@ impl AsyncBacnetClient {
     pub async fn subscribe_cov<T>(
         &self,
         target: T,
+        device_instance: u32,
         subscriber_process_identifier: u32,
         monitored_object_identifier: ObjectIdentifier,
         issue_confirmed_notifications: bool,
@@ -450,7 +461,7 @@ impl AsyncBacnetClient {
         self.commands
             .send(EndpointCommand::SubscribeCov {
                 target: target.clone(),
-                subscriber_process_identifier,
+                key: (device_instance, monitored_object_identifier),
                 service_data,
                 sink,
                 response,
@@ -461,6 +472,7 @@ impl AsyncBacnetClient {
         ack?;
 
         Ok(CovSubscription {
+            device_instance,
             subscriber_process_identifier,
             monitored_object_identifier,
             target,
@@ -478,6 +490,8 @@ impl AsyncBacnetClient {
 /// explicitly. Dropping this value without unsubscribing just lets the
 /// subscription lapse on its own; nothing tells the device to stop early.
 pub struct CovSubscription {
+    /// Half of the routing key, kept so a renewal re-registers the same one.
+    device_instance: u32,
     subscriber_process_identifier: u32,
     monitored_object_identifier: ObjectIdentifier,
     target: BacnetTarget,
@@ -516,6 +530,7 @@ impl CovSubscription {
             .client
             .subscribe_cov(
                 self.target.clone(),
+                self.device_instance,
                 self.subscriber_process_identifier,
                 self.monitored_object_identifier,
                 issue_confirmed_notifications,
@@ -570,7 +585,9 @@ enum EndpointCommand {
     },
     SubscribeCov {
         target: BacnetTarget,
-        subscriber_process_identifier: u32,
+        /// What notifications for this subscription will identify themselves
+        /// as, and therefore how they are routed back here.
+        key: CovKey,
         service_data: Vec<u8>,
         sink: mpsc::UnboundedSender<CovNotification>,
         response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
@@ -585,7 +602,6 @@ struct ActiveDiscovery<T> {
 }
 
 struct PendingTransaction {
-    peer: SocketAddr,
     service_choice: ConfirmedServiceChoice,
     frame: Arc<[u8]>,
     retries_remaining: u8,
@@ -593,10 +609,31 @@ struct PendingTransaction {
     response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
 }
 
+/// What one outstanding transaction is identified by.
+///
+/// The peer is half the key because ASHRAE 135 clause 5.4 scopes the
+/// transaction state machine to a pair of devices: an invoke ID need only be
+/// unique among the requests one device has outstanding *to one other device*.
+/// Keying on the number alone would make the 256 available IDs a budget for
+/// the whole network rather than for each peer, so a client talking to two
+/// hundred controllers would run out against all of them at once.
+type TransactionKey = (SocketAddr, u8);
+
+/// What a COV notification is routed by: the device that says it sent it, and
+/// the object it says the notification is about.
+///
+/// Deliberately not the subscriber process identifier. That number is chosen
+/// by the subscriber and echoed by the device, so routing on it means two
+/// subscriptions that happen to pick the same number are indistinguishable -
+/// and since the routing table is a map, the second silently displaces the
+/// first, whose notifications then stop arriving with nothing to say so. The
+/// identity a notification asserts about itself cannot collide that way.
+type CovKey = (u32, ObjectIdentifier);
+
 struct Endpoint {
     socket: UdpSocket,
     commands: mpsc::Receiver<EndpointCommand>,
-    pending: HashMap<u8, PendingTransaction>,
+    pending: HashMap<TransactionKey, PendingTransaction>,
     /// Invoke IDs that timed out, and the instant each may be issued again.
     ///
     /// A device that answers after we have given up sends its response with
@@ -610,10 +647,14 @@ struct Endpoint {
     /// Holding the ID back for one full transaction budget after it fails
     /// means the late response arrives when nothing is listening, which is
     /// where it belongs.
-    quarantined: HashMap<u8, Instant>,
+    ///
+    /// Held back for the peer that failed to answer and not for the rest: one
+    /// slow controller has no business narrowing the ID space available to
+    /// every other device on the network.
+    quarantined: HashMap<TransactionKey, Instant>,
     device_discoveries: Vec<ActiveDiscovery<DeviceInfo>>,
     router_discoveries: Vec<ActiveDiscovery<DiscoveredRouter>>,
-    cov_subscribers: HashMap<u32, mpsc::UnboundedSender<CovNotification>>,
+    cov_subscribers: HashMap<CovKey, mpsc::UnboundedSender<CovNotification>>,
     next_invoke_id: u8,
     timeout: Duration,
     retries: u8,
@@ -711,15 +752,19 @@ impl Endpoint {
             }
             EndpointCommand::SubscribeCov {
                 target,
-                subscriber_process_identifier,
+                key,
                 service_data,
                 sink,
                 response,
             } => {
                 // Registered before the request goes out, so a notification
                 // that arrives right behind the SimpleAck is never missed.
-                self.cov_subscribers
-                    .insert(subscriber_process_identifier, sink);
+                //
+                // A renewal re-registers the same key and replaces the sink,
+                // which is the intended effect: one subscription to an object
+                // has one channel, whatever process identifier it was asked
+                // for with.
+                self.cov_subscribers.insert(key, sink);
                 self.handle_confirmed_command(
                     target,
                     ConfirmedServiceChoice::SubscribeCOV,
@@ -765,16 +810,15 @@ impl Endpoint {
         // A cancelled request may have released an invoke ID while the endpoint
         // was asleep in select. Reclaim those slots before admitting new work.
         self.remove_cancelled();
-        let Some(invoke_id) = self.reserve_invoke_id() else {
+        let Some(invoke_id) = self.reserve_invoke_id(target.address) else {
             let _ = response.send(Err(ClientError::TooManyTransactions));
             return;
         };
         let frame: Arc<[u8]> =
             build_confirmed_frame(&target, invoke_id, service_choice, service_data).into();
         self.pending.insert(
-            invoke_id,
+            (target.address, invoke_id),
             PendingTransaction {
-                peer: target.address,
                 service_choice,
                 frame: Arc::clone(&frame),
                 retries_remaining: self.retries,
@@ -783,20 +827,27 @@ impl Endpoint {
             },
         );
         if let Err(error) = self.socket.send_to(&frame, target.address).await {
-            if let Some(pending) = self.pending.remove(&invoke_id) {
+            if let Some(pending) = self.pending.remove(&(target.address, invoke_id)) {
                 let _ = pending.response.send(Err(ClientError::Io(error)));
             }
         }
     }
 
-    fn reserve_invoke_id(&mut self) -> Option<u8> {
+    /// Reserve an invoke ID for a request to `peer`.
+    ///
+    /// Occupancy is checked per peer, so the 256 IDs are a budget for each
+    /// device rather than for the whole client. `next_invoke_id` stays a
+    /// single rotating cursor across every peer: it only decides where the
+    /// search starts, and keeping one avoids a per-peer cursor that would have
+    /// to be reaped along with the peer.
+    fn reserve_invoke_id(&mut self, peer: SocketAddr) -> Option<u8> {
         let now = Instant::now();
         self.quarantined.retain(|_, until| *until > now);
         for _ in 0..=u8::MAX {
             let invoke_id = self.next_invoke_id;
             self.next_invoke_id = self.next_invoke_id.wrapping_add(1);
-            if !self.pending.contains_key(&invoke_id) && !self.quarantined.contains_key(&invoke_id)
-            {
+            let key = (peer, invoke_id);
+            if !self.pending.contains_key(&key) && !self.quarantined.contains_key(&key) {
                 return Some(invoke_id);
             }
         }
@@ -892,20 +943,25 @@ impl Endpoint {
             | Apdu::Abort { invoke_id, .. } => *invoke_id,
             _ => return,
         };
-        let Some(pending) = self.pending.get(&invoke_id) else {
+        // Keyed on where the response came from as well as the ID it carries,
+        // so a reply from one device is never considered against a
+        // transaction outstanding with another - which is what makes it safe
+        // for the same invoke ID to be live with several peers at once.
+        let key = (source, invoke_id);
+        let Some(pending) = self.pending.get(&key) else {
             // Worth a line rather than a silent drop: a response on a
             // quarantined ID is this device answering after we gave up on it,
             // which is the thing you want to know when a site looks slow.
-            if self.quarantined.contains_key(&invoke_id) {
+            if self.quarantined.contains_key(&key) {
                 log::debug!("late response from {source} on invoke id {invoke_id}, discarded");
             }
             return;
         };
-        if pending.peer != source || !response_matches_service(&apdu, pending.service_choice) {
+        if !response_matches_service(&apdu, pending.service_choice) {
             return;
         }
         let result = response_result(apdu);
-        if let Some(pending) = self.pending.remove(&invoke_id) {
+        if let Some(pending) = self.pending.remove(&key) {
             let _ = pending.response.send(result);
         }
     }
@@ -919,59 +975,62 @@ impl Endpoint {
         let expired = self
             .pending
             .iter()
-            .filter_map(|(invoke_id, pending)| (pending.deadline <= now).then_some(*invoke_id))
+            .filter_map(|(key, pending)| (pending.deadline <= now).then_some(*key))
             .collect::<Vec<_>>();
-        for invoke_id in expired {
-            let Some(pending) = self.pending.get_mut(&invoke_id) else {
+        for key in expired {
+            let Some(pending) = self.pending.get_mut(&key) else {
                 continue;
             };
             if pending.response.is_closed() {
-                self.pending.remove(&invoke_id);
+                self.pending.remove(&key);
                 continue;
             }
             if pending.retries_remaining == 0 {
-                if let Some(pending) = self.pending.remove(&invoke_id) {
+                if let Some(pending) = self.pending.remove(&key) {
                     let _ = pending.response.send(Err(ClientError::Timeout));
                     self.quarantined
-                        .insert(invoke_id, Instant::now() + self.transaction_budget());
+                        .insert(key, Instant::now() + self.transaction_budget());
                 }
                 continue;
             }
             pending.retries_remaining -= 1;
             pending.deadline = Instant::now() + self.timeout;
             let frame = Arc::clone(&pending.frame);
-            let peer = pending.peer;
+            let (peer, _) = key;
             if let Err(error) = self.socket.send_to(&frame, peer).await {
-                if let Some(pending) = self.pending.remove(&invoke_id) {
+                if let Some(pending) = self.pending.remove(&key) {
                     let _ = pending.response.send(Err(ClientError::Io(error)));
                 }
             }
         }
     }
 
-    /// Route a decoded notification to whichever subscription asked for it.
+    /// Route a decoded notification to the subscription for the object it says
+    /// it is about.
     ///
-    /// A subscriber_process_identifier with no matching (or already-dropped)
-    /// subscription is silently ignored - the notification simply isn't ours
-    /// to deliver anywhere.
+    /// Routed on what the notification asserts - its initiating device and its
+    /// monitored object - rather than on the process identifier it echoes.
+    /// Those two are the subscription's identity; the process identifier is
+    /// only a number the subscriber picked, and two subscriptions are free to
+    /// pick the same one.
+    ///
+    /// A notification matching no live subscription is dropped. That covers
+    /// both a subscription this client established before a restart and has
+    /// not re-established, and a device reporting an object nobody here asked
+    /// about - neither of which there is any honest way to deliver.
     fn dispatch_cov_notification(&mut self, notification: CovNotification) {
-        if let Some(sink) = self
-            .cov_subscribers
-            .get(&notification.subscriber_process_identifier)
-        {
+        let key = (
+            notification.initiating_device.instance,
+            notification.monitored_object,
+        );
+        if let Some(sink) = self.cov_subscribers.get(&key) {
             let _ = sink.send(notification);
             return;
         }
-        // Nothing is listening on this process identifier. Usually a
-        // subscription this client established before a restart and the device
-        // has not yet let lapse, but it is also how a device sending an
-        // identifier that was never ours looks. Either way the notification is
-        // dropped - saying so is what stops a caller's count of them being a
-        // silent underestimate.
         log::debug!(
-            "COV notification for process id {} from device {}, which nothing subscribed; discarded",
-            notification.subscriber_process_identifier,
-            notification.initiating_device.instance
+            "COV notification from device {} about {:?}, which nothing subscribed; discarded",
+            notification.initiating_device.instance,
+            notification.monitored_object
         );
     }
 
@@ -1143,8 +1202,8 @@ fn response_result(apdu: Apdu) -> Result<Vec<u8>, ClientError> {
             error_code,
             ..
         } => Err(ClientError::PropertyError {
-            class: error_class,
-            code: error_code,
+            class: error_class.into(),
+            code: error_code.into(),
         }),
         Apdu::Reject { reject_reason, .. } => Err(ClientError::Rejected(reject_reason)),
         Apdu::Abort { abort_reason, .. } => {

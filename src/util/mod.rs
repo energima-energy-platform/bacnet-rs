@@ -230,8 +230,17 @@ pub fn bacnet_error_code_name(code: u32) -> Option<&'static str> {
     })
 }
 
+use crate::service::{ErrorClass, ErrorCode};
+
 /// Describe a BACnet error while retaining its numeric class and code.
-pub fn describe_bacnet_error(class: u32, code: u32) -> String {
+///
+/// Takes the typed pair but names them from the tables above rather than from
+/// the enums' own `Display`: these are the standard's kebab-case spellings,
+/// which is what an operator reading a log will find in the standard, and the
+/// enums spell their variants the way Rust does.
+pub fn describe_bacnet_error(class: ErrorClass, code: ErrorCode) -> String {
+    let class = u32::from(class);
+    let code = u32::from(code);
     let class_label = match bacnet_error_class_name(class) {
         Some(name) => format!("{name}[{class}]"),
         None => format!("{class}"),
