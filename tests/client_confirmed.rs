@@ -23,9 +23,9 @@ use bacnet_rs::{
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier},
     property::PropertyValue,
     service::{
-        AbortReason, ConfirmedServiceChoice, PropertyResult, ReadAccessResult,
-        ReadPropertyMultipleRequest, ReadPropertyMultipleResponse, ReadPropertyRequest,
-        ReadPropertyResponse, RejectReason,
+        AbortReason, ConfirmedServiceChoice, ErrorClass, ErrorCode, PropertyResult,
+        ReadAccessResult, ReadPropertyMultipleRequest, ReadPropertyMultipleResponse,
+        ReadPropertyRequest, ReadPropertyResponse, RejectReason,
     },
 };
 
@@ -278,7 +278,13 @@ fn read_property_surfaces_error_pdu() {
         .expect_err("device returned an error PDU");
 
     assert!(
-        matches!(err, ClientError::PropertyError { class: 1, code: 32 }),
+        matches!(
+            err,
+            ClientError::PropertyError {
+                class: ErrorClass::Object,
+                code: ErrorCode::UnknownProperty
+            }
+        ),
         "expected PropertyError(1, 32), got {err:?}"
     );
 }
@@ -423,7 +429,10 @@ fn object_list_does_not_hide_read_access_errors() {
 
     assert!(matches!(
         test_client().read_object_list(addr, 1234),
-        Err(ClientError::PropertyError { class: 2, code: 27 })
+        Err(ClientError::PropertyError {
+            class: ErrorClass::Property,
+            code: ErrorCode::ReadAccessDenied
+        })
     ));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }

@@ -512,3 +512,122 @@ async fn a_quarantined_invoke_id_returns_once_its_budget_passes() {
          whittle the pool away a transaction at a time"
     );
 }
+
+/// One device's outstanding transactions must not consume another device's
+/// invoke IDs.
+///
+/// ASHRAE 135 scopes the transaction state machine to a pair of devices, so
+/// each peer has its own 256. Keyed globally, a client with many devices in
+/// flight at once runs out against all of them together - and a site is
+/// exactly that shape: two hundred controllers, each polled and subscribed
+/// concurrently. Two slow devices here stand in for that: neither answers, so
+/// both hold their transactions open, and a third request to a *different*
+/// peer still has to be admitted.
+#[tokio::test]
+async fn one_peer_holding_transactions_open_does_not_exhaust_another() {
+    // Two devices that receive and never answer, so their transactions stay
+    // outstanding for the length of the test.
+    let silent_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_one_addr = silent_one.local_addr().unwrap();
+    let silent_two_addr = silent_two.local_addr().unwrap();
+
+    let answering = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let answering_addr = answering.local_addr().unwrap();
+    let responder = quick_responder(answering, 1);
+
+    let client = test_client(Duration::from_secs(30), 0).await;
+    let object = ObjectIdentifier::new(ObjectType::AnalogValue, 1);
+
+    // Fill both silent peers' tables well past what a single shared table
+    // would have left over.
+    let mut outstanding = Vec::new();
+    for address in [silent_one_addr, silent_two_addr] {
+        for _ in 0..200 {
+            let client = client.clone();
+            outstanding.push(tokio::spawn(async move {
+                client
+                    .read_property(address, object, PropertyIdentifier::PresentValue)
+                    .await
+            }));
+        }
+    }
+
+    // Let those requests reach the endpoint before asking the third device for
+    // anything, so the budget is genuinely occupied when it is admitted.
+    //
+    // Bounded rather than counted: with a single shared budget most of these
+    // are refused an invoke ID and never reach the wire at all, and waiting
+    // for a fixed 400 would hang instead of failing. How many arrived is not
+    // the assertion - the third device answering is.
+    let mut buffer = [0_u8; 1500];
+    for socket in [&silent_one, &silent_two] {
+        for _ in 0..200 {
+            if tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buffer))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    let answered = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.read_property(answering_addr, object, PropertyIdentifier::PresentValue),
+    )
+    .await
+    .expect("a third device must still be reachable");
+    assert_eq!(
+        answered.unwrap(),
+        vec![PropertyValue::Real(1.0)],
+        "400 transactions outstanding with two other devices must not deny a third an invoke ID"
+    );
+
+    responder.await.unwrap();
+    for task in outstanding {
+        task.abort();
+    }
+}
+
+/// A response is matched to the peer that sent it, not to the ID alone.
+///
+/// This property is older than the per-peer budget - it used to be an explicit
+/// `pending.peer != source` comparison - but the budget is what makes it load
+/// bearing, because an ID can now legitimately be outstanding with two devices
+/// at once. The check now lives in the shape of the routing key rather than in
+/// a line of its own, so it is worth a test that would notice it going missing:
+/// for a client reading the same property from similar devices, one device's
+/// answer delivered to another's caller is indistinguishable from the truth.
+#[tokio::test]
+async fn a_response_is_matched_to_the_peer_that_sent_it() {
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second_addr = second.local_addr().unwrap();
+
+    // Each device answers with its own object instance as the value, so the
+    // two answers are told apart by content.
+    let first_responder = quick_responder(first, 1);
+    let second_responder = quick_responder(second, 1);
+
+    let client = test_client(Duration::from_secs(5), 0).await;
+    let (first_result, second_result) = tokio::join!(
+        client.read_property(
+            first_addr,
+            ObjectIdentifier::new(ObjectType::AnalogValue, 11),
+            PropertyIdentifier::PresentValue
+        ),
+        client.read_property(
+            second_addr,
+            ObjectIdentifier::new(ObjectType::AnalogValue, 22),
+            PropertyIdentifier::PresentValue
+        ),
+    );
+
+    assert_eq!(first_result.unwrap(), vec![PropertyValue::Real(11.0)]);
+    assert_eq!(second_result.unwrap(), vec![PropertyValue::Real(22.0)]);
+
+    first_responder.await.unwrap();
+    second_responder.await.unwrap();
+}
