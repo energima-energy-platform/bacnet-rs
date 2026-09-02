@@ -9,7 +9,7 @@
 //! window closes.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -472,13 +472,11 @@ impl AsyncBacnetClient {
         ack?;
 
         Ok(CovSubscription {
-            device_instance,
             subscriber_process_identifier,
             monitored_object_identifier,
             target,
             client: self.clone(),
             notifications,
-            carryover: VecDeque::new(),
         })
     }
 }
@@ -490,14 +488,11 @@ impl AsyncBacnetClient {
 /// explicitly. Dropping this value without unsubscribing just lets the
 /// subscription lapse on its own; nothing tells the device to stop early.
 pub struct CovSubscription {
-    /// Half of the routing key, kept so a renewal re-registers the same one.
-    device_instance: u32,
     subscriber_process_identifier: u32,
     monitored_object_identifier: ObjectIdentifier,
     target: BacnetTarget,
     client: AsyncBacnetClient,
     notifications: mpsc::UnboundedReceiver<CovNotification>,
-    carryover: VecDeque<CovNotification>,
 }
 
 impl CovSubscription {
@@ -508,39 +503,48 @@ impl CovSubscription {
 
     /// Wait for the next notification.
     ///
-    /// Returns `None` once the client endpoint has shut down.
+    /// Returns `None` once the client endpoint has shut down. A renewal does
+    /// not interrupt this: the channel a subscription is created with is the
+    /// one it keeps for its whole life.
     pub async fn recv(&mut self) -> Option<CovNotification> {
-        if let Some(notification) = self.carryover.pop_front() {
-            return Some(notification);
-        }
         self.notifications.recv().await
     }
 
     /// Refreshes the subscription before its lifetime lapses, re-sending
     /// SubscribeCOV with the same identifiers so the device treats it as a
-    /// renewal rather than a competing second subscription. Anything that
-    /// arrived on the old channel during the round trip is preserved and
-    /// served before newer notifications. On error, `self` is unchanged.
+    /// renewal rather than a competing second subscription.
+    ///
+    /// Sent as a plain confirmed request rather than through
+    /// [`AsyncBacnetClient::subscribe_cov`], because this subscription's
+    /// channel is already registered under a key the renewal does not change.
+    /// Going the other way would build a second channel and register it over
+    /// the first *before* the request goes out - so a renewal that then timed
+    /// out would leave this subscription alive but permanently silent, its
+    /// sink evicted by an attempt that never succeeded. A refresh must not be
+    /// able to cost the caller the subscription it is refreshing.
+    ///
+    /// `self` is unchanged either way: on success the device has simply been
+    /// told to keep reporting, and on error nothing here has moved.
     pub async fn renew(
         &mut self,
         issue_confirmed_notifications: bool,
         lifetime: Option<u32>,
     ) -> Result<(), ClientError> {
-        let renewed = self
-            .client
-            .subscribe_cov(
-                self.target.clone(),
-                self.device_instance,
-                self.subscriber_process_identifier,
-                self.monitored_object_identifier,
-                issue_confirmed_notifications,
-                lifetime,
+        let request = SubscribeCovRequest::subscribe(
+            self.subscriber_process_identifier,
+            self.monitored_object_identifier,
+            issue_confirmed_notifications,
+            lifetime,
+        );
+        let mut service_data = Vec::new();
+        request.encode(&mut service_data)?;
+        self.client
+            .send_confirmed_request(
+                &self.target,
+                ConfirmedServiceChoice::SubscribeCOV,
+                service_data,
             )
             .await?;
-        while let Ok(notification) = self.notifications.try_recv() {
-            self.carryover.push_back(notification);
-        }
-        self.notifications = renewed.notifications;
         Ok(())
     }
 

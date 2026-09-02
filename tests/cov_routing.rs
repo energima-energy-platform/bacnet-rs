@@ -250,3 +250,83 @@ async fn a_notification_from_another_device_is_not_delivered() {
         "a notification claiming another device must not be delivered here"
     );
 }
+
+/// A client whose requests give up quickly, for the tests that deliberately
+/// let one time out.
+async fn impatient_client() -> AsyncBacnetClient {
+    AsyncBacnetClient::from_config(ClientConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        timeout: Duration::from_millis(200),
+        retries: 0,
+    })
+    .await
+    .expect("bind client")
+}
+
+/// The regression this exists for, and the expensive one to diagnose in the
+/// field: a renewal that fails must not cost the caller the subscription it
+/// was refreshing.
+///
+/// Renewing used to go through `subscribe_cov`, which registers its new
+/// channel under the subscription's routing key *before* the request goes on
+/// the wire. A renewal that then timed out - a controller briefly unreachable
+/// is the ordinary case - had already evicted the live channel, so `recv`
+/// returned `None` for ever after. The subscription looked healthy from the
+/// device's side and was silent from ours, and nothing in between said so.
+#[tokio::test]
+async fn a_renewal_that_fails_leaves_the_subscription_receiving() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.expect("bind device");
+    let address = device.local_addr().expect("device address");
+    // One ack, for the initial subscribe. The renewal that follows is never
+    // answered, which is the whole point.
+    let responder = acknowledging_device(device, 1);
+    let client = impatient_client().await;
+
+    let mut subscription = subscribed(&client, address, 7, object(1)).await;
+    let device = responder.await.expect("responder");
+
+    assert!(
+        subscription.renew(false, Some(3600)).await.is_err(),
+        "the device is not answering, so the renewal must be reported as failed"
+    );
+
+    device
+        .send_to(&notification(7, DEVICE, object(1), 21.5), client.local_addr())
+        .await
+        .expect("send a notification");
+
+    let received = tokio::time::timeout(PATIENCE, subscription.recv())
+        .await
+        .expect("a failed renewal must not silence the subscription it refreshes")
+        .expect("the channel must still be open");
+    assert_eq!(received.monitored_object, object(1));
+}
+
+/// And the ordinary path: a renewal that succeeds is invisible to the caller,
+/// who keeps receiving on the channel it already had.
+#[tokio::test]
+async fn a_renewal_that_succeeds_keeps_the_same_channel() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.expect("bind device");
+    let address = device.local_addr().expect("device address");
+    let responder = acknowledging_device(device, 2);
+    let client = client().await;
+
+    let mut subscription = subscribed(&client, address, 7, object(1)).await;
+    subscription
+        .renew(false, Some(3600))
+        .await
+        .expect("the device acknowledged the renewal");
+    let device = responder.await.expect("responder");
+
+    device
+        .send_to(&notification(7, DEVICE, object(1), 19.0), client.local_addr())
+        .await
+        .expect("send a notification");
+
+    let received = tokio::time::timeout(PATIENCE, subscription.recv())
+        .await
+        .expect("a renewed subscription must go on reporting")
+        .expect("a notification");
+    assert_eq!(received.monitored_object, object(1));
+}
