@@ -78,7 +78,7 @@ macro_rules! generate_custom_enum {
         pastey::paste! {
             $(#[$doc])*
             #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
             pub enum $name {
                 $($variant,)*
                 Custom( [<$name Value>] ),
@@ -86,7 +86,7 @@ macro_rules! generate_custom_enum {
             }
 
             #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
             pub struct [<$name Value>] { value: $unit }
 
             impl [<$name Value>] {
