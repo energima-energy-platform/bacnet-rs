@@ -1,26 +1,16 @@
 //! What properties an object of each type may have, per ASHRAE 135.
 //!
-//! A client cannot ask a device for "every property" directly: `ALL` is a
-//! ReadPropertyMultiple shorthand many devices refuse, and `Property_List`
-//! only exists from protocol revision 14. This is the answer for the devices
-//! that offer neither - the standard's own list for the type, asked for in
-//! full so the device's per-property errors prune it down to what it really
-//! has.
+//! For devices that offer neither `ALL` nor `Property_List`: the standard's
+//! list for the type, asked in full so the device's per-property errors prune
+//! it. Always the weakest answer - a device's own `Property_List` is
+//! authoritative and knows about proprietary properties, so ask the device
+//! first.
 //!
-//! # This is a guess, and always the weakest answer
+//! Required and optional are listed together: asking only for the required set
+//! would miss units, limits and COV increment, which is most of what makes an
+//! object worth describing.
 //!
-//! A device's own `Property_List` is authoritative and this is not: a
-//! controller may implement fewer of the optional properties, and a vendor may
-//! add proprietary ones that appear in no standard. So a caller should ask the
-//! device first and fall back to this, rather than the other way round.
-//!
-//! Required and optional properties are listed together. Separating them would
-//! suggest a caller should ask only for the required ones, which would miss
-//! exactly the properties - units, limits, COV increment - that make an object
-//! worth describing. An optional property a device does not have costs one
-//! error in a response it was already sending.
-//!
-//! The lists were taken from the 2020 edition, via the work in
+//! Lists taken from the 2020 edition, via
 //! <https://github.com/bacnet-rs/bacnet-rs/pull/65>.
 
 use crate::object::{ObjectType, PropertyIdentifier};
@@ -2470,11 +2460,8 @@ const TREND_LOG_MULTIPLE: &[PropertyIdentifier] = &[
     PropertyIdentifier::ProfileName,
 ];
 
-/// Properties every BACnet object has, whatever its type.
-///
-/// The answer for a type this table does not know - a vendor-proprietary code,
-/// or one from a revision newer than the lists above. Better than nothing:
-/// these four are enough to name an object and to ask it what else it has.
+/// The answer for a type this table does not know. Enough to name an object
+/// and to ask it what else it has.
 const UNIVERSAL: &[PropertyIdentifier] = &[
     PropertyIdentifier::ObjectIdentifier,
     PropertyIdentifier::ObjectName,
@@ -2482,11 +2469,8 @@ const UNIVERSAL: &[PropertyIdentifier] = &[
     PropertyIdentifier::PropertyList,
 ];
 
-/// The properties an object of this type may have.
-///
-/// Never empty: a type this table has no entry for falls back to the four
-/// properties every object has, which is enough to identify it and to ask it
-/// for its own `Property_List`.
+/// The properties an object of this type may have. Never empty - an unknown
+/// type falls back to [`UNIVERSAL`].
 pub fn standard_properties(object_type: ObjectType) -> &'static [PropertyIdentifier] {
     match object_type {
         ObjectType::AccessCredential => ACCESS_CREDENTIAL,
@@ -2559,14 +2543,14 @@ pub fn standard_properties(object_type: ObjectType) -> &'static [PropertyIdentif
 mod tests {
     use super::*;
 
-    /// Every object type the crate names, plus a couple past the end of the
-    /// table, so the sweeps below cover the fallback as well as the entries.
+    /// Every named type plus a few past the table, so the sweeps below cover
+    /// the fallback too.
     fn every_object_type() -> impl Iterator<Item = ObjectType> {
         (0..=64_u32).map(ObjectType::from)
     }
 
-    /// ASHRAE 135 requires these three of every object, so a list missing one
-    /// is a transcription error rather than a device that lacks it.
+    /// Required of every object, so a list missing one is a transcription
+    /// error.
     #[test]
     fn every_list_identifies_the_object() {
         for object_type in every_object_type() {
@@ -2584,9 +2568,8 @@ mod tests {
         }
     }
 
-    /// A duplicate costs a wasted property in every request built from the
-    /// list, on every object of that type, forever - and is invisible in a
-    /// table this long.
+    /// A duplicate wastes a property in every request built from the list, and
+    /// is invisible in a table this long.
     #[test]
     fn no_property_is_listed_twice() {
         for object_type in every_object_type() {
@@ -2602,8 +2585,7 @@ mod tests {
         }
     }
 
-    /// The fallback exists so that an unrecognized type is still worth asking
-    /// about: these four are enough to name it and to ask it what else it has.
+    /// An unrecognized type is still worth asking about.
     #[test]
     fn an_unknown_type_still_gets_something_to_ask_for() {
         let vendor = standard_properties(ObjectType::from(900));
@@ -2611,9 +2593,8 @@ mod tests {
         assert!(vendor.contains(&PropertyIdentifier::PropertyList));
     }
 
-    /// The point of the table: the properties that make an object worth
-    /// describing are optional in the standard, so a list of only the required
-    /// ones would be useless.
+    /// The properties worth describing are optional in the standard, so a
+    /// required-only list would be useless.
     #[test]
     fn the_properties_that_describe_an_object_are_listed() {
         for (object_type, expected) in [
@@ -2666,12 +2647,8 @@ mod tests {
         }
     }
 
-    /// A known gap, recorded rather than left to be discovered.
-    ///
-    /// The colour objects arrived in a revision after the edition these lists
-    /// were taken from, so they fall through to the universal four. An object
-    /// of either type is still named and can still be asked for its own
-    /// `Property_List`; it just gets no help from here.
+    /// A known gap: the colour objects postdate the edition these lists came
+    /// from, so they fall through to [`UNIVERSAL`].
     #[test]
     fn the_colour_types_are_a_known_gap() {
         for object_type in [ObjectType::Color, ObjectType::ColorTemperature] {

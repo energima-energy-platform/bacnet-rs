@@ -1,15 +1,11 @@
-"""A segmenting BACnet peer, for testing this crate's segmentation against a
-stack that implements ASHRAE 135 clause 5.4 in full.
+"""A segmenting BACnet peer, for testing this crate against a stack that
+implements ASHRAE 135 clause 5.4 in full.
 
-bacpypes3 rather than bacnet-stack: the C stack's CHANGELOG says outright that
-it has "no support for segmentation in the TSM or APDU handlers", and its
-`PDU_TYPE_SEGMENT_ACK` case only frees the invoke ID. bacpypes3 carries the
-whole state machine - SEGMENTED_REQUEST, SEGMENTED_CONFIRMATION and
-SEGMENTED_RESPONSE - so it can both send and receive segmented messages.
+bacpypes3 rather than bacnet-stack, whose CHANGELOG says it has "no support for
+segmentation in the TSM or APDU handlers".
 
-Serves a device whose Object_List is far too large for one APDU, so reading it
-forces a segmented response, and accepts segmented requests so a large
-ReadPropertyMultiple exercises the other direction.
+Serves a device whose Object_List is far too large for one APDU, and accepts
+segmented requests, so both directions can be exercised.
 """
 
 import argparse
@@ -27,7 +23,7 @@ async def main() -> None:
         "--objects",
         type=int,
         default=400,
-        help="analog values to serve; 400 puts Object_List well past one APDU",
+        help="analog values to serve; 400 puts Object_List past one APDU",
     )
     parser.add_argument(
         "--max-apdu",
@@ -39,8 +35,7 @@ async def main() -> None:
 
     app = Application.from_args(args)
 
-    # The three properties that make this peer useful. Without them bacpypes3
-    # answers an oversized read with an Abort instead of segmenting it.
+    # Without these bacpypes3 aborts an oversized read instead of segmenting.
     device = app.device_object
     device.segmentationSupported = "segmentedBoth"
     device.maxSegmentsAccepted = 64
@@ -56,24 +51,18 @@ async def main() -> None:
             )
         )
 
-    # bacpypes3 binds its socket before it finishes wiring the protocol to
-    # the stack behind it: a datagram arriving in that gap raises
-    # `'IPv4DatagramProtocol' object has no attribute 'server'` inside
-    # bacpypes3 and is dropped. The readiness event that closes the gap
-    # (`IPv4DatagramServer._local_transport_ready`) is private, so this yields
-    # to the event loop instead and lets the tasks created during construction
-    # finish. Without it the first request of every test is answered only
-    # after the client retransmits, which is a five-second stall per test and
-    # would mask a real fault in retransmission.
+    # bacpypes3 binds its socket before wiring the protocol behind it, and a
+    # datagram arriving in that gap is dropped. Its readiness event is private,
+    # so yield instead. Without this the first request of every test is answered
+    # only after a retransmit - a five-second stall that would mask a real
+    # retransmission fault.
     await asyncio.sleep(1.0)
 
-    # Counted from the application rather than from the argument, because
-    # bacpypes3 adds objects of its own - a NetworkPort for the address it was
-    # given - and the Rust side asserts on what the device actually serves.
+    # From the application, not the argument: bacpypes3 adds a NetworkPort of
+    # its own, and the Rust side asserts on what is actually served.
     served = sum(1 for _ in app.iter_objects())
 
-    # The Rust side waits for this line before it sends anything, so the test
-    # never races the socket being bound.
+    # The Rust side waits for this line before sending anything.
     print(f"ready objects={served}", flush=True)
     await asyncio.Event().wait()
 

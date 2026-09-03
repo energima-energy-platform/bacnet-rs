@@ -1,11 +1,7 @@
-//! The segmentation cases a cooperative peer will not produce on demand.
-//!
-//! `interop_segmentation.rs` drives the same code against bacpypes3, which is
-//! what proves the happy path is read the way another stack reads it. These
-//! tests are for the paths a well-behaved peer never takes: a lost
-//! acknowledgement, a gap in the sequence, a transfer that will not end, and a
-//! peer that cannot receive segments at all. A fake device is the only way to
-//! ask for those on purpose.
+//! The segmentation cases a cooperative peer will not produce on demand: a
+//! lost acknowledgement, a gap in the sequence, a transfer that will not end,
+//! a peer that cannot receive segments. `interop_segmentation.rs` covers the
+//! happy path against a real stack.
 
 #![cfg(feature = "async")]
 
@@ -51,9 +47,8 @@ fn segment(invoke_id: u8, sequence: u8, more_follows: bool, data: &[u8]) -> Vec<
     })
 }
 
-/// A ReadPropertyResponse carrying `count` reals, encoded - long enough to be
-/// worth splitting, and decodable only if every piece is reassembled in the
-/// right order.
+/// Long enough to be worth splitting, and decodable only if reassembled in
+/// order.
 fn encoded_response(count: usize) -> Vec<u8> {
     let values: Vec<PropertyValue> = (0..count).map(|n| PropertyValue::Real(n as f32)).collect();
     let response = ReadPropertyResponse::new(
@@ -101,13 +96,9 @@ fn invoke_id_of(apdu: &Apdu) -> u8 {
     }
 }
 
-/// A lost acknowledgement means the device sends the same segment again. The
-/// remedy is to say the same thing again - and, crucially, *not* to append the
-/// segment a second time.
-///
-/// Appending it would produce a reassembled response that is longer than what
-/// the device sent and decodes to nonsense, which is the kind of corruption
-/// that would surface far from here.
+/// A lost acknowledgement means the device repeats a segment. Repeat the ack,
+/// and do *not* append it twice - that would decode to nonsense far from
+/// here.
 #[tokio::test]
 async fn a_repeated_segment_is_acknowledged_again_and_not_appended() {
     let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -168,9 +159,8 @@ async fn a_repeated_segment_is_acknowledged_again_and_not_appended() {
     responder.await.unwrap();
 }
 
-/// A gap is answered with a negative acknowledgement naming the last segment
-/// that did arrive in order, so the device resumes from there instead of
-/// starting the transfer again.
+/// A gap is answered by naming the last in-order segment, so the device
+/// resumes rather than starting over.
 #[tokio::test]
 async fn a_gap_asks_for_the_missing_segment_rather_than_the_whole_transfer() {
     let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -232,11 +222,8 @@ async fn a_gap_asks_for_the_missing_segment_rather_than_the_whole_transfer() {
     responder.await.unwrap();
 }
 
-/// A device that never stops sending is cut off rather than allowed to grow
-/// the buffer without limit.
-///
-/// The bound is stated in every request's `max_segments`, so a device is told
-/// the limit before it starts. This is what happens when one ignores it.
+/// A device that ignores the `max_segments` we stated is cut off rather than
+/// allowed to grow the buffer without limit.
 #[tokio::test]
 async fn a_transfer_past_the_segment_limit_is_aborted() {
     let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -283,12 +270,8 @@ async fn a_transfer_past_the_segment_limit_is_aborted() {
     );
 }
 
-/// A request too large for a peer that cannot receive segments fails here
-/// rather than on the wire.
-///
-/// The exchange would end the same way - such a peer answers an oversized
-/// request with `SegmentationNotSupported` - so answering from the peer's own
-/// advertised capabilities spends no round trip to learn it.
+/// Refused from the peer's advertised capabilities rather than on the wire:
+/// the exchange would end the same way, without the round trip.
 #[tokio::test]
 async fn an_oversized_request_to_a_peer_that_cannot_segment_is_refused() {
     let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -337,8 +320,7 @@ async fn an_oversized_request_to_a_peer_that_cannot_segment_is_refused() {
     );
 }
 
-/// A request that fits is still sent whole. The segmented path must not
-/// capture the ordinary one.
+/// The segmented path must not capture the ordinary one.
 #[tokio::test]
 async fn a_request_that_fits_is_not_segmented() {
     let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();

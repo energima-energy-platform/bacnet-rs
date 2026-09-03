@@ -1,20 +1,13 @@
-//! Segmentation, driven against a stack that implements ASHRAE 135 clause 5.4
-//! in full.
+//! Segmentation against bacpypes3, which implements clause 5.4 in full.
 //!
-//! The peer is bacpypes3, not bacnet-stack. The C stack's own CHANGELOG says
-//! it has "no support for segmentation in the TSM or APDU handlers", and its
-//! `PDU_TYPE_SEGMENT_ACK` case does nothing but free the invoke ID - so it
-//! cannot exercise either direction. bacpypes3 carries the whole state
-//! machine.
+//! `segmentation.rs` is this crate answering itself, so a misreading of the
+//! spec would be shared by both ends and pass. These would catch it.
 //!
-//! Why an outside stack at all, when `segmentation.rs` already tests both
-//! halves over loopback: those tests are this crate answering itself, so a
-//! misreading of the spec would be shared by both ends and pass. These are the
-//! ones that would catch it.
+//! bacnet-stack cannot serve here: its CHANGELOG says it has "no support for
+//! segmentation in the TSM or APDU handlers".
 //!
-//! Skipped, loudly, when no interpreter with bacpypes3 is available. Point
-//! `BACNET_INTEROP_PYTHON` at one, or `pip install bacpypes3` into the
-//! `python3` on PATH.
+//! Skipped loudly without an interpreter carrying bacpypes3 - point
+//! `BACNET_INTEROP_PYTHON` at one, or `pip install bacpypes3`.
 
 #![cfg(feature = "async")]
 
@@ -66,11 +59,8 @@ impl Drop for Peer {
     }
 }
 
-/// Start the peer and wait until it says it is listening.
-///
-/// Waited for rather than slept past: a fixed sleep is either too short on a
-/// loaded machine or wasted on an idle one, and the peer prints a line for
-/// exactly this purpose.
+/// Start the peer and wait for it to say it is listening, rather than sleeping
+/// a fixed time that is either too short or wasted.
 async fn spawn_peer(python: &PathBuf, port: u16, objects: usize, max_apdu: u32) -> Peer {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -131,12 +121,9 @@ async fn client() -> AsyncBacnetClient {
     .expect("bind the client")
 }
 
-/// Reading a device's Object_List when it runs past one APDU.
-///
-/// The case that pays for all of this. Without reassembly the whole-property
-/// read fails and the caller falls back to reading the array a slice at a
-/// time - hundreds of round trips on a large controller, repeated every time
-/// the list is re-read.
+/// The case that pays for all of this: without reassembly the whole-property
+/// read fails and the caller reads the array a slice at a time - hundreds of
+/// round trips per re-read.
 #[tokio::test]
 async fn a_segmented_response_is_reassembled() {
     let Some(python) = interop_python() else {
@@ -172,19 +159,11 @@ async fn a_segmented_response_is_reassembled() {
     );
 }
 
-/// A transfer long enough that getting the second segment right is not
-/// enough.
+/// Seven or more segments, where an off-by-one in the sequence handling shows
+/// up - a two-segment transfer passes with the comparison the wrong way round.
 ///
-/// Two thousand objects is an Object_List around ten kilobytes, so seven or
-/// more segments at the APDU size this client accepts. That is where an
-/// off-by-one in the sequence handling shows up - a two-segment transfer
-/// passes with the comparison the wrong way round.
-///
-/// Note that the peer's `--max-apdu` is *not* what sets the segment size: the
-/// segments a device sends are bounded by the `max-APDU-length-accepted` this
-/// client states in its request, per clause 20.1.2.5. The peer's own figure
-/// is its receive limit, which is what the segmented-request test below
-/// exercises instead.
+/// The peer's `--max-apdu` does not set the segment size: per clause 20.1.2.5
+/// that comes from the `max-APDU-length-accepted` *this* client states.
 #[tokio::test]
 async fn a_long_transfer_of_many_segments_is_reassembled() {
     let Some(python) = interop_python() else {
@@ -206,13 +185,10 @@ async fn a_long_transfer_of_many_segments_is_reassembled() {
     assert_eq!(values.len(), peer.objects);
 }
 
-/// A request too large for one APDU, which this client must send in pieces.
-///
-/// A ReadPropertyMultiple naming twelve hundred objects is the realistic
-/// shape of this: the request runs to nine or ten segments, so the peer's
-/// granted window actually governs how many go out between acknowledgements,
-/// and the response is segmented too - one exchange drives both state
-/// machines against each other.
+/// A request too large for one APDU. At twelve hundred objects it runs to nine
+/// or ten segments, so the peer's granted window governs how many go out
+/// between acknowledgements - and the answer is segmented too, driving both
+/// state machines at once.
 #[tokio::test]
 async fn a_segmented_request_is_accepted() {
     let Some(python) = interop_python() else {

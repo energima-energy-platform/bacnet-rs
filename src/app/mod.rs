@@ -896,17 +896,11 @@ impl SegmentationInfo {
 
 /// Segment reassembly buffer for incoming segmented messages
 #[derive(Debug)]
-/// Not what the client uses, and not a working reassembler.
-///
-/// `reassemble` rejects any result longer than `max_apdu_length`, which is
-/// every message that actually needed segmenting - so this has never been run
-/// against a device. It also keys buffers on invoke ID alone, where ASHRAE 135
-/// clause 5.4 scopes a transaction to a *pair* of devices; two peers
-/// segmenting under the same ID would overwrite each other.
-///
-/// Segmentation lives in the client instead, on the transaction it belongs to,
-/// where the `(peer, invoke id)` key and the retransmission deadline already
-/// are. See `client::async_client`.
+/// Not what the client uses, and not a working reassembler: `reassemble`
+/// rejects any result longer than `max_apdu_length`, which is every message
+/// that needed segmenting, and it keys buffers on invoke ID alone where clause
+/// 5.4 scopes a transaction per peer. Segmentation lives in
+/// `client::async_client` instead.
 pub struct SegmentReassemblyBuffer {
     /// Invoke ID of the segmented message
     pub invoke_id: u8,
