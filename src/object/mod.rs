@@ -1011,6 +1011,8 @@ pub mod reliability;
 pub use object_type::ObjectType;
 pub mod property_identifier;
 pub use property_identifier::PropertyIdentifier;
+pub mod standard_properties;
+pub use standard_properties::standard_properties;
 
 pub use analog::{AnalogInput, AnalogOutput, AnalogValue};
 pub use binary::{BinaryInput, BinaryOutput, BinaryPV, BinaryValue, Polarity};
