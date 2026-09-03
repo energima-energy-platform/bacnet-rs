@@ -292,7 +292,10 @@ async fn a_renewal_that_fails_leaves_the_subscription_receiving() {
     );
 
     device
-        .send_to(&notification(7, DEVICE, object(1), 21.5), client.local_addr())
+        .send_to(
+            &notification(7, DEVICE, object(1), 21.5),
+            client.local_addr(),
+        )
         .await
         .expect("send a notification");
 
@@ -320,7 +323,10 @@ async fn a_renewal_that_succeeds_keeps_the_same_channel() {
     let device = responder.await.expect("responder");
 
     device
-        .send_to(&notification(7, DEVICE, object(1), 19.0), client.local_addr())
+        .send_to(
+            &notification(7, DEVICE, object(1), 19.0),
+            client.local_addr(),
+        )
         .await
         .expect("send a notification");
 

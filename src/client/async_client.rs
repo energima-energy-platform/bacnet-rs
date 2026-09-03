@@ -605,12 +605,126 @@ struct ActiveDiscovery<T> {
     deadline: Instant,
 }
 
+/// Segments this client will accept in one reassembled response.
+///
+/// Sent in every request's `max_segments`, so a device is told the limit up
+/// front rather than discovering it by having a transfer cut off part way.
+/// Sixty-four at the 1476-byte maximum APDU is around 94 KB, which covers the
+/// Object_List of a device far larger than anything in the field.
+const MAX_SEGMENTS_ACCEPTED: MaxSegments = MaxSegments::SixtyFour;
+
+/// The concrete count behind [`MAX_SEGMENTS_ACCEPTED`], used to bound a
+/// reassembly buffer and to refuse an outbound request that cannot fit.
+const MAX_SEGMENTS: usize = 64;
+
+/// The window size this client grants a device sending us segments.
+///
+/// One, deliberately: every segment is acknowledged before the next is sent.
+/// That costs a round trip per segment where a larger window would pipeline
+/// them, but it removes the whole question of which segments in a window are
+/// missing - the only gap that can ever exist is the next one. ASHRAE 135
+/// clause 5.4 leaves the actual window size to the receiver, so a device
+/// proposing sixteen is simply told one and must honour it.
+const GRANTED_WINDOW: u8 = 1;
+
+/// The window size this client proposes when it is the one sending segments.
+///
+/// Proposed, not decided: the peer's first SegmentAck carries the size it will
+/// actually accept, and that is what [`OutboundSegments`] paces itself to.
+const PROPOSED_WINDOW: u8 = 16;
+
+/// A response arriving in pieces.
+///
+/// Held on the transaction it belongs to rather than in a table of its own,
+/// because reassembly is per `(peer, invoke id)` and [`Endpoint::pending`] is
+/// already keyed that way. A segmentation table keyed on invoke ID alone -
+/// which is what the unused [`crate::app::SegmentationManager`] does - would
+/// let two devices segmenting under the same ID overwrite each other, and this
+/// client deliberately scopes IDs per peer.
+struct Reassembly {
+    /// Everything accepted so far, in order.
+    data: Vec<u8>,
+    /// The sequence number of the last segment accepted in order, or `None`
+    /// before any has been. Every decision about an arriving segment is made
+    /// against this one number, which is what the window of one buys.
+    last_in_order: Option<u8>,
+    /// The SegmentAck most recently sent, kept so a timeout can re-send it.
+    /// A lost ack stalls the device silently: it is waiting for permission to
+    /// continue that it will never get, and nothing else here would notice.
+    last_ack: Arc<[u8]>,
+    /// Segments accepted, to enforce [`MAX_SEGMENTS`].
+    segments: usize,
+}
+
+/// A request being sent in pieces.
+struct OutboundSegments {
+    /// Every segment's complete frame, indexed by sequence number. Built up
+    /// front: the service data is already in hand, and pre-framing it means a
+    /// retransmission re-sends bytes rather than re-encoding them.
+    frames: Vec<Arc<[u8]>>,
+    /// Sequence numbers up to and including this one are acknowledged. `None`
+    /// before the peer has acknowledged anything.
+    acked: Option<u8>,
+    /// How many segments the peer accepts before it acknowledges, from its
+    /// first SegmentAck. Until then, one - the first segment goes out alone,
+    /// because until the peer answers there is nothing that says a second
+    /// would be looked at.
+    window: u8,
+}
+
+impl OutboundSegments {
+    /// The next sequence number not yet sent, given what has been acked.
+    fn next_unsent(&self) -> u8 {
+        match self.acked {
+            Some(acked) => acked.wrapping_add(1),
+            None => 0,
+        }
+    }
+
+    /// The sequence numbers that may be in flight now: everything after the
+    /// last acknowledged segment, up to the peer's window.
+    fn window_after_ack(&self) -> std::ops::Range<usize> {
+        let first = usize::from(self.next_unsent());
+        let last = (first + usize::from(self.window.max(1))).min(self.frames.len());
+        first..last
+    }
+
+    /// Whether every segment has been acknowledged, so the peer now owes us
+    /// the actual response.
+    fn all_acked(&self) -> bool {
+        self.acked
+            .is_some_and(|acked| usize::from(acked) + 1 >= self.frames.len())
+    }
+}
+
+/// What an arriving segment means for the transfer it belongs to.
+enum SegmentOutcome {
+    /// Take it and ask for the next.
+    Accepted(u8),
+    /// Already had this one, so the acknowledgement for it was lost. Saying
+    /// the same thing again is the whole remedy.
+    Repeat,
+    /// A gap. Name the last segment that did arrive in order, so the peer
+    /// resumes from there rather than starting over.
+    Missing(u8),
+    /// The last segment. Acknowledge it and hand the caller the whole thing.
+    Complete(u8, Vec<u8>),
+    /// Stop the transfer.
+    Abandon(AbortReason),
+}
+
 struct PendingTransaction {
     service_choice: ConfirmedServiceChoice,
     frame: Arc<[u8]>,
     retries_remaining: u8,
     deadline: Instant,
     response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
+    /// Set once a device answers with a segmented ComplexAck, and taken when
+    /// the last segment arrives.
+    reassembly: Option<Reassembly>,
+    /// Set when the request itself was too large for one APDU, and cleared
+    /// once the peer has acknowledged every segment.
+    outbound: Option<OutboundSegments>,
 }
 
 /// What one outstanding transaction is identified by.
@@ -710,7 +824,7 @@ impl Endpoint {
                 },
                 received = self.socket.recv_from(&mut self.receive_buffer) => {
                     match received {
-                        Ok((length, source)) => self.handle_packet(length, source),
+                        Ok((length, source)) => self.handle_packet(length, source).await,
                         Err(error) => {
                             self.fail_all(|| ClientError::Io(std::io::Error::new(error.kind(), error.to_string())));
                             break;
@@ -818,8 +932,28 @@ impl Endpoint {
             let _ = response.send(Err(ClientError::TooManyTransactions));
             return;
         };
-        let frame: Arc<[u8]> =
-            build_confirmed_frame(&target, invoke_id, service_choice, service_data).into();
+        // Only the first segment goes out now. Until the peer's first
+        // SegmentAck names the window it will accept, a second segment has
+        // nothing saying it would be looked at.
+        let (frame, outbound) =
+            match split_request(&target, invoke_id, service_choice, service_data) {
+                Ok(RequestFrames::Whole(frame)) => (Arc::<[u8]>::from(frame), None),
+                Ok(RequestFrames::Segmented(frames)) => {
+                    let first = Arc::clone(&frames[0]);
+                    (
+                        first,
+                        Some(OutboundSegments {
+                            frames,
+                            acked: None,
+                            window: 1,
+                        }),
+                    )
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
         self.pending.insert(
             (target.address, invoke_id),
             PendingTransaction {
@@ -828,6 +962,8 @@ impl Endpoint {
                 retries_remaining: self.retries,
                 deadline: Instant::now() + self.timeout,
                 response,
+                reassembly: None,
+                outbound,
             },
         );
         if let Err(error) = self.socket.send_to(&frame, target.address).await {
@@ -870,8 +1006,11 @@ impl Endpoint {
             .saturating_mul(u32::from(self.retries).saturating_add(1))
     }
 
-    fn handle_packet(&mut self, length: usize, source: SocketAddr) {
-        let apdu = {
+    async fn handle_packet(&mut self, length: usize, source: SocketAddr) {
+        // The network-layer source travels with the APDU because a SegmentAck
+        // has to be addressed back the way the segment came - a peer behind a
+        // router is not reachable by its address alone.
+        let (apdu, route) = {
             let data = &self.receive_buffer[..length];
             let Some(frame) = decode_bacnet_ip_frame(data, source) else {
                 return;
@@ -937,14 +1076,15 @@ impl Endpoint {
                 return;
             }
 
-            apdu
+            (apdu, frame.npdu.source.clone())
         };
         let invoke_id = match &apdu {
             Apdu::ComplexAck { invoke_id, .. }
             | Apdu::SimpleAck { invoke_id, .. }
             | Apdu::Error { invoke_id, .. }
             | Apdu::Reject { invoke_id, .. }
-            | Apdu::Abort { invoke_id, .. } => *invoke_id,
+            | Apdu::Abort { invoke_id, .. }
+            | Apdu::SegmentAck { invoke_id, .. } => *invoke_id,
             _ => return,
         };
         // Keyed on where the response came from as well as the ID it carries,
@@ -961,12 +1101,249 @@ impl Endpoint {
             }
             return;
         };
-        if !response_matches_service(&apdu, pending.service_choice) {
+        let expecting = pending.service_choice;
+
+        // A SegmentAck paces a request *this client* is sending. It answers
+        // nothing and carries no service choice to check, so it is taken
+        // before the checks below rather than being mistaken for a response.
+        if let Apdu::SegmentAck {
+            negative,
+            sequence_number,
+            window_size,
+            ..
+        } = &apdu
+        {
+            let (negative, sequence_number, window_size) =
+                (*negative, *sequence_number, *window_size);
+            self.advance_outbound(key, negative, sequence_number, window_size)
+                .await;
             return;
         }
+
+        if !response_matches_service(&apdu, expecting) {
+            return;
+        }
+
+        // A segmented ComplexAck is not the response yet - it is one piece of
+        // it, and the transaction stays open until the last piece lands.
+        if matches!(
+            apdu,
+            Apdu::ComplexAck {
+                segmented: true,
+                ..
+            }
+        ) {
+            if let Apdu::ComplexAck {
+                more_follows,
+                sequence_number,
+                service_data,
+                ..
+            } = apdu
+            {
+                self.accept_response_segment(
+                    key,
+                    sequence_number,
+                    more_follows,
+                    service_data,
+                    route,
+                )
+                .await;
+            }
+            return;
+        }
+
         let result = response_result(apdu);
         if let Some(pending) = self.pending.remove(&key) {
             let _ = pending.response.send(result);
+        }
+    }
+
+    /// Take one segment of a segmented response, acknowledge it, and complete
+    /// the transaction once the last one has landed.
+    ///
+    /// ASHRAE 135 clause 5.4.5. With a granted window of one the rules
+    /// collapse to three cases: the segment being waited for, the one just
+    /// taken - which means the acknowledgement for it was lost, so saying the
+    /// same thing again is the whole remedy - or a gap, answered with a
+    /// negative acknowledgement naming the last segment that did arrive in
+    /// order so the peer resumes from there.
+    async fn accept_response_segment(
+        &mut self,
+        key: TransactionKey,
+        sequence_number: Option<u8>,
+        more_follows: bool,
+        service_data: Vec<u8>,
+        route: Option<NetworkAddress>,
+    ) {
+        let (peer, invoke_id) = key;
+        // A segmented ComplexAck carrying no sequence number is malformed:
+        // that number is what every decision below is made against.
+        let Some(sequence) = sequence_number else {
+            self.abandon(key, AbortReason::InvalidApduInThisState, route)
+                .await;
+            return;
+        };
+
+        let (outcome, previous_ack) = {
+            let Some(pending) = self.pending.get_mut(&key) else {
+                return;
+            };
+            let reassembly = pending.reassembly.get_or_insert_with(|| Reassembly {
+                data: Vec::new(),
+                last_in_order: None,
+                last_ack: Arc::from(Vec::new()),
+                segments: 0,
+            });
+            let previous_ack = Arc::clone(&reassembly.last_ack);
+            let outcome = match reassembly.last_in_order {
+                // A transfer that does not start at zero is not one this
+                // client can follow, and guessing where it started would be
+                // worse than saying so.
+                None if sequence != 0 => {
+                    SegmentOutcome::Abandon(AbortReason::InvalidApduInThisState)
+                }
+                Some(last) if sequence == last => SegmentOutcome::Repeat,
+                Some(last) if sequence != last.wrapping_add(1) => SegmentOutcome::Missing(last),
+                _ if reassembly.segments >= MAX_SEGMENTS => {
+                    SegmentOutcome::Abandon(AbortReason::BufferOverflow)
+                }
+                _ => {
+                    reassembly.data.extend_from_slice(&service_data);
+                    reassembly.segments += 1;
+                    reassembly.last_in_order = Some(sequence);
+                    if more_follows {
+                        SegmentOutcome::Accepted(sequence)
+                    } else {
+                        SegmentOutcome::Complete(sequence, std::mem::take(&mut reassembly.data))
+                    }
+                }
+            };
+            (outcome, previous_ack)
+        };
+
+        match outcome {
+            SegmentOutcome::Accepted(sequence) | SegmentOutcome::Missing(sequence) => {
+                let negative = matches!(outcome, SegmentOutcome::Missing(_));
+                let frame: Arc<[u8]> =
+                    segment_ack_frame(invoke_id, sequence, negative, route).into();
+                if let Some(pending) = self.pending.get_mut(&key) {
+                    if let Some(reassembly) = &mut pending.reassembly {
+                        reassembly.last_ack = Arc::clone(&frame);
+                    }
+                    // A transfer of many segments must not be killed by the
+                    // budget for a single exchange: each segment that arrives
+                    // is progress, so the clock starts again. Bounded by
+                    // MAX_SEGMENTS rather than by the deadline.
+                    pending.retries_remaining = self.retries;
+                    pending.deadline = Instant::now() + self.timeout;
+                }
+                self.send_or_fail(key, &frame).await;
+            }
+            SegmentOutcome::Repeat => {
+                if !previous_ack.is_empty() {
+                    self.send_or_fail(key, &previous_ack).await;
+                }
+            }
+            SegmentOutcome::Complete(sequence, data) => {
+                // Acknowledged before the caller is answered: the peer is
+                // owed the last acknowledgement whatever this client does
+                // with the result, and without it the peer holds the
+                // transaction open until its own timer expires.
+                let frame = segment_ack_frame(invoke_id, sequence, false, route);
+                let _ = self.socket.send_to(&frame, peer).await;
+                if let Some(pending) = self.pending.remove(&key) {
+                    let _ = pending.response.send(Ok(data));
+                }
+            }
+            SegmentOutcome::Abandon(reason) => self.abandon(key, reason, route).await,
+        }
+    }
+
+    /// Send the next window of a request going out in segments.
+    ///
+    /// ASHRAE 135 clause 5.4.4. A negative acknowledgement and a positive one
+    /// call for the same action - continue from the segment named - so the
+    /// only thing the sign changes is nothing here: both say how far the peer
+    /// has got, and the answer either way is to carry on from there.
+    async fn advance_outbound(
+        &mut self,
+        key: TransactionKey,
+        _negative: bool,
+        sequence_number: u8,
+        window_size: u8,
+    ) {
+        let frames = {
+            let Some(pending) = self.pending.get_mut(&key) else {
+                return;
+            };
+            // A SegmentAck against a request that was never segmented is not
+            // about anything this client is doing.
+            let Some(outbound) = pending.outbound.as_mut() else {
+                return;
+            };
+            if usize::from(sequence_number) >= outbound.frames.len() {
+                return;
+            }
+            outbound.acked = Some(sequence_number);
+            // The window is the peer's to set, and it is only known once the
+            // peer has spoken. Never zero: a window of none would stall the
+            // transfer with nothing left to prompt it.
+            outbound.window = window_size.max(1);
+            let all_acked = outbound.all_acked();
+            let frames: Vec<Arc<[u8]>> = if all_acked {
+                Vec::new()
+            } else {
+                outbound
+                    .window_after_ack()
+                    .map(|index| Arc::clone(&outbound.frames[index]))
+                    .collect()
+            };
+            if all_acked {
+                // Every segment is with the peer. What is owed now is the
+                // response, which arrives on the ordinary path.
+                pending.outbound = None;
+                pending.frame = Arc::from(Vec::new());
+            } else if let Some(first) = frames.first() {
+                pending.frame = Arc::clone(first);
+            }
+            pending.retries_remaining = self.retries;
+            pending.deadline = Instant::now() + self.timeout;
+            frames
+        };
+        for frame in frames {
+            if !self.send_or_fail(key, &frame).await {
+                return;
+            }
+        }
+    }
+
+    /// Send one frame to a transaction's peer, failing the transaction if the
+    /// socket refuses it. Returns whether it went.
+    async fn send_or_fail(&mut self, key: TransactionKey, frame: &[u8]) -> bool {
+        let (peer, _) = key;
+        match self.socket.send_to(frame, peer).await {
+            Ok(_) => true,
+            Err(error) => {
+                if let Some(pending) = self.pending.remove(&key) {
+                    let _ = pending.response.send(Err(ClientError::Io(error)));
+                }
+                false
+            }
+        }
+    }
+
+    /// Stop a segmented transfer, telling the peer and the caller why.
+    async fn abandon(
+        &mut self,
+        key: TransactionKey,
+        reason: AbortReason,
+        route: Option<NetworkAddress>,
+    ) {
+        let (peer, invoke_id) = key;
+        let frame = abort_frame(invoke_id, reason, route);
+        let _ = self.socket.send_to(&frame, peer).await;
+        if let Some(pending) = self.pending.remove(&key) {
+            let _ = pending.response.send(Err(ClientError::Abort(reason)));
         }
     }
 
@@ -999,11 +1376,28 @@ impl Endpoint {
             }
             pending.retries_remaining -= 1;
             pending.deadline = Instant::now() + self.timeout;
-            let frame = Arc::clone(&pending.frame);
-            let (peer, _) = key;
-            if let Err(error) = self.socket.send_to(&frame, peer).await {
-                if let Some(pending) = self.pending.remove(&key) {
-                    let _ = pending.response.send(Err(ClientError::Io(error)));
+            // What a retransmission *is* depends on where the transaction has
+            // got to. Mid-reassembly the request was answered long ago and
+            // the peer is waiting on an acknowledgement that never arrived -
+            // re-sending the request would restart the whole transfer.
+            // Mid-send, it is the unacknowledged window that needs repeating,
+            // not the first segment alone.
+            let frames: Vec<Arc<[u8]>> = if let Some(reassembly) = &pending.reassembly {
+                vec![Arc::clone(&reassembly.last_ack)]
+            } else if let Some(outbound) = &pending.outbound {
+                outbound
+                    .window_after_ack()
+                    .map(|index| Arc::clone(&outbound.frames[index]))
+                    .collect()
+            } else {
+                vec![Arc::clone(&pending.frame)]
+            };
+            for frame in frames {
+                if frame.is_empty() {
+                    continue;
+                }
+                if !self.send_or_fail(key, &frame).await {
+                    break;
                 }
             }
         }
@@ -1121,41 +1515,215 @@ fn encode_who_is(low_limit: Option<u32>, high_limit: Option<u32>) -> Result<Vec<
     Ok(buffer)
 }
 
+/// The largest APDU this client accepts, stated in every request.
+///
+/// ASHRAE 135 clause 20.1.2.5 defines `max-APDU-length-accepted` as the
+/// *requester's* own limit, so it is ours to state and never the peer's. It
+/// used to be derived from the peer's advertised figure, which - before
+/// reassembly existed - was a way of asking a device to keep its answers
+/// small enough to arrive whole. With segmentation that trade runs the other
+/// way: a larger accepted APDU means fewer segments for the same answer.
+const OUR_MAX_APDU: MaxApduSize = MaxApduSize::Up1476;
+
+/// The APDU header of a *segmented* ConfirmedRequest: PDU type, the
+/// segments/size byte, invoke ID, sequence number, window size, service
+/// choice. Subtracted from the peer's limit to size one segment's payload.
+const SEGMENTED_REQUEST_HEADER: usize = 6;
+
+/// What the peer's advertised capabilities mean for a request aimed at it.
+struct PeerLimits {
+    /// The largest APDU the peer accepts, and so the ceiling on one segment
+    /// of a request to it.
+    max_apdu: usize,
+    /// Whether the peer can send us a segmented response.
+    sends_segments: bool,
+    /// Whether the peer will accept a segmented request from us.
+    accepts_segments: bool,
+}
+
+/// Read a peer's limits, assuming the most capable peer when it has told us
+/// nothing.
+///
+/// Optimistic on purpose, and consistent with how this client has always
+/// treated an uncached device: a request that turns out to be too large earns
+/// an Abort, which is a fact the caller can act on, where assuming the
+/// smallest possible APDU would cap every request to a device we simply have
+/// not read the capabilities of yet.
+fn peer_limits(target: &BacnetTarget) -> PeerLimits {
+    match &target.capabilities {
+        Some(caps) => PeerLimits {
+            max_apdu: MaxApduSize::at_most(caps.max_apdu).size(),
+            sends_segments: matches!(
+                caps.segmentation,
+                Segmentation::Both | Segmentation::Transmit
+            ),
+            accepts_segments: matches!(
+                caps.segmentation,
+                Segmentation::Both | Segmentation::Receive
+            ),
+        },
+        None => PeerLimits {
+            max_apdu: MaxApduSize::Up1476.size(),
+            sends_segments: true,
+            accepts_segments: true,
+        },
+    }
+}
+
 fn build_confirmed_frame(
     target: &BacnetTarget,
     invoke_id: u8,
     service_choice: ConfirmedServiceChoice,
     service_data: Vec<u8>,
 ) -> Vec<u8> {
-    let (max_response_size, segmented_response_accepted) = match &target.capabilities {
-        Some(caps) => (
-            MaxApduSize::at_most(caps.max_apdu),
-            matches!(
-                caps.segmentation,
-                Segmentation::Both | Segmentation::Transmit
-            ),
-        ),
-        None => (MaxApduSize::Up1476, true),
-    };
+    let limits = peer_limits(target);
     let apdu = Apdu::ConfirmedRequest {
         segmented: false,
         more_follows: false,
-        segmented_response_accepted,
-        max_segments: MaxSegments::Unspecified,
-        max_response_size,
+        segmented_response_accepted: limits.sends_segments,
+        max_segments: MAX_SEGMENTS_ACCEPTED,
+        max_response_size: OUR_MAX_APDU,
         invoke_id,
         sequence_number: None,
         proposed_window_size: None,
         service_choice,
         service_data,
     };
+    wrap_request(target, &apdu)
+}
+
+/// One segment of a request too large to send whole.
+fn build_request_segment_frame(
+    target: &BacnetTarget,
+    invoke_id: u8,
+    service_choice: ConfirmedServiceChoice,
+    sequence_number: u8,
+    more_follows: bool,
+    chunk: &[u8],
+) -> Vec<u8> {
+    let limits = peer_limits(target);
+    let apdu = Apdu::ConfirmedRequest {
+        segmented: true,
+        more_follows,
+        segmented_response_accepted: limits.sends_segments,
+        max_segments: MAX_SEGMENTS_ACCEPTED,
+        max_response_size: OUR_MAX_APDU,
+        invoke_id,
+        sequence_number: Some(sequence_number),
+        proposed_window_size: Some(PROPOSED_WINDOW),
+        service_choice,
+        service_data: chunk.to_vec(),
+    };
+    wrap_request(target, &apdu)
+}
+
+/// How a request will go out.
+enum RequestFrames {
+    /// It fits one APDU, which is the overwhelmingly common case.
+    Whole(Vec<u8>),
+    /// It does not, and the peer accepts segments. Every segment, in order.
+    Segmented(Vec<Arc<[u8]>>),
+}
+
+/// Decide whether a request needs segmenting, and build its frames.
+///
+/// Returns an Abort rather than a bespoke error, because that is what the
+/// exchange would have produced anyway: a peer that cannot receive segments
+/// answers an oversized request with
+/// `SegmentationNotSupported`, and one that can would abort a transfer past
+/// its segment limit. Reporting it here spends no round trip to learn it.
+fn split_request(
+    target: &BacnetTarget,
+    invoke_id: u8,
+    service_choice: ConfirmedServiceChoice,
+    service_data: Vec<u8>,
+) -> Result<RequestFrames, ClientError> {
+    let limits = peer_limits(target);
+    // The unsegmented header is two bytes shorter, but sizing the decision on
+    // the segmented one costs nothing and keeps a request that only just fits
+    // off the boundary.
+    if service_data.len() + SEGMENTED_REQUEST_HEADER <= limits.max_apdu {
+        return Ok(RequestFrames::Whole(build_confirmed_frame(
+            target,
+            invoke_id,
+            service_choice,
+            service_data,
+        )));
+    }
+    if !limits.accepts_segments {
+        return Err(ClientError::Abort(AbortReason::SegmentationNotSupported));
+    }
+    let payload = limits
+        .max_apdu
+        .saturating_sub(SEGMENTED_REQUEST_HEADER)
+        .max(1);
+    let chunks: Vec<&[u8]> = service_data.chunks(payload).collect();
+    if chunks.len() > MAX_SEGMENTS {
+        return Err(ClientError::Abort(AbortReason::ApduTooLong));
+    }
+    let last = chunks.len() - 1;
+    let frames = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            build_request_segment_frame(
+                target,
+                invoke_id,
+                service_choice,
+                index as u8,
+                index != last,
+                chunk,
+            )
+            .into()
+        })
+        .collect();
+    Ok(RequestFrames::Segmented(frames))
+}
+
+/// Wrap a request APDU for `target`, routed if the target is behind a router.
+fn wrap_request(target: &BacnetTarget, apdu: &Apdu) -> Vec<u8> {
     let mut npdu = Npdu::new();
     npdu.control.expecting_reply = true;
     if let Some(route) = &target.route {
         npdu.set_destination(route.clone());
         npdu.hop_count = Some(255);
     }
-    wrap_unicast(&npdu, &apdu)
+    wrap_unicast(&npdu, apdu)
+}
+
+/// Acknowledge a segment, or ask for one again.
+///
+/// `server: false` because this client is the one that made the request, so
+/// in this transaction it is the client half. `window_size` is the size this
+/// client grants, which clause 5.4 makes the receiver's decision.
+fn segment_ack_frame(
+    invoke_id: u8,
+    sequence_number: u8,
+    negative: bool,
+    route: Option<NetworkAddress>,
+) -> Vec<u8> {
+    build_response_frame(
+        &Apdu::SegmentAck {
+            negative,
+            server: false,
+            invoke_id,
+            sequence_number,
+            window_size: GRANTED_WINDOW,
+        },
+        route,
+    )
+}
+
+/// Tell a peer to stop sending a transfer this client will not finish.
+fn abort_frame(invoke_id: u8, abort_reason: AbortReason, route: Option<NetworkAddress>) -> Vec<u8> {
+    build_response_frame(
+        &Apdu::Abort {
+            server: false,
+            invoke_id,
+            abort_reason,
+        },
+        route,
+    )
 }
 
 /// Build a reply APDU (SimpleAck/Reject/...) addressed back at `route`, the
