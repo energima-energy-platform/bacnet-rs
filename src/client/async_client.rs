@@ -44,6 +44,46 @@ use super::{
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
+
+/// Least a derived timeout may be, so a peer answering in milliseconds is not
+/// retransmitted on ordinary jitter.
+const MIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Most a derived timeout may be, as a multiple of the configured one - a
+/// ceiling on how long one slow device can hold a transaction open.
+const TIMEOUT_CEILING: u32 = 4;
+
+/// A peer's round-trip time, smoothed, and the timeout derived from it.
+///
+/// Jacobson/Karels, as TCP derives its retransmission timer: the mean plus
+/// four deviations, so a peer with a long tail is given room for it without
+/// every other peer waiting as long. Per peer because the spread is large -
+/// measured on one site, two routers differed fourteenfold in median response
+/// and fiftyfold at the tail, so no single figure suits both.
+struct Rtt {
+    smoothed: Duration,
+    deviation: Duration,
+}
+
+impl Rtt {
+    fn first(sample: Duration) -> Self {
+        Self {
+            smoothed: sample,
+            deviation: sample / 2,
+        }
+    }
+
+    /// One eighth weight on the mean, one quarter on the deviation.
+    fn observe(&mut self, sample: Duration) {
+        let error = sample.abs_diff(self.smoothed);
+        self.deviation = (self.deviation * 3 + error) / 4;
+        self.smoothed = (self.smoothed * 7 + sample) / 8;
+    }
+
+    fn timeout(&self) -> Duration {
+        self.smoothed + self.deviation * 4
+    }
+}
 const MAX_BACNET_IP_FRAME: usize = 65_535;
 
 /// Cloneable handle to a concurrent BACnet/IP endpoint.
@@ -711,6 +751,12 @@ struct PendingTransaction {
     frame: Arc<[u8]>,
     retries_remaining: u8,
     deadline: Instant,
+    /// When the request went out, for the round-trip sample.
+    sent_at: Instant,
+    /// Whether it has been sent more than once. Karn's algorithm: a
+    /// retransmitted request yields no usable sample, because which attempt
+    /// was answered is unknowable.
+    retransmitted: bool,
     response: oneshot::Sender<Result<Vec<u8>, ClientError>>,
     /// Set when a device answers with a segmented ComplexAck.
     reassembly: Option<Reassembly>,
@@ -766,6 +812,9 @@ struct Endpoint {
     router_discoveries: Vec<ActiveDiscovery<DiscoveredRouter>>,
     cov_subscribers: HashMap<CovKey, mpsc::UnboundedSender<CovNotification>>,
     next_invoke_id: u8,
+    /// What each peer's answers have taken. A request then waits about as long
+    /// as that peer needs rather than as long as the slowest on the network.
+    rtt: HashMap<SocketAddr, Rtt>,
     timeout: Duration,
     retries: u8,
     /// What peers are told, and so the largest response any should send.
@@ -790,6 +839,7 @@ impl Endpoint {
             router_discoveries: Vec::new(),
             cov_subscribers: HashMap::new(),
             next_invoke_id: 0,
+            rtt: HashMap::new(),
             timeout,
             retries,
             accepted_apdu,
@@ -960,7 +1010,9 @@ impl Endpoint {
                 service_choice,
                 frame: Arc::clone(&frame),
                 retries_remaining: self.retries,
-                deadline: Instant::now() + self.timeout,
+                deadline: Instant::now() + self.rto(target.address),
+                sent_at: Instant::now(),
+                retransmitted: false,
                 response,
                 reassembly: None,
                 outbound,
@@ -1001,9 +1053,59 @@ impl Endpoint {
     /// not answered within its whole budget is unlikely to answer after
     /// another one, and holding the ID longer would shrink the pool for no
     /// further protection.
-    fn transaction_budget(&self) -> Duration {
-        self.timeout
-            .saturating_mul(u32::from(self.retries).saturating_add(1))
+    /// Every attempt's wait added up - one whole transaction. An invoke ID is
+    /// held back this long after timing out, so a late answer to any attempt
+    /// arrives when nothing is listening.
+    fn transaction_budget(&self, peer: SocketAddr) -> Duration {
+        (0..=u32::from(self.retries))
+            .map(|sent| self.attempt_wait(peer, sent))
+            .fold(Duration::ZERO, |total, wait| total.saturating_add(wait))
+    }
+
+    fn ceiling(&self) -> Duration {
+        self.timeout.saturating_mul(TIMEOUT_CEILING)
+    }
+
+    /// How long to wait for `peer`'s answer, from what its answers have taken.
+    ///
+    /// The configured timeout until it has answered anything, which is what
+    /// every request waited before. The floor is held below the ceiling
+    /// because `clamp` panics the other way round, and a caller is free to
+    /// configure a timeout shorter than the floor.
+    fn rto(&self, peer: SocketAddr) -> Duration {
+        let ceiling = self.ceiling();
+        self.rtt.get(&peer).map_or(self.timeout, |rtt| {
+            rtt.timeout().clamp(MIN_TIMEOUT.min(ceiling), ceiling)
+        })
+    }
+
+    /// The wait before the `sent`-th attempt: twice the last, since a peer
+    /// that missed one deadline is more likely busy than quick.
+    fn attempt_wait(&self, peer: SocketAddr, sent: u32) -> Duration {
+        self.rto(peer)
+            .saturating_mul(1u32 << sent.min(4))
+            .min(self.ceiling())
+    }
+
+    /// The wait after a retransmission, from how many attempts have gone out.
+    fn backoff(&self, peer: SocketAddr, retries_remaining: u8) -> Duration {
+        let sent = u32::from(self.retries.saturating_sub(retries_remaining));
+        self.attempt_wait(peer, sent.saturating_add(1))
+    }
+
+    /// Remove a transaction the peer answered, taking its round trip as a
+    /// sample. Only for the paths where an answer actually arrived - a
+    /// timeout or an abort of our own says nothing about how fast the peer is.
+    fn settle(&mut self, key: TransactionKey) -> Option<PendingTransaction> {
+        let pending = self.pending.remove(&key)?;
+        if !pending.retransmitted {
+            let sample = pending.sent_at.elapsed();
+            self.rtt
+                .entry(key.0)
+                .and_modify(|rtt| rtt.observe(sample))
+                .or_insert_with(|| Rtt::first(sample));
+        }
+        Some(pending)
     }
 
     async fn handle_packet(&mut self, length: usize, source: SocketAddr) {
@@ -1153,7 +1255,7 @@ impl Endpoint {
         }
 
         let result = response_result(apdu);
-        if let Some(pending) = self.pending.remove(&key) {
+        if let Some(pending) = self.settle(key) {
             let _ = pending.response.send(result);
         }
     }
@@ -1242,7 +1344,7 @@ impl Endpoint {
                 // the transaction open until its own timer expires.
                 let frame = segment_ack_frame(invoke_id, sequence, false, route);
                 let _ = self.socket.send_to(&frame, peer).await;
-                if let Some(pending) = self.pending.remove(&key) {
+                if let Some(pending) = self.settle(key) {
                     let _ = pending.response.send(Ok(data));
                 }
             }
@@ -1344,6 +1446,16 @@ impl Endpoint {
             .filter_map(|(key, pending)| (pending.deadline <= now).then_some(*key))
             .collect::<Vec<_>>();
         for key in expired {
+            // Read what the next deadline needs before taking the mutable
+            // borrow, since deriving it consults this peer's round trips.
+            let Some(remaining) = self
+                .pending
+                .get(&key)
+                .map(|pending| pending.retries_remaining)
+            else {
+                continue;
+            };
+            let wait = self.backoff(key.0, remaining);
             let Some(pending) = self.pending.get_mut(&key) else {
                 continue;
             };
@@ -1351,16 +1463,17 @@ impl Endpoint {
                 self.pending.remove(&key);
                 continue;
             }
-            if pending.retries_remaining == 0 {
+            if remaining == 0 {
                 if let Some(pending) = self.pending.remove(&key) {
                     let _ = pending.response.send(Err(ClientError::Timeout));
                     self.quarantined
-                        .insert(key, Instant::now() + self.transaction_budget());
+                        .insert(key, Instant::now() + self.transaction_budget(key.0));
                 }
                 continue;
             }
             pending.retries_remaining -= 1;
-            pending.deadline = Instant::now() + self.timeout;
+            pending.retransmitted = true;
+            pending.deadline = Instant::now() + wait;
             // What a retransmission means depends on where the transaction
             // is: mid-reassembly the peer awaits an ack, and re-sending the
             // request would restart the transfer; mid-send it is the
@@ -1759,5 +1872,70 @@ fn response_result(apdu: Apdu) -> Result<Vec<u8>, ClientError> {
             Err(ClientError::Abort(AbortReason::from(abort_reason)))
         }
         _ => Err(ClientError::NoResponse),
+    }
+}
+
+#[cfg(test)]
+mod rtt_tests {
+    use super::*;
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// A peer answering steadily converges on its own round trip, not on the
+    /// slowest device on the network. Measured on one site: 105ms at one
+    /// router, 1.45s at another.
+    #[test]
+    fn a_steady_peer_converges_on_its_own_round_trip() {
+        let mut fast = Rtt::first(ms(105));
+        let mut slow = Rtt::first(ms(1450));
+        for _ in 0..40 {
+            fast.observe(ms(105));
+            slow.observe(ms(1450));
+        }
+        assert!(fast.timeout() < ms(150), "{:?}", fast.timeout());
+        assert!(slow.timeout() > ms(1450), "{:?}", slow.timeout());
+        assert!(slow.timeout() < ms(1700), "{:?}", slow.timeout());
+    }
+
+    /// The reason it is the mean plus four deviations rather than the mean: a
+    /// peer whose answers are mostly quick but occasionally very slow has to
+    /// be given room for the slow ones, or one in twenty reads is lost to a
+    /// timeout that was never about the network.
+    #[test]
+    fn a_long_tail_widens_the_timeout() {
+        let mut steady = Rtt::first(ms(1450));
+        let mut bimodal = Rtt::first(ms(1450));
+        for round in 0..40 {
+            steady.observe(ms(1450));
+            // One in ten answers takes 8.6s, as the bench's simulator does.
+            bimodal.observe(if round % 10 == 0 { ms(8600) } else { ms(1450) });
+        }
+        assert!(
+            bimodal.timeout() > steady.timeout() * 2,
+            "{:?} vs {:?}",
+            bimodal.timeout(),
+            steady.timeout()
+        );
+    }
+
+    /// A peer that speeds up is followed down rather than held at its worst.
+    #[test]
+    fn a_peer_that_speeds_up_is_followed() {
+        let mut rtt = Rtt::first(ms(4000));
+        for _ in 0..60 {
+            rtt.observe(ms(100));
+        }
+        assert!(rtt.timeout() < ms(400), "{:?}", rtt.timeout());
+    }
+
+    /// The first sample is all there is to go on, so the deviation is seeded
+    /// generously rather than at zero - which would time out the second
+    /// request on any jitter at all.
+    #[test]
+    fn one_sample_leaves_room_for_the_next() {
+        let rtt = Rtt::first(ms(100));
+        assert_eq!(rtt.timeout(), ms(300));
     }
 }
