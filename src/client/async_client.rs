@@ -78,16 +78,11 @@ impl AsyncBacnetClient {
         Self::from_socket_accepting(socket, timeout, retries, DEFAULT_MAX_APDU)
     }
 
-    /// As [`AsyncBacnetClient::from_socket`], but stating a smaller
-    /// `max-APDU-length-accepted` than the standard's largest.
+    /// As [`AsyncBacnetClient::from_socket`], for a path that carries less
+    /// than a full APDU - a GRE or VPN tunnel, the ordinary way a gateway
+    /// reaches a site.
     ///
-    /// For a client whose path to the devices carries less than a full APDU -
-    /// a GRE or VPN tunnel, which is the ordinary way a gateway reaches a
-    /// site. The declared figure is what a device sizes its *response* to, so
-    /// stating the truth here is what keeps answers small enough to arrive;
-    /// a device told 1476 over a 1458-byte path sends 1476 and the answer is
-    /// dropped whole. Use [`MaxApduSize::at_most`] to round a byte figure
-    /// down to a size the standard actually defines.
+    /// [`MaxApduSize::at_most`] rounds a byte figure down to a defined size.
     pub fn from_socket_accepting(
         socket: UdpSocket,
         timeout: Duration,
@@ -773,8 +768,7 @@ struct Endpoint {
     next_invoke_id: u8,
     timeout: Duration,
     retries: u8,
-    /// The largest APDU this client tells peers it accepts, and so the
-    /// largest response any of them should send.
+    /// What peers are told, and so the largest response any should send.
     accepted_apdu: MaxApduSize,
     receive_buffer: Vec<u8>,
 }
@@ -1511,13 +1505,10 @@ fn encode_who_is(low_limit: Option<u32>, high_limit: Option<u32>) -> Result<Vec<
 /// peer's figure to keep answers small enough to arrive whole; with
 /// reassembly that trade inverts - a larger APDU means fewer segments.
 ///
-/// It is not always ours to state freely, which is why it is a default rather
-/// than a constant. A client reaching a site through a tunnel has a path that
-/// carries less than this, and the standard's sizes are not a continuum: a
-/// device told 1476 will answer with 1476 bytes, and over a 1458-byte path
-/// that answer is dropped rather than fragmented. A peer that cannot segment
-/// then has no smaller answer to give, and the read is simply unobtainable.
-/// See [`AsyncBacnetClient::from_socket_accepting`].
+/// A default rather than a constant because it is what a device sizes its
+/// response to: told 1476 over a 1458-byte tunnel it answers with 1476 bytes
+/// that are dropped, not fragmented, and a peer that cannot segment has no
+/// smaller answer to give.
 const DEFAULT_MAX_APDU: MaxApduSize = MaxApduSize::Up1476;
 
 /// PDU type, segments/size, invoke ID, sequence, window, service choice.
@@ -1535,9 +1526,7 @@ struct PeerLimits {
 /// nothing - a too-large request then earns an Abort the caller can act on,
 /// where assuming the smallest APDU would cap every uncached device.
 ///
-/// Bounded by `ours` as well as by the peer's own figure: a request travels
-/// the same path the response does, so a client whose path carries less than
-/// the peer accepts cannot send the larger frame either.
+/// Bounded by `ours` too: a request travels the same path its response does.
 fn peer_limits(target: &BacnetTarget, ours: MaxApduSize) -> PeerLimits {
     match &target.capabilities {
         Some(caps) => PeerLimits {
