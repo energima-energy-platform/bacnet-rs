@@ -9,7 +9,7 @@
 //! window closes.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -53,6 +53,28 @@ const MIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// ceiling on how long one slow device can hold a transaction open.
 const TIMEOUT_CEILING: u32 = 4;
 
+/// What one peer's answers have taken, over the recent window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundTrip {
+    pub samples: usize,
+    pub p50: Duration,
+    pub p90: Duration,
+    pub p99: Duration,
+    pub shortest: Duration,
+    pub longest: Duration,
+}
+
+/// One peer, as the client has come to know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerHealth {
+    pub peer: SocketAddr,
+    /// `None` until the peer has answered something.
+    pub round_trip: Option<RoundTrip>,
+    /// What a request to it currently waits, derived from the above - or the
+    /// configured timeout while there is nothing to derive it from.
+    pub timeout: Duration,
+}
+
 /// A peer's round-trip time, smoothed, and the timeout derived from it.
 ///
 /// Jacobson/Karels, as TCP derives its retransmission timer: the mean plus
@@ -63,14 +85,46 @@ const TIMEOUT_CEILING: u32 = 4;
 struct Rtt {
     smoothed: Duration,
     deviation: Duration,
+    /// The most recent samples, oldest first, for the percentiles a caller
+    /// reports. The smoothed mean above answers "how long should I wait";
+    /// this answers "what does this peer actually do", which a mean cannot -
+    /// the interesting peers are the ones whose answers are bimodal.
+    recent: VecDeque<Duration>,
 }
+
+/// Samples kept per peer. At a few hundred peers this is under a megabyte,
+/// and it is a window rather than a history: what a peer did an hour ago is
+/// not what an operator is asking about.
+const RECENT_SAMPLES: usize = 256;
 
 impl Rtt {
     fn first(sample: Duration) -> Self {
         Self {
             smoothed: sample,
             deviation: sample / 2,
+            recent: VecDeque::from([sample]),
         }
+    }
+
+    /// The window, sorted, or `None` before anything has answered.
+    fn percentiles(&self) -> Option<RoundTrip> {
+        if self.recent.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = self.recent.iter().copied().collect();
+        sorted.sort_unstable();
+        let at = |fraction: f64| {
+            let index = ((sorted.len() as f64) * fraction) as usize;
+            sorted[index.min(sorted.len() - 1)]
+        };
+        Some(RoundTrip {
+            samples: sorted.len(),
+            p50: at(0.50),
+            p90: at(0.90),
+            p99: at(0.99),
+            shortest: sorted[0],
+            longest: sorted[sorted.len() - 1],
+        })
     }
 
     /// One eighth weight on the mean, one quarter on the deviation.
@@ -78,6 +132,10 @@ impl Rtt {
         let error = sample.abs_diff(self.smoothed);
         self.deviation = (self.deviation * 3 + error) / 4;
         self.smoothed = (self.smoothed * 7 + sample) / 8;
+        if self.recent.len() == RECENT_SAMPLES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(sample);
     }
 
     fn timeout(&self) -> Duration {
@@ -138,6 +196,22 @@ impl AsyncBacnetClient {
             commands,
             local_addr,
         })
+    }
+
+    /// What every peer this client has spoken to has been like: its recent
+    /// round trips, and the timeout they have led it to wait.
+    ///
+    /// For reporting rather than for control - the client already acts on
+    /// this. A peer that has answered nothing is listed with no round trip
+    /// rather than omitted, since "asked and never answered" is the
+    /// interesting case.
+    pub async fn peer_health(&self) -> Result<Vec<PeerHealth>, ClientError> {
+        let (sink, answer) = oneshot::channel();
+        self.commands
+            .send(EndpointCommand::PeerHealth { sink })
+            .await
+            .map_err(|_| ClientError::EndpointClosed)?;
+        answer.await.map_err(|_| ClientError::EndpointClosed)
     }
 
     /// Address of the endpoint's single UDP socket.
@@ -641,6 +715,9 @@ enum EndpointCommand {
         destination: SocketAddr,
         sink: mpsc::UnboundedSender<Result<DiscoveredRouter, ClientError>>,
     },
+    PeerHealth {
+        sink: oneshot::Sender<Vec<PeerHealth>>,
+    },
     SubscribeCov {
         target: BacnetTarget,
         /// What notifications for this subscription will identify themselves
@@ -905,6 +982,9 @@ impl Endpoint {
                     self.device_discoveries.push(discovery);
                 }
             }
+            EndpointCommand::PeerHealth { sink } => {
+                let _ = sink.send(self.peer_health());
+            }
             EndpointCommand::DiscoverRouters {
                 frame,
                 destination,
@@ -1053,6 +1133,22 @@ impl Endpoint {
     /// not answered within its whole budget is unlikely to answer after
     /// another one, and holding the ID longer would shrink the pool for no
     /// further protection.
+    /// Every peer's recent round trips and the timeout they lead to, ordered
+    /// by address so successive reports of an unchanged network are identical.
+    fn peer_health(&self) -> Vec<PeerHealth> {
+        let mut health: Vec<PeerHealth> = self
+            .rtt
+            .iter()
+            .map(|(peer, rtt)| PeerHealth {
+                peer: *peer,
+                round_trip: rtt.percentiles(),
+                timeout: self.rto(*peer),
+            })
+            .collect();
+        health.sort_unstable_by_key(|entry| entry.peer);
+        health
+    }
+
     /// Every attempt's wait added up - one whole transaction. An invoke ID is
     /// held back this long after timing out, so a late answer to any attempt
     /// arrives when nothing is listening.
@@ -1937,5 +2033,54 @@ mod rtt_tests {
     fn one_sample_leaves_room_for_the_next() {
         let rtt = Rtt::first(ms(100));
         assert_eq!(rtt.timeout(), ms(300));
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// A mean cannot describe the peers worth describing. The bench's
+    /// simulator answers in 1.45s nine times in ten and 8.6s the tenth, and
+    /// the percentiles are what say so.
+    #[test]
+    fn the_window_reports_the_shape_a_mean_hides() {
+        let mut rtt = Rtt::first(ms(1450));
+        for round in 0..99 {
+            rtt.observe(if round % 10 == 0 { ms(8600) } else { ms(1450) });
+        }
+        let seen = rtt.percentiles().expect("samples");
+        assert_eq!(seen.samples, 100);
+        assert_eq!(seen.p50, ms(1450));
+        assert_eq!(seen.longest, ms(8600));
+        assert!(seen.p99 > ms(8000), "{:?}", seen.p99);
+        assert_eq!(seen.shortest, ms(1450));
+    }
+
+    /// A window, not a history: what a peer did long ago is not what an
+    /// operator is asking about, and the memory is bounded per peer.
+    #[test]
+    fn the_window_forgets_the_far_past() {
+        let mut rtt = Rtt::first(ms(9000));
+        for _ in 0..RECENT_SAMPLES * 2 {
+            rtt.observe(ms(100));
+        }
+        let seen = rtt.percentiles().expect("samples");
+        assert_eq!(seen.samples, RECENT_SAMPLES);
+        assert_eq!(seen.longest, ms(100), "the 9s outlier should have aged out");
+    }
+
+    #[test]
+    fn one_sample_is_a_distribution_of_one() {
+        let seen = Rtt::first(ms(120)).percentiles().expect("samples");
+        assert_eq!(seen.samples, 1);
+        assert_eq!(
+            (seen.p50, seen.p99, seen.shortest, seen.longest),
+            (ms(120), ms(120), ms(120), ms(120))
+        );
     }
 }

@@ -21,7 +21,7 @@ mod transaction;
 #[cfg(feature = "std")]
 pub use address_cache::CachedDevice;
 #[cfg(feature = "async")]
-pub use async_client::{AsyncBacnetClient, CovSubscription};
+pub use async_client::{AsyncBacnetClient, CovSubscription, PeerHealth, RoundTrip};
 pub use config::{ClientBuilder, ClientConfig, DEFAULT_HOST, DEFAULT_TIMEOUT};
 pub use error::ClientError;
 
