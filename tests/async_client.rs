@@ -3,8 +3,8 @@
 use std::{sync::Arc, time::Duration};
 
 use bacnet_rs::{
-    app::Apdu,
-    client::{AsyncBacnetClient, ClientConfig, DiscoveredRouter},
+    app::{Apdu, MaxApduSize},
+    client::{AsyncBacnetClient, BacnetTarget, ClientConfig, DiscoveredRouter},
     network::{NetworkAddress, Npdu},
     object::{
         database::ObjectDatabase, AnalogValue, Device, ObjectIdentifier, ObjectType,
@@ -630,4 +630,85 @@ async fn a_response_is_matched_to_the_peer_that_sent_it() {
 
     first_responder.await.unwrap();
     second_responder.await.unwrap();
+}
+
+/// What a device sizes its response to is the `max-APDU-length-accepted` we
+/// state, so a client whose path carries less than a full APDU has to say so
+/// or the answers it gets back are too large to arrive.
+#[tokio::test]
+async fn a_lowered_apdu_ceiling_is_what_the_request_declares() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let device_addr = device.local_addr().unwrap();
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = AsyncBacnetClient::from_socket_accepting(
+        socket,
+        Duration::from_millis(200),
+        0,
+        MaxApduSize::Up1024,
+    )
+    .unwrap();
+
+    let listener = tokio::spawn(async move {
+        let mut buffer = vec![0; 1500];
+        let (read, _) = device.recv_from(&mut buffer).await.unwrap();
+        buffer.truncate(read);
+        buffer
+    });
+
+    let target = BacnetTarget::new(device_addr);
+    let _ = client
+        .read_property(
+            &target,
+            ObjectIdentifier::new(ObjectType::AnalogInput, 1),
+            PropertyIdentifier::PresentValue,
+        )
+        .await;
+
+    let frame = listener.await.unwrap();
+    let Apdu::ConfirmedRequest {
+        max_response_size, ..
+    } = parse_confirmed_request(&frame)
+    else {
+        panic!("expected a confirmed request");
+    };
+    assert_eq!(
+        max_response_size,
+        MaxApduSize::Up1024,
+        "the device is told what this client can actually receive"
+    );
+}
+
+/// And the default is unchanged, so a client on a network that carries a full
+/// APDU still asks for one.
+#[tokio::test]
+async fn the_default_ceiling_is_the_standards_largest() {
+    let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let device_addr = device.local_addr().unwrap();
+    let client = test_client(Duration::from_millis(200), 0).await;
+
+    let listener = tokio::spawn(async move {
+        let mut buffer = vec![0; 1500];
+        let (read, _) = device.recv_from(&mut buffer).await.unwrap();
+        buffer.truncate(read);
+        buffer
+    });
+
+    let target = BacnetTarget::new(device_addr);
+    let _ = client
+        .read_property(
+            &target,
+            ObjectIdentifier::new(ObjectType::AnalogInput, 1),
+            PropertyIdentifier::PresentValue,
+        )
+        .await;
+
+    let frame = listener.await.unwrap();
+    let Apdu::ConfirmedRequest {
+        max_response_size, ..
+    } = parse_confirmed_request(&frame)
+    else {
+        panic!("expected a confirmed request");
+    };
+    assert_eq!(max_response_size, MaxApduSize::Up1476);
 }

@@ -75,11 +75,30 @@ impl AsyncBacnetClient {
         timeout: Duration,
         retries: u8,
     ) -> Result<Self, ClientError> {
+        Self::from_socket_accepting(socket, timeout, retries, DEFAULT_MAX_APDU)
+    }
+
+    /// As [`AsyncBacnetClient::from_socket`], but stating a smaller
+    /// `max-APDU-length-accepted` than the standard's largest.
+    ///
+    /// For a client whose path to the devices carries less than a full APDU -
+    /// a GRE or VPN tunnel, which is the ordinary way a gateway reaches a
+    /// site. The declared figure is what a device sizes its *response* to, so
+    /// stating the truth here is what keeps answers small enough to arrive;
+    /// a device told 1476 over a 1458-byte path sends 1476 and the answer is
+    /// dropped whole. Use [`MaxApduSize::at_most`] to round a byte figure
+    /// down to a size the standard actually defines.
+    pub fn from_socket_accepting(
+        socket: UdpSocket,
+        timeout: Duration,
+        retries: u8,
+        accepted_apdu: MaxApduSize,
+    ) -> Result<Self, ClientError> {
         let local_addr = socket.local_addr()?;
         // Discovery may target broadcast addresses.
         socket.set_broadcast(true)?;
         let (commands, receiver) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-        tokio::spawn(Endpoint::new(socket, receiver, timeout, retries).run());
+        tokio::spawn(Endpoint::new(socket, receiver, timeout, retries, accepted_apdu).run());
         Ok(Self {
             commands,
             local_addr,
@@ -754,6 +773,9 @@ struct Endpoint {
     next_invoke_id: u8,
     timeout: Duration,
     retries: u8,
+    /// The largest APDU this client tells peers it accepts, and so the
+    /// largest response any of them should send.
+    accepted_apdu: MaxApduSize,
     receive_buffer: Vec<u8>,
 }
 
@@ -763,6 +785,7 @@ impl Endpoint {
         commands: mpsc::Receiver<EndpointCommand>,
         timeout: Duration,
         retries: u8,
+        accepted_apdu: MaxApduSize,
     ) -> Self {
         Self {
             socket,
@@ -775,6 +798,7 @@ impl Endpoint {
             next_invoke_id: 0,
             timeout,
             retries,
+            accepted_apdu,
             receive_buffer: vec![0; MAX_BACNET_IP_FRAME],
         }
     }
@@ -912,25 +936,30 @@ impl Endpoint {
         };
         // Only the first segment goes out: until the peer names its window,
         // nothing says a second would be looked at.
-        let (frame, outbound) =
-            match split_request(&target, invoke_id, service_choice, service_data) {
-                Ok(RequestFrames::Whole(frame)) => (Arc::<[u8]>::from(frame), None),
-                Ok(RequestFrames::Segmented(frames)) => {
-                    let first = Arc::clone(&frames[0]);
-                    (
-                        first,
-                        Some(OutboundSegments {
-                            frames,
-                            acked: None,
-                            window: 1,
-                        }),
-                    )
-                }
-                Err(error) => {
-                    let _ = response.send(Err(error));
-                    return;
-                }
-            };
+        let (frame, outbound) = match split_request(
+            &target,
+            invoke_id,
+            service_choice,
+            service_data,
+            self.accepted_apdu,
+        ) {
+            Ok(RequestFrames::Whole(frame)) => (Arc::<[u8]>::from(frame), None),
+            Ok(RequestFrames::Segmented(frames)) => {
+                let first = Arc::clone(&frames[0]);
+                (
+                    first,
+                    Some(OutboundSegments {
+                        frames,
+                        acked: None,
+                        window: 1,
+                    }),
+                )
+            }
+            Err(error) => {
+                let _ = response.send(Err(error));
+                return;
+            }
+        };
         self.pending.insert(
             (target.address, invoke_id),
             PendingTransaction {
@@ -1475,13 +1504,21 @@ fn encode_who_is(low_limit: Option<u32>, high_limit: Option<u32>) -> Result<Vec<
     Ok(buffer)
 }
 
-/// The largest APDU this client accepts.
+/// The largest APDU this client accepts, unless a caller lowers it.
 ///
 /// Clause 20.1.2.5 makes `max-APDU-length-accepted` the *requester's* own
 /// limit, so it is ours to state, not the peer's. It was derived from the
 /// peer's figure to keep answers small enough to arrive whole; with
 /// reassembly that trade inverts - a larger APDU means fewer segments.
-const OUR_MAX_APDU: MaxApduSize = MaxApduSize::Up1476;
+///
+/// It is not always ours to state freely, which is why it is a default rather
+/// than a constant. A client reaching a site through a tunnel has a path that
+/// carries less than this, and the standard's sizes are not a continuum: a
+/// device told 1476 will answer with 1476 bytes, and over a 1458-byte path
+/// that answer is dropped rather than fragmented. A peer that cannot segment
+/// then has no smaller answer to give, and the read is simply unobtainable.
+/// See [`AsyncBacnetClient::from_socket_accepting`].
+const DEFAULT_MAX_APDU: MaxApduSize = MaxApduSize::Up1476;
 
 /// PDU type, segments/size, invoke ID, sequence, window, service choice.
 const SEGMENTED_REQUEST_HEADER: usize = 6;
@@ -1497,10 +1534,14 @@ struct PeerLimits {
 /// Read a peer's limits, assuming the most capable peer when it has said
 /// nothing - a too-large request then earns an Abort the caller can act on,
 /// where assuming the smallest APDU would cap every uncached device.
-fn peer_limits(target: &BacnetTarget) -> PeerLimits {
+///
+/// Bounded by `ours` as well as by the peer's own figure: a request travels
+/// the same path the response does, so a client whose path carries less than
+/// the peer accepts cannot send the larger frame either.
+fn peer_limits(target: &BacnetTarget, ours: MaxApduSize) -> PeerLimits {
     match &target.capabilities {
         Some(caps) => PeerLimits {
-            max_apdu: MaxApduSize::at_most(caps.max_apdu).size(),
+            max_apdu: MaxApduSize::at_most(caps.max_apdu).size().min(ours.size()),
             sends_segments: matches!(
                 caps.segmentation,
                 Segmentation::Both | Segmentation::Transmit
@@ -1511,7 +1552,7 @@ fn peer_limits(target: &BacnetTarget) -> PeerLimits {
             ),
         },
         None => PeerLimits {
-            max_apdu: MaxApduSize::Up1476.size(),
+            max_apdu: ours.size(),
             sends_segments: true,
             accepts_segments: true,
         },
@@ -1523,14 +1564,15 @@ fn build_confirmed_frame(
     invoke_id: u8,
     service_choice: ConfirmedServiceChoice,
     service_data: Vec<u8>,
+    accepted_apdu: MaxApduSize,
 ) -> Vec<u8> {
-    let limits = peer_limits(target);
+    let limits = peer_limits(target, accepted_apdu);
     let apdu = Apdu::ConfirmedRequest {
         segmented: false,
         more_follows: false,
         segmented_response_accepted: limits.sends_segments,
         max_segments: MAX_SEGMENTS_ACCEPTED,
-        max_response_size: OUR_MAX_APDU,
+        max_response_size: accepted_apdu,
         invoke_id,
         sequence_number: None,
         proposed_window_size: None,
@@ -1548,14 +1590,15 @@ fn build_request_segment_frame(
     sequence_number: u8,
     more_follows: bool,
     chunk: &[u8],
+    accepted_apdu: MaxApduSize,
 ) -> Vec<u8> {
-    let limits = peer_limits(target);
+    let limits = peer_limits(target, accepted_apdu);
     let apdu = Apdu::ConfirmedRequest {
         segmented: true,
         more_follows,
         segmented_response_accepted: limits.sends_segments,
         max_segments: MAX_SEGMENTS_ACCEPTED,
-        max_response_size: OUR_MAX_APDU,
+        max_response_size: accepted_apdu,
         invoke_id,
         sequence_number: Some(sequence_number),
         proposed_window_size: Some(PROPOSED_WINDOW),
@@ -1582,8 +1625,9 @@ fn split_request(
     invoke_id: u8,
     service_choice: ConfirmedServiceChoice,
     service_data: Vec<u8>,
+    accepted_apdu: MaxApduSize,
 ) -> Result<RequestFrames, ClientError> {
-    let limits = peer_limits(target);
+    let limits = peer_limits(target, accepted_apdu);
     // Sized on the segmented header, two bytes longer, to keep a request that
     // only just fits off the boundary.
     if service_data.len() + SEGMENTED_REQUEST_HEADER <= limits.max_apdu {
@@ -1592,6 +1636,7 @@ fn split_request(
             invoke_id,
             service_choice,
             service_data,
+            accepted_apdu,
         )));
     }
     if !limits.accepts_segments {
@@ -1617,6 +1662,7 @@ fn split_request(
                 index as u8,
                 index != last,
                 chunk,
+                accepted_apdu,
             )
             .into()
         })
