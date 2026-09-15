@@ -258,14 +258,15 @@ struct AnalogView<'a> {
     high_limit: Option<f32>,
     low_limit: Option<f32>,
     deadband: f32,
+    cov_increment: Option<f32>,
     alarm: Option<&'a IntrinsicReporting>,
 }
 
 /// Read a property common to every analog object type.
 ///
 /// Returns `None` for properties belonging to a single type (device type,
-/// priority array, relinquish default, COV increment) so callers fall through to
-/// their own arms.
+/// priority array, relinquish default) so callers fall through to their own
+/// arms.
 fn shared_get(view: AnalogView<'_>, property: PropertyIdentifier) -> Option<Result<PropertyValue>> {
     if let Some(result) = common_get(
         &CommonView {
@@ -281,6 +282,18 @@ fn shared_get(view: AnalogView<'_>, property: PropertyIdentifier) -> Option<Resu
         property,
     ) {
         return Some(result);
+    }
+
+    // Optional on all three analog types, not just the commandable one, and
+    // present exactly when the object has an increment. Absent it is an unknown
+    // property rather than a zero, which a COV engine would read as "report
+    // every change".
+    if property == PropertyIdentifier::CovIncrement {
+        return Some(
+            view.cov_increment
+                .map(PropertyValue::Real)
+                .ok_or(ObjectError::UnknownProperty),
+        );
     }
 
     let value = match property {
@@ -361,11 +374,13 @@ fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool
 /// Properties every analog object exposes, in the order they are reported.
 ///
 /// The per-type additions sit inside that order rather than after it: Device_Type
-/// between Description and Status_Flags, and the commandable and COV properties
-/// in `trailing`, straight after Units.
+/// between Description and Status_Flags, and the commandable properties in
+/// `trailing`, straight after Units. COV_Increment follows them, and is listed
+/// only when the object has one - it is optional on every analog type.
 fn shared_property_list(
     device_type: bool,
     trailing: &[PropertyIdentifier],
+    cov_increment: Option<f32>,
     high_limit: Option<f32>,
     low_limit: Option<f32>,
     alarm: Option<&IntrinsicReporting>,
@@ -388,6 +403,9 @@ fn shared_property_list(
         PropertyIdentifier::Units,
     ]);
     properties.extend_from_slice(trailing);
+    if cov_increment.is_some() {
+        properties.push(PropertyIdentifier::CovIncrement);
+    }
     properties.extend(analog_alarm_property_list(high_limit, low_limit, alarm));
     properties
 }
@@ -426,6 +444,7 @@ macro_rules! analog_views {
                 high_limit: self.high_limit,
                 low_limit: self.low_limit,
                 deadband: self.deadband,
+                cov_increment: self.cov_increment,
                 alarm: self.alarm.as_ref(),
             }
         }
@@ -825,6 +844,7 @@ impl BacnetObject for AnalogInput {
         shared_property_list(
             true,
             &[],
+            self.cov_increment,
             self.high_limit,
             self.low_limit,
             self.alarm.as_ref(),
@@ -898,6 +918,7 @@ impl BacnetObject for AnalogOutput {
                 PropertyIdentifier::PriorityArray,
                 PropertyIdentifier::RelinquishDefault,
             ],
+            self.cov_increment,
             self.high_limit,
             self.low_limit,
             self.alarm.as_ref(),
@@ -918,10 +939,6 @@ impl BacnetObject for AnalogValue {
             PropertyIdentifier::RelinquishDefault => {
                 Ok(PropertyValue::Real(self.relinquish_default))
             }
-            PropertyIdentifier::CovIncrement => self
-                .cov_increment
-                .map(PropertyValue::Real)
-                .ok_or(ObjectError::UnknownProperty),
             _ => shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty)),
         }
     }
@@ -954,17 +971,13 @@ impl BacnetObject for AnalogValue {
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut trailing = vec![
-            PropertyIdentifier::PriorityArray,
-            PropertyIdentifier::RelinquishDefault,
-        ];
-        if self.cov_increment.is_some() {
-            trailing.push(PropertyIdentifier::CovIncrement);
-        }
-
         shared_property_list(
             false,
-            &trailing,
+            &[
+                PropertyIdentifier::PriorityArray,
+                PropertyIdentifier::RelinquishDefault,
+            ],
+            self.cov_increment,
             self.high_limit,
             self.low_limit,
             self.alarm.as_ref(),
@@ -1135,6 +1148,47 @@ mod tests {
             input.set_sourced_value(PropertyValue::Boolean(true)),
             Err(ObjectError::InvalidPropertyType)
         ));
+    }
+
+    /// COV_Increment is optional on all three analog types, and it was the
+    /// commandable one that had it: an input's increment was stored and never
+    /// answered, so a COV engine asking for it found nothing and reported every
+    /// change a sensor made.
+    #[test]
+    fn every_analog_type_answers_the_cov_increment_it_holds() {
+        let mut input = AnalogInput::new(1, "Room CO2".to_string());
+        let mut output = AnalogOutput::new(1, "Damper".to_string());
+        let mut value = AnalogValue::new(1, "Setpoint".to_string());
+
+        for object in [&input as &dyn BacnetObject, &output, &value] {
+            assert!(matches!(
+                object.get_property(PropertyIdentifier::CovIncrement),
+                Err(ObjectError::UnknownProperty)
+            ));
+            assert!(!object
+                .property_list()
+                .contains(&PropertyIdentifier::CovIncrement));
+        }
+
+        input.cov_increment = Some(25.0);
+        output.cov_increment = Some(2.0);
+        value.cov_increment = Some(0.5);
+
+        for (object, increment) in [
+            (&input as &dyn BacnetObject, 25.0),
+            (&output, 2.0),
+            (&value, 0.5),
+        ] {
+            assert_eq!(
+                object
+                    .get_property(PropertyIdentifier::CovIncrement)
+                    .unwrap(),
+                PropertyValue::Real(increment)
+            );
+            assert!(object
+                .property_list()
+                .contains(&PropertyIdentifier::CovIncrement));
+        }
     }
 
     /// A commandable object has a priority array, so a source driving it must go

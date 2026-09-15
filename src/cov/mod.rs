@@ -356,7 +356,7 @@ fn reportable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{AnalogValue, Device, MultiStateValue, ObjectType};
+    use crate::object::{AnalogInput, AnalogValue, Device, MultiStateValue, ObjectType};
 
     fn address() -> SocketAddr {
         "192.168.6.1:47808".parse().unwrap()
@@ -532,6 +532,43 @@ mod tests {
                 PropertyValue::Real(21.6),
             )
             .unwrap();
+        assert_eq!(engine.tick(&database, &subscriptions, 2).len(), 1);
+    }
+
+    /// The same suppression, on the object type a sensor actually is. An input's
+    /// Present_Value is driven rather than written, and its increment used to be
+    /// unreadable, so a floor of climate sensors reported every tick.
+    #[test]
+    fn an_inputs_own_increment_suppresses_the_changes_a_sensor_makes() {
+        let database = database();
+        let input = ObjectIdentifier::new(ObjectType::AnalogInput, 2);
+        let mut sensor = AnalogInput::new(2, "Room CO2".to_string());
+        sensor.present_value = 520.0;
+        sensor.cov_increment = Some(25.0);
+        database.add_object(Box::new(sensor)).unwrap();
+
+        let subscriptions = CovSubscriptions::new();
+        let mut watching = subscription(false, None);
+        watching.key.monitored_object = input;
+        subscriptions.subscribe(watching);
+        let mut engine = CovEngine::new(1234);
+        assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 1);
+
+        let drive = |value: f32| {
+            database
+                .with_object_mut(input, |object| {
+                    object.set_sourced_value(PropertyValue::Real(value))
+                })
+                .unwrap()
+                .unwrap();
+        };
+
+        // The sensor's own noise, well inside the increment.
+        drive(531.0);
+        assert!(engine.tick(&database, &subscriptions, 1).is_empty());
+
+        // A spike is not.
+        drive(780.0);
         assert_eq!(engine.tick(&database, &subscriptions, 2).len(), 1);
     }
 
