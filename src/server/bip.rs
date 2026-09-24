@@ -63,9 +63,15 @@ impl BacnetIpServer {
     }
 
     pub fn from_socket(socket: UdpSocket, database: Arc<ObjectDatabase>) -> Self {
+        Self::from_dispatcher(socket, ServerDispatcher::new(ObjectService::new(database)))
+    }
+
+    /// Serve a dispatcher built elsewhere, so the application can own the
+    /// device's object service whether one server or a router fronts it.
+    pub fn from_dispatcher(socket: UdpSocket, dispatcher: ServerDispatcher) -> Self {
         Self {
             socket,
-            dispatcher: ServerDispatcher::new(ObjectService::new(database)),
+            dispatcher,
             receive_buffer: vec![0; MAX_BACNET_IP_FRAME],
             observer: None,
         }
@@ -425,7 +431,9 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub(super) fn new(socket: &UdpSocket) -> Result<Self, ServerError> {
+    /// A notifier sending from `socket`, which it shares with whatever serves
+    /// on it.
+    pub fn new(socket: &UdpSocket) -> Result<Self, ServerError> {
         let socket = socket.try_clone()?;
         // A broadcast recipient needs this; a device that never has one is
         // unaffected by it being set.
