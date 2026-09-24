@@ -193,7 +193,7 @@ impl NpduControl {
 
 /// Network address (network number + MAC address)
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetworkAddress {
     /// Network number (0 = local network, 65535 = broadcast)
     pub network: u16,

@@ -6,7 +6,7 @@ use std::{
 use crate::{
     app::{Apdu, MaxApduSize, MaxSegments},
     datalink::bip::{BvlcFunction, BvlcHeader},
-    network::Npdu,
+    network::{NetworkAddress, Npdu},
     object::database::ObjectDatabase,
     service::{
         cov_notification::CovNotification, event_notification::EventNotification, AbortReason,
@@ -42,13 +42,16 @@ pub struct BacnetIpServer {
 pub struct ServedRequest<'a> {
     /// Where the datagram came from.
     pub source: Option<SocketAddr>,
+    /// The routed device that answered, when the server is a
+    /// [`VirtualRouter`](super::VirtualRouter).
+    pub device: Option<&'a NetworkAddress>,
     /// The decoded request.
     pub request: &'a Apdu,
     /// The reply this device produced, if any.
     pub response: Option<&'a Apdu>,
 }
 
-type RequestObserver = Box<dyn Fn(&ServedRequest<'_>) + Send + Sync>;
+pub(super) type RequestObserver = Box<dyn Fn(&ServedRequest<'_>) + Send + Sync>;
 
 impl BacnetIpServer {
     pub fn bind<A: ToSocketAddrs>(
@@ -106,16 +109,7 @@ impl BacnetIpServer {
     /// bound to; use [`Notifier::with_broadcast_address`] to direct them at a
     /// subnet instead.
     pub fn notifier(&self) -> Result<Notifier, ServerError> {
-        let socket = self.socket.try_clone()?;
-        // A broadcast recipient needs this; a device that never has one is
-        // unaffected by it being set.
-        socket.set_broadcast(true)?;
-        let port = socket.local_addr()?.port();
-        Ok(Notifier {
-            socket,
-            broadcast_address: SocketAddr::from((Ipv4Addr::BROADCAST, port)),
-            invoke_id: std::sync::atomic::AtomicU8::new(1),
-        })
+        Notifier::new(&self.socket)
     }
 
     /// Receive and process one UDP datagram.
@@ -306,35 +300,57 @@ fn process_datagram(
     if request_npdu.is_network_message() {
         return Ok(None);
     }
-    let response = match Apdu::decode(apdu_data) {
-        Ok(request_apdu) => {
+    let response = answer(
+        dispatcher,
+        &request_npdu,
+        Apdu::decode(apdu_data).map_err(|_| apdu_data),
+        source,
+        observer,
+        None,
+    )?;
+    Ok(response.map(|response| DatagramResponse {
+        frame: encode_response(&response),
+        destination,
+    }))
+}
+
+/// Dispatch one request to one device, showing it to `observer`.
+///
+/// `request` is the APDU, or its raw bytes when it would not decode, which
+/// still earn a reject.
+pub(super) fn answer(
+    dispatcher: &ServerDispatcher,
+    request_npdu: &Npdu,
+    request: Result<Apdu, &[u8]>,
+    source: Option<SocketAddr>,
+    observer: Option<&RequestObserver>,
+    device: Option<&NetworkAddress>,
+) -> Result<Option<ServerResponse>, ServerError> {
+    match request {
+        Ok(request) => {
             // Dispatching consumes the request, so an observer needs its own
             // copy. Only made when one is installed: this is a debugging path,
             // and a device serving a gateway should not pay for it otherwise.
-            let observed = observer.map(|_| request_apdu.clone());
-            let response = dispatcher.dispatch(&request_npdu, request_apdu, source)?;
-
+            let observed = observer.map(|_| request.clone());
+            let response = dispatcher.dispatch(request_npdu, request, source)?;
             if let (Some(observer), Some(request)) = (observer, &observed) {
                 observer(&ServedRequest {
                     source,
+                    device,
                     request,
                     response: response.as_ref().map(|response| &response.apdu),
                 });
             }
-            response
+            Ok(response)
         }
-        Err(_) => response_for_undecodable_apdu(&request_npdu, apdu_data),
-    };
-    let Some(response) = response else {
-        return Ok(None);
-    };
+        Err(data) => Ok(response_for_undecodable_apdu(request_npdu, data)),
+    }
+}
 
+pub(super) fn encode_response(response: &ServerResponse) -> Vec<u8> {
     let npdu = response.npdu.encode();
     let apdu = response.apdu.encode();
-    Ok(Some(DatagramResponse {
-        frame: wrap_bvlc_parts(BvlcFunction::OriginalUnicastNpdu, &[&npdu, &apdu]),
-        destination,
-    }))
+    wrap_bvlc_parts(BvlcFunction::OriginalUnicastNpdu, &[&npdu, &apdu])
 }
 
 struct DatagramResponse {
@@ -375,7 +391,7 @@ fn response_for_undecodable_apdu(request_npdu: &Npdu, data: &[u8]) -> Option<Ser
     Some(ServerResponse { npdu, apdu })
 }
 
-fn decode_bacnet_ip_frame(data: &[u8]) -> Option<(Npdu, &[u8], Option<SocketAddr>)> {
+pub(super) fn decode_bacnet_ip_frame(data: &[u8]) -> Option<(Npdu, &[u8], Option<SocketAddr>)> {
     let header = BvlcHeader::decode(data).ok()?;
     if usize::from(header.length) != data.len() {
         return None;
@@ -402,12 +418,41 @@ fn decode_bacnet_ip_frame(data: &[u8]) -> Option<(Npdu, &[u8], Option<SocketAddr
 /// its own handle on the server's socket so it can transmit while the loop is
 /// blocked in `recv_from`.
 pub struct Notifier {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     broadcast_address: SocketAddr,
+    source: Option<NetworkAddress>,
     invoke_id: std::sync::atomic::AtomicU8,
 }
 
 impl Notifier {
+    pub(super) fn new(socket: &UdpSocket) -> Result<Self, ServerError> {
+        let socket = socket.try_clone()?;
+        // A broadcast recipient needs this; a device that never has one is
+        // unaffected by it being set.
+        socket.set_broadcast(true)?;
+        let port = socket.local_addr()?.port();
+        Ok(Self {
+            socket: Arc::new(socket),
+            broadcast_address: SocketAddr::from((Ipv4Addr::BROADCAST, port)),
+            source: None,
+            invoke_id: std::sync::atomic::AtomicU8::new(1),
+        })
+    }
+
+    /// A notifier for one device behind a [`VirtualRouter`](super::VirtualRouter),
+    /// stamping `source` as SNET/SADR so a recipient can tell which device spoke.
+    ///
+    /// Shares this notifier's socket rather than cloning it: a site of a
+    /// thousand devices must not hold a thousand file descriptors.
+    pub fn routed_from(&self, source: NetworkAddress) -> Self {
+        Self {
+            socket: Arc::clone(&self.socket),
+            broadcast_address: self.broadcast_address,
+            source: Some(source),
+            invoke_id: std::sync::atomic::AtomicU8::new(1),
+        }
+    }
+
     /// Send broadcasts to `address` rather than 255.255.255.255.
     ///
     /// A directed subnet broadcast is often what a routed network wants, and is
@@ -471,14 +516,7 @@ impl Notifier {
             }
         };
 
-        let npdu = if confirmed {
-            // A confirmed request asks the recipient to reply.
-            let mut npdu = Npdu::new();
-            npdu.control.expecting_reply = true;
-            npdu.encode()
-        } else {
-            Npdu::new().encode()
-        };
+        let npdu = self.npdu(confirmed);
 
         let (address, function) = self.route(destination);
         let frame = wrap_bvlc_parts(function, &[&npdu, &apdu.encode()]);
@@ -521,18 +559,22 @@ impl Notifier {
             }
         };
 
-        let npdu = if confirmed {
-            let mut npdu = Npdu::new();
-            npdu.control.expecting_reply = true;
-            npdu.encode()
-        } else {
-            Npdu::new().encode()
-        };
+        let npdu = self.npdu(confirmed);
 
         let (address, function) = self.route(destination);
         let frame = wrap_bvlc_parts(function, &[&npdu, &apdu.encode()]);
         self.socket.send_to(&frame, address)?;
         Ok(())
+    }
+
+    fn npdu(&self, confirmed: bool) -> Vec<u8> {
+        let mut npdu = Npdu::new();
+        // A confirmed request asks the recipient to reply.
+        npdu.control.expecting_reply = confirmed;
+        if let Some(source) = &self.source {
+            npdu.set_source(source.clone());
+        }
+        npdu.encode()
     }
 
     /// Invoke ids cycle 0-255; confirmed notifications are not tracked, so this
@@ -548,7 +590,7 @@ fn wrap_bvlc(function: BvlcFunction, payload: &[u8]) -> Vec<u8> {
     wrap_bvlc_parts(function, &[payload])
 }
 
-fn wrap_bvlc_parts(function: BvlcFunction, payload_parts: &[&[u8]]) -> Vec<u8> {
+pub(super) fn wrap_bvlc_parts(function: BvlcFunction, payload_parts: &[&[u8]]) -> Vec<u8> {
     let payload_length: usize = payload_parts.iter().map(|part| part.len()).sum();
     let length = 4 + payload_length;
     let mut frame = Vec::with_capacity(length);

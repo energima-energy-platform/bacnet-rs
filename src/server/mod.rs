@@ -5,13 +5,15 @@
 //! against an [`ObjectDatabase`], while [`BacnetIpServer`] owns the UDP socket
 //! and handles BVLC, NPDU, and APDU framing. With the `async` feature,
 //! `AsyncBacnetIpServer` provides bounded concurrent request handling over a
-//! single Tokio UDP socket.
+//! single Tokio UDP socket. [`VirtualRouter`] hosts many devices behind one
+//! BACnet/IP port, as a router to networks that exist only in this process.
 
 mod address_cache;
 mod bip;
 mod dispatcher;
 mod error;
 mod object_service;
+mod router;
 
 pub use address_cache::{AddressCache, NotificationTarget};
 #[cfg(feature = "async")]
@@ -20,3 +22,4 @@ pub use bip::{BacnetIpServer, Notifier, ServedRequest};
 pub use dispatcher::{ServerDispatcher, ServerResponse};
 pub use error::ServerError;
 pub use object_service::ObjectService;
+pub use router::{RouterDevices, VirtualRouter};
