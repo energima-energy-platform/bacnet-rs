@@ -227,7 +227,7 @@ pub fn status_flags_bits(
 ///
 /// The event algorithm itself lives with the object (it depends on the object's
 /// value type); this holds only what every algorithm shares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IntrinsicReporting {
     /// Instance number of the notification class object that routes notifications.
     pub notification_class: u32,
@@ -246,6 +246,9 @@ pub struct IntrinsicReporting {
     pub event_detection_enable: bool,
     /// Timestamps of the last to-offnormal, to-fault and to-normal transitions.
     pub event_time_stamps: [TimestampValue; 3],
+    /// What caused each of those, so an acknowledgement reports the event type
+    /// of the transition it acknowledges rather than of the object's state now.
+    pub event_triggers: [Option<AlarmTrigger>; 3],
 }
 
 impl IntrinsicReporting {
@@ -265,6 +268,7 @@ impl IntrinsicReporting {
                 UNSPECIFIED_TIMESTAMP,
                 UNSPECIFIED_TIMESTAMP,
             ],
+            event_triggers: [None; 3],
         }
     }
 
@@ -282,8 +286,15 @@ impl IntrinsicReporting {
     /// This follows the transition itself, so it happens whether or not a
     /// notification is sent. Acknowledgement is tracked separately by
     /// [`Self::await_acknowledgement`].
-    pub fn record_transition(&mut self, state: EventState, at: TimestampValue) {
-        self.event_time_stamps[EventTransition::for_state(state).bit_index()] = at;
+    pub fn record_transition(
+        &mut self,
+        state: EventState,
+        at: TimestampValue,
+        trigger: AlarmTrigger,
+    ) {
+        let index = EventTransition::for_state(state).bit_index();
+        self.event_time_stamps[index] = at;
+        self.event_triggers[index] = Some(trigger);
     }
 
     /// Mark a transition as awaiting operator acknowledgement.
@@ -498,14 +509,16 @@ mod tests {
         let mut reporting = IntrinsicReporting::new(1);
         let at = TimestampValue::Time(10, 20, 30, 0);
 
-        reporting.record_transition(EventState::Offnormal, at.clone());
+        let trigger = AlarmTrigger::BinaryChange { active: true };
+        reporting.record_transition(EventState::Offnormal, at.clone(), trigger);
         assert_eq!(reporting.event_time_stamps[0], at);
+        assert_eq!(reporting.event_triggers[0], Some(trigger));
         assert!(
             reporting.acked_transitions.to_offnormal,
             "stamping a transition does not make an ack outstanding"
         );
 
-        reporting.record_transition(EventState::Normal, at.clone());
+        reporting.record_transition(EventState::Normal, at.clone(), trigger);
         assert_eq!(reporting.event_time_stamps[2], at);
     }
 

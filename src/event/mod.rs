@@ -107,11 +107,17 @@ impl EventEngine {
         acknowledgement: Acknowledgement,
         timestamp: TimestampValue,
     ) -> Vec<AddressedNotification> {
+        let transition = EventTransition::for_state(acknowledgement.state);
         let Some((notification_class, trigger, out_of_service)) = database
             .with_object(acknowledgement.object, |object| {
+                let reporting = object.intrinsic()?;
+                // The object's state now is no guide: it may have recovered,
+                // or faulted, since the transition being acknowledged.
+                let trigger = reporting.event_triggers[transition.bit_index()]
+                    .or_else(|| Some(object.evaluate_alarm()?.trigger))?;
                 Some((
-                    object.intrinsic()?.notification_class,
-                    object.evaluate_alarm()?.trigger,
+                    reporting.notification_class,
+                    trigger,
                     object.is_out_of_service(),
                 ))
             })
@@ -119,7 +125,6 @@ impl EventEngine {
         else {
             return Vec::new();
         };
-        let transition = EventTransition::for_state(acknowledgement.state);
         let (priority, _) = notification_class_settings(database, notification_class, transition);
         let base = EventNotification {
             process_identifier: 0,
@@ -218,7 +223,11 @@ impl EventEngine {
             .with_object_mut(identifier, |object| {
                 object.apply_event_state(evaluation.desired_state);
                 let reporting = object.intrinsic_mut()?;
-                reporting.record_transition(evaluation.desired_state, timestamp.clone());
+                reporting.record_transition(
+                    evaluation.desired_state,
+                    timestamp.clone(),
+                    evaluation.trigger,
+                );
                 Some(reporting.notifies(evaluation.desired_state))
             })
             .flatten();
@@ -394,6 +403,34 @@ mod tests {
 
     fn database() -> Arc<ObjectDatabase> {
         database_with_recipients(true)
+    }
+
+    /// One recipient, which every transition asks to acknowledge.
+    fn database_acking_everything() -> Arc<ObjectDatabase> {
+        let database = Arc::new(ObjectDatabase::new(Device::new(1234, "Test".to_string())));
+        database
+            .add_object(Box::new(
+                NotificationClass::new(NC, "NC".to_string())
+                    .with_ack_required(EventTransitionBits::all())
+                    .with_recipient(gateway(), 777),
+            ))
+            .unwrap();
+        database
+    }
+
+    fn acknowledging(
+        object: ObjectIdentifier,
+        state: EventState,
+        time_stamp: TimestampValue,
+    ) -> crate::service::acknowledge_alarm::AcknowledgeAlarmRequest {
+        crate::service::acknowledge_alarm::AcknowledgeAlarmRequest {
+            acknowledging_process_identifier: 777,
+            event_object_identifier: object,
+            event_state_acknowledged: state,
+            time_stamp,
+            acknowledgment_source: "operator".to_string(),
+            time_of_acknowledgment: TimestampValue::SequenceNumber(50),
+        }
     }
 
     fn database_with_recipients(registered: bool) -> Arc<ObjectDatabase> {
@@ -1011,8 +1048,54 @@ mod tests {
     #[test]
     fn an_acknowledgement_must_name_the_transition_it_acknowledges() {
         use crate::server::ObjectService;
-        use crate::service::acknowledge_alarm::AcknowledgeAlarmRequest;
 
+        let database = database_acking_everything();
+        database
+            .add_object(Box::new(
+                MultiStateValue::new(1, "Mode".to_string(), 5)
+                    .with_intrinsic_reporting(NC, vec![5]),
+            ))
+            .unwrap();
+        let object = ObjectIdentifier::new(ObjectType::MultiStateValue, 1);
+        let mut engine = EventEngine::new(1234);
+        database
+            .set_property(
+                object,
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Unsigned(5),
+            )
+            .unwrap();
+        let raised_at = TimestampValue::SequenceNumber(42);
+        assert_eq!(engine.tick(&database, 1, raised_at.clone()).len(), 1);
+        let service = ObjectService::new(Arc::clone(&database));
+
+        let acknowledge = |time_stamp| acknowledging(object, EventState::Offnormal, time_stamp);
+        assert!(matches!(
+            service.acknowledge_alarm(&acknowledge(TimestampValue::SequenceNumber(41))),
+            Err(crate::object::ObjectError::InvalidTimeStamp)
+        ));
+        service.acknowledge_alarm(&acknowledge(raised_at)).unwrap();
+
+        let acknowledgements = service.take_acknowledgements();
+        assert_eq!(acknowledgements.len(), 1);
+        let announced = engine.acknowledged(&database, acknowledgements[0], stamp());
+        assert_eq!(announced.len(), 1, "one per recipient");
+        let notification = &announced[0].notification;
+        assert_eq!(
+            notification.notify_type,
+            crate::object::intrinsic::NotifyType::AckNotification
+        );
+        assert_eq!(notification.to_state, EventState::Offnormal);
+        assert_eq!(notification.process_identifier, 777);
+    }
+
+    /// Only a transition awaiting acknowledgement is announced: acknowledging
+    /// one nobody asked about, or one already acknowledged, succeeds quietly.
+    #[test]
+    fn an_acknowledgement_is_announced_once_and_only_when_awaited() {
+        use crate::server::ObjectService;
+
+        // To-offnormal needs no acknowledgement here.
         let database = database();
         database
             .add_object(Box::new(
@@ -1033,30 +1116,96 @@ mod tests {
         assert_eq!(engine.tick(&database, 1, raised_at.clone()).len(), 1);
         let service = ObjectService::new(Arc::clone(&database));
 
-        let acknowledge = |time_stamp| AcknowledgeAlarmRequest {
-            acknowledging_process_identifier: 777,
-            event_object_identifier: object,
-            event_state_acknowledged: EventState::Offnormal,
-            time_stamp,
-            acknowledgment_source: "operator".to_string(),
-            time_of_acknowledgment: TimestampValue::SequenceNumber(50),
-        };
-        assert!(matches!(
-            service.acknowledge_alarm(&acknowledge(TimestampValue::SequenceNumber(41))),
-            Err(crate::object::ObjectError::InvalidTimeStamp)
-        ));
-        service.acknowledge_alarm(&acknowledge(raised_at)).unwrap();
-
-        let acknowledgements = service.take_acknowledgements();
-        assert_eq!(acknowledgements.len(), 1);
-        let announced = engine.acknowledged(&database, acknowledgements[0], stamp());
-        assert_eq!(announced.len(), 1, "one per recipient");
-        let notification = &announced[0].notification;
-        assert_eq!(
-            notification.notify_type,
-            crate::object::intrinsic::NotifyType::AckNotification
+        let request = acknowledging(object, EventState::Offnormal, raised_at);
+        service.acknowledge_alarm(&request).unwrap();
+        assert!(
+            service.take_acknowledgements().is_empty(),
+            "nobody was asked to acknowledge it"
         );
-        assert_eq!(notification.to_state, EventState::Offnormal);
-        assert_eq!(notification.process_identifier, 777);
+
+        let database = database_acking_everything();
+        database
+            .add_object(Box::new(
+                MultiStateValue::new(1, "Mode".to_string(), 5)
+                    .with_intrinsic_reporting(NC, vec![5]),
+            ))
+            .unwrap();
+        database
+            .set_property(
+                object,
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Unsigned(5),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.tick(&database, 1, request.time_stamp.clone()).len(),
+            1
+        );
+        let service = ObjectService::new(Arc::clone(&database));
+        service.acknowledge_alarm(&request).unwrap();
+        service.acknowledge_alarm(&request).unwrap();
+        assert_eq!(
+            service.take_acknowledgements().len(),
+            1,
+            "a repeated acknowledgement is not announced again"
+        );
+    }
+
+    /// The acknowledgement carries the event type of the transition it
+    /// acknowledges, not of whatever the object is doing by then.
+    #[test]
+    fn an_acknowledgement_reports_the_event_type_of_its_transition() {
+        use crate::server::ObjectService;
+
+        let database = database_acking_everything();
+        database
+            .add_object(Box::new(
+                AnalogValue::new(1, "Temp".to_string()).with_out_of_range_reporting(
+                    NC,
+                    Some(18.0),
+                    Some(24.0),
+                    0.5,
+                ),
+            ))
+            .unwrap();
+        let object = ObjectIdentifier::new(ObjectType::AnalogValue, 1);
+        let mut engine = EventEngine::new(1234);
+        database
+            .set_property(
+                object,
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Real(25.0),
+            )
+            .unwrap();
+        let raised_at = TimestampValue::SequenceNumber(42);
+        assert_eq!(engine.tick(&database, 0, raised_at.clone()).len(), 1);
+
+        // Faulted since: the object's own evaluation is a reliability change.
+        database
+            .set_property(
+                object,
+                PropertyIdentifier::Reliability,
+                PropertyValue::Enumerated(u32::from(crate::object::Reliability::UnreliableOther)),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.tick(&database, 1, stamp())[0].notification.to_state,
+            EventState::Fault
+        );
+
+        let service = ObjectService::new(Arc::clone(&database));
+        service
+            .acknowledge_alarm(&acknowledging(object, EventState::HighLimit, raised_at))
+            .unwrap();
+        let acknowledgement = service.take_acknowledgements()[0];
+        let announced = engine.acknowledged(&database, acknowledgement, stamp());
+        assert!(
+            matches!(
+                announced[0].notification.parameters,
+                NotificationParameters::OutOfRange { .. }
+            ),
+            "{:?}",
+            announced[0].notification.parameters
+        );
     }
 }
