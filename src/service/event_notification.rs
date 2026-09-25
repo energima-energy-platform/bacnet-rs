@@ -259,9 +259,12 @@ impl EventNotification {
             11,
         )?);
 
-        encode_opening_tag(buffer, 12)?;
-        self.parameters.encode(buffer)?;
-        encode_closing_tag(buffer, 12)?;
+        // Nor event-values: an acknowledgement reports no algorithm (13.8.1).
+        if self.notify_type != NotifyType::AckNotification {
+            encode_opening_tag(buffer, 12)?;
+            self.parameters.encode(buffer)?;
+            encode_closing_tag(buffer, 12)?;
+        }
 
         Ok(())
     }

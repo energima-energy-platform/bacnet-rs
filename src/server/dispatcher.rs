@@ -243,6 +243,20 @@ impl ServerDispatcher {
                     Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
                 }
             }
+            ConfirmedServiceChoice::AcknowledgeAlarm => {
+                match crate::service::acknowledge_alarm::AcknowledgeAlarmRequest::decode(
+                    service_data,
+                ) {
+                    Ok(request) => match self.objects.acknowledge_alarm(&request) {
+                        Ok(()) => Ok(Apdu::SimpleAck {
+                            invoke_id,
+                            service_choice: service_choice as u8,
+                        }),
+                        Err(error) => Ok(object_error_apdu(invoke_id, service_choice, error)),
+                    },
+                    Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
+                }
+            }
             ConfirmedServiceChoice::WriteProperty => {
                 match WritePropertyRequest::decode(service_data) {
                     Ok(request) => match self.objects.write_property(&request, source) {
