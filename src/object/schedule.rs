@@ -371,6 +371,17 @@ impl BacnetObject for Schedule {
                         })
                         .collect::<Result<Vec<SpecialEventValue>>>()?;
                     within_capacity(events.len(), self.capacity.exceptions)?;
+                    // A device may hold other priorities of its own making, but
+                    // one written to it is BACnet's 1-16.
+                    if let Some(event) = events
+                        .iter()
+                        .find(|event| !(1..=16).contains(&event.priority))
+                    {
+                        return Err(ObjectError::InvalidValue(format!(
+                            "event priority {} is not 1-16",
+                            event.priority
+                        )));
+                    }
                     for event in &events {
                         within_capacity(
                             event.time_values.len(),
@@ -829,6 +840,24 @@ mod tests {
         assert!(matches!(
             schedule.set_property(PropertyIdentifier::WeeklySchedule, week),
             Err(ObjectError::NoSpaceToWriteProperty)
+        ));
+    }
+
+    #[test]
+    fn an_exception_written_with_a_priority_outside_1_to_16_is_refused() {
+        let mut schedule = office_hours();
+        let mut event = match exception(1) {
+            PropertyValue::SpecialEvent(event) => event,
+            _ => unreachable!(),
+        };
+        event.priority = 0;
+
+        assert!(matches!(
+            schedule.set_property(
+                PropertyIdentifier::ExceptionSchedule,
+                PropertyValue::Array(vec![PropertyValue::SpecialEvent(event)]),
+            ),
+            Err(ObjectError::InvalidValue(_))
         ));
     }
 }
