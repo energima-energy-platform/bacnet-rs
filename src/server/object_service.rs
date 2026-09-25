@@ -83,16 +83,20 @@ impl ObjectService {
     ///
     /// The time stamp must be the one recorded for the transition into the
     /// acknowledged state; anything else, including an object with no
-    /// transitions to match, is INVALID_TIME_STAMP. The acknowledgement is
-    /// queued for [`take_acknowledgements`](Self::take_acknowledgements), since
-    /// telling the recipients needs a clock and a socket this does not have.
+    /// transitions to match, is INVALID_TIME_STAMP. A transition awaiting
+    /// acknowledgement is queued for
+    /// [`take_acknowledgements`](Self::take_acknowledgements), since telling
+    /// the recipients needs a clock and a socket this does not have; one that
+    /// is not succeeds and is told to nobody, so a repeated acknowledgement
+    /// cannot notify twice.
     pub fn acknowledge_alarm(
         &self,
         request: &crate::service::acknowledge_alarm::AcknowledgeAlarmRequest,
     ) -> Result<(), ObjectError> {
         let transition =
             crate::object::intrinsic::EventTransition::for_state(request.event_state_acknowledged);
-        self.database
+        let awaited = self
+            .database
             .with_object_mut(request.event_object_identifier, |object| {
                 let reporting = object
                     .intrinsic_mut()
@@ -100,10 +104,14 @@ impl ObjectService {
                 if reporting.event_time_stamps[transition.bit_index()] != request.time_stamp {
                     return Err(ObjectError::InvalidTimeStamp);
                 }
+                let awaited = !reporting.acked_transitions.contains(transition);
                 reporting.acked_transitions.set(transition, true);
-                Ok(())
+                Ok(awaited)
             })
             .ok_or(ObjectError::NotFound)??;
+        if !awaited {
+            return Ok(());
+        }
         self.acknowledgements
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
