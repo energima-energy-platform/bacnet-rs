@@ -24,7 +24,7 @@ use super::{
         answer, decode_bacnet_ip_frame, encode_response, wrap_bvlc_parts, RequestObserver,
         ServedRequest,
     },
-    DatagramSocket, Notifier, ServerDispatcher, ServerError,
+    DatagramSocket, Dispatch, Notifier, ServerError,
 };
 
 const MAX_BACNET_IP_FRAME: usize = 65_535;
@@ -48,7 +48,7 @@ struct Routes {
     /// Kept apart from the devices so a network with none on it is still
     /// announced: a router's networks are its wiring, not its population.
     networks: BTreeSet<u16>,
-    devices: BTreeMap<NetworkAddress, ServerDispatcher>,
+    devices: BTreeMap<NetworkAddress, Arc<dyn Dispatch>>,
 }
 
 impl RouterDevices {
@@ -85,8 +85,8 @@ impl RouterDevices {
     pub fn insert(
         &self,
         address: NetworkAddress,
-        dispatcher: ServerDispatcher,
-    ) -> Result<Option<ServerDispatcher>, ServerError> {
+        dispatcher: Arc<dyn Dispatch>,
+    ) -> Result<Option<Arc<dyn Dispatch>>, ServerError> {
         if address.address.is_empty() {
             return Err(ServerError::InvalidConfiguration(
                 "a routed device needs a MAC address".to_string(),
@@ -102,7 +102,7 @@ impl RouterDevices {
         Ok(routes.devices.insert(address, dispatcher))
     }
 
-    pub fn remove(&self, address: &NetworkAddress) -> Option<ServerDispatcher> {
+    pub fn remove(&self, address: &NetworkAddress) -> Option<Arc<dyn Dispatch>> {
         self.write().devices.remove(address)
     }
 
@@ -118,10 +118,10 @@ impl RouterDevices {
     fn reached_by(
         &self,
         destination: &NetworkAddress,
-    ) -> Option<Vec<(NetworkAddress, ServerDispatcher)>> {
+    ) -> Option<Vec<(NetworkAddress, Arc<dyn Dispatch>)>> {
         let routes = self.read();
-        let clone = |(address, dispatcher): (&NetworkAddress, &ServerDispatcher)| {
-            (address.clone(), dispatcher.clone())
+        let clone = |(address, dispatcher): (&NetworkAddress, &Arc<dyn Dispatch>)| {
+            (address.clone(), Arc::clone(dispatcher))
         };
         if destination.network == GLOBAL_BROADCAST {
             return Some(routes.devices.iter().map(clone).collect());
@@ -282,7 +282,7 @@ fn route(
             Err(_) => continue,
         };
         let response = answer(
-            dispatcher,
+            &**dispatcher,
             &npdu,
             request,
             Some(source),
@@ -374,7 +374,7 @@ mod tests {
             database::ObjectDatabase, AnalogValue, Device, ObjectIdentifier, ObjectType,
             PropertyIdentifier, PropertyValue,
         },
-        server::{NotificationTarget, ObjectService},
+        server::{NotificationTarget, ObjectService, ServerDispatcher, ServerResponse},
         service::cov_notification::{CovNotification, CovPropertyValue},
     };
 
@@ -383,12 +383,14 @@ mod tests {
     const NETWORK: u16 = 1001;
     const OTHER_NETWORK: u16 = 1002;
 
-    fn device(instance: u32) -> ServerDispatcher {
+    fn device(instance: u32) -> Arc<dyn Dispatch> {
         let database = ObjectDatabase::new(Device::new(instance, format!("Device {instance}")));
         let mut value = AnalogValue::new(1, "Setpoint".to_string());
         value.present_value = instance as f32;
         database.add_object(Box::new(value)).unwrap();
-        ServerDispatcher::new(ObjectService::new(Arc::new(database)))
+        Arc::new(ServerDispatcher::new(ObjectService::new(Arc::new(
+            database,
+        ))))
     }
 
     fn at(network: u16, mac: u8) -> NetworkAddress {
@@ -519,6 +521,45 @@ mod tests {
             [at(NETWORK, 1), at(NETWORK, 2), at(OTHER_NETWORK, 1)]
         );
         assert!(replies.iter().all(|reply| reply.1 == source()));
+    }
+
+    /// A dispatcher that keeps its device out of discovery.
+    struct Unlisted(Arc<dyn Dispatch>);
+
+    impl Dispatch for Unlisted {
+        fn dispatch(
+            &self,
+            request_npdu: &Npdu,
+            request_apdu: Apdu,
+            source: Option<SocketAddr>,
+        ) -> Result<Option<ServerResponse>, ServerError> {
+            match request_apdu {
+                Apdu::UnconfirmedRequest {
+                    service_choice: crate::service::UnconfirmedServiceChoice::WhoIs,
+                    ..
+                } => Ok(None),
+                other => self.0.dispatch(request_npdu, other, source),
+            }
+        }
+    }
+
+    #[test]
+    fn a_device_answers_through_the_dispatcher_it_was_given() {
+        let devices = site();
+        devices
+            .insert(at(NETWORK, 2), Arc::new(Unlisted(device(12))))
+            .unwrap();
+        let frame = who_is_to(
+            BvlcFunction::OriginalBroadcastNpdu,
+            Some(NetworkAddress::new(GLOBAL_BROADCAST, Vec::new())),
+        );
+
+        let replies = route(&devices, &frame, source(), None).unwrap();
+
+        assert_eq!(
+            answered_by(&replies),
+            [at(NETWORK, 1), at(OTHER_NETWORK, 1)]
+        );
     }
 
     #[test]
