@@ -13,8 +13,8 @@
 //! [`value_at`](Schedule::value_at) and the `schedule` module for that.
 
 use crate::object::{
-    BacnetObject, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue,
-    Reliability, Result,
+    within_capacity, BacnetObject, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier,
+    PropertyValue, Reliability, Result,
 };
 use crate::property::{
     DailyScheduleValue, DateRangeValue, ObjectPropertyReference, SpecialEventPeriod,
@@ -29,6 +29,19 @@ pub const DAYS_PER_WEEK: usize = 7;
 
 /// The lowest BACnet command priority, used unless configured otherwise.
 pub const DEFAULT_PRIORITY_FOR_WRITING: u8 = 16;
+
+/// How much a schedule can hold. `None` is unlimited.
+///
+/// Controllers keep schedules in fixed storage, often small: a couple of
+/// exception dates of a few events each is common. A write that does not fit is
+/// refused with NO_SPACE_TO_WRITE_PROPERTY.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScheduleCapacity {
+    /// Entries in Exception_Schedule.
+    pub exceptions: Option<usize>,
+    /// Time/value pairs in one day, of the weekly schedule or of an exception.
+    pub time_values_per_day: Option<usize>,
+}
 
 /// Schedule object.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +70,8 @@ pub struct Schedule {
     pub reliability: Reliability,
     /// Whether the schedule is decoupled from its targets.
     pub out_of_service: bool,
+    /// How much of the weekly and exception schedules the device can store.
+    pub capacity: ScheduleCapacity,
 }
 
 /// A date range that is always in effect: both endpoints unspecified.
@@ -86,6 +101,7 @@ impl Schedule {
             priority_for_writing: DEFAULT_PRIORITY_FOR_WRITING,
             reliability: Reliability::NoFaultDetected,
             out_of_service: false,
+            capacity: ScheduleCapacity::default(),
         }
     }
 
@@ -337,20 +353,33 @@ impl BacnetObject for Schedule {
                             _ => return Err(ObjectError::InvalidPropertyType),
                         }
                     }
+                    for day in &week {
+                        within_capacity(day.time_values.len(), self.capacity.time_values_per_day)?;
+                    }
                     self.weekly_schedule = week;
                     Ok(())
                 }
                 _ => Err(ObjectError::InvalidPropertyType),
             },
             PropertyIdentifier::ExceptionSchedule => match value {
-                PropertyValue::Array(events) | PropertyValue::List(events) => events
-                    .into_iter()
-                    .map(|event| match event {
-                        PropertyValue::SpecialEvent(event) => Ok(event),
-                        _ => Err(ObjectError::InvalidPropertyType),
-                    })
-                    .collect::<Result<Vec<SpecialEventValue>>>()
-                    .map(|events| self.exception_schedule = events),
+                PropertyValue::Array(events) | PropertyValue::List(events) => {
+                    let events = events
+                        .into_iter()
+                        .map(|event| match event {
+                            PropertyValue::SpecialEvent(event) => Ok(event),
+                            _ => Err(ObjectError::InvalidPropertyType),
+                        })
+                        .collect::<Result<Vec<SpecialEventValue>>>()?;
+                    within_capacity(events.len(), self.capacity.exceptions)?;
+                    for event in &events {
+                        within_capacity(
+                            event.time_values.len(),
+                            self.capacity.time_values_per_day,
+                        )?;
+                    }
+                    self.exception_schedule = events;
+                    Ok(())
+                }
                 _ => Err(ObjectError::InvalidPropertyType),
             },
             PropertyIdentifier::ListOfObjectPropertyReferences => match value {
@@ -742,5 +771,64 @@ mod tests {
                 end: (2026, 12, 31, ANY),
             })
         );
+    }
+
+    fn exception(time_values: usize) -> PropertyValue {
+        PropertyValue::SpecialEvent(SpecialEventValue {
+            period: SpecialEventPeriod::CalendarEntry(CalendarEntryValue::Date(
+                UNSPECIFIED_YEAR,
+                12,
+                24,
+                ANY,
+            )),
+            time_values: (0..time_values)
+                .map(|hour| time_value(hour as u8, 15.0))
+                .collect(),
+            priority: 8,
+        })
+    }
+
+    #[test]
+    fn an_exception_schedule_larger_than_the_device_holds_is_refused_whole() {
+        let mut schedule = office_hours();
+        schedule.capacity = ScheduleCapacity {
+            exceptions: Some(2),
+            time_values_per_day: Some(6),
+        };
+        let write = |schedule: &mut Schedule, events: Vec<PropertyValue>| {
+            schedule.set_property(
+                PropertyIdentifier::ExceptionSchedule,
+                PropertyValue::Array(events),
+            )
+        };
+
+        assert!(write(&mut schedule, vec![exception(6), exception(1)]).is_ok());
+        assert!(matches!(
+            write(&mut schedule, vec![exception(1); 3]),
+            Err(ObjectError::NoSpaceToWriteProperty)
+        ));
+        assert!(matches!(
+            write(&mut schedule, vec![exception(7)]),
+            Err(ObjectError::NoSpaceToWriteProperty)
+        ));
+        assert_eq!(
+            schedule.exception_schedule.len(),
+            2,
+            "unchanged by a refusal"
+        );
+    }
+
+    #[test]
+    fn a_weekly_day_larger_than_the_device_holds_is_refused() {
+        let mut schedule = office_hours();
+        schedule.capacity.time_values_per_day = Some(1);
+        let week = schedule
+            .get_property(PropertyIdentifier::WeeklySchedule)
+            .unwrap();
+
+        assert!(matches!(
+            schedule.set_property(PropertyIdentifier::WeeklySchedule, week),
+            Err(ObjectError::NoSpaceToWriteProperty)
+        ));
     }
 }

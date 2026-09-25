@@ -11,8 +11,8 @@
 //! schedule engine calls each tick.
 
 use crate::object::{
-    BacnetObject, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue,
-    Result,
+    within_capacity, BacnetObject, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier,
+    PropertyValue, Result,
 };
 use crate::property::CalendarEntryValue;
 
@@ -32,6 +32,8 @@ pub struct Calendar {
     pub date_list: Vec<CalendarEntryValue>,
     /// Whether the last refreshed date was one of them.
     pub present_value: bool,
+    /// How many entries Date_List has room for. `None` is unlimited.
+    pub date_list_capacity: Option<usize>,
 }
 
 impl Calendar {
@@ -43,6 +45,7 @@ impl Calendar {
             description: String::new(),
             date_list: Vec::new(),
             present_value: false,
+            date_list_capacity: None,
         }
     }
 
@@ -122,18 +125,22 @@ impl BacnetObject for Calendar {
                 _ => Err(ObjectError::InvalidPropertyType),
             },
             PropertyIdentifier::DateList => match value {
-                PropertyValue::List(entries) | PropertyValue::Array(entries) => entries
-                    .into_iter()
-                    .map(|entry| match entry {
-                        PropertyValue::CalendarEntry(entry) => Ok(entry),
-                        // A bare date is the commonest thing an operator writes.
-                        PropertyValue::Date(year, month, day, weekday) => {
-                            Ok(CalendarEntryValue::Date(year, month, day, weekday))
-                        }
-                        _ => Err(ObjectError::InvalidPropertyType),
-                    })
-                    .collect::<Result<Vec<CalendarEntryValue>>>()
-                    .map(|entries| self.date_list = entries),
+                PropertyValue::List(entries) | PropertyValue::Array(entries) => {
+                    let entries = entries
+                        .into_iter()
+                        .map(|entry| match entry {
+                            PropertyValue::CalendarEntry(entry) => Ok(entry),
+                            // A bare date is the commonest thing an operator writes.
+                            PropertyValue::Date(year, month, day, weekday) => {
+                                Ok(CalendarEntryValue::Date(year, month, day, weekday))
+                            }
+                            _ => Err(ObjectError::InvalidPropertyType),
+                        })
+                        .collect::<Result<Vec<CalendarEntryValue>>>()?;
+                    within_capacity(entries.len(), self.date_list_capacity)?;
+                    self.date_list = entries;
+                    Ok(())
+                }
                 _ => Err(ObjectError::InvalidPropertyType),
             },
             _ => Err(ObjectError::PropertyNotWritable),
@@ -262,6 +269,18 @@ mod tests {
                 PropertyValue::Boolean(true)
             ),
             Err(ObjectError::PropertyNotWritable)
+        ));
+    }
+
+    #[test]
+    fn a_date_list_longer_than_the_device_holds_is_refused() {
+        let mut calendar = holidays();
+        let list = calendar.get_property(PropertyIdentifier::DateList).unwrap();
+        calendar.date_list_capacity = Some(1);
+
+        assert!(matches!(
+            calendar.set_property(PropertyIdentifier::DateList, list),
+            Err(ObjectError::NoSpaceToWriteProperty)
         ));
     }
 }

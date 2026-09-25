@@ -211,6 +211,7 @@ pub fn bacnet_error_code_name(code: u32) -> Option<&'static str> {
     Some(match code {
         0 => "other",
         9 => "invalid-data-type",
+        19 => "no-space-to-add-list-element",
         20 => "no-space-to-write-property",
         23 => "object-deletion-not-permitted",
         27 => "read-access-denied",

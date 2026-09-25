@@ -10,8 +10,8 @@
 
 use crate::object::{
     intrinsic::{EventTransition, EventTransitionBits},
-    BacnetObject, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue,
-    Result,
+    within_capacity, BacnetObject, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier,
+    PropertyValue, Result,
 };
 use crate::property::{DestinationValue, Recipient};
 
@@ -37,6 +37,8 @@ pub struct NotificationClass {
     pub ack_required: EventTransitionBits,
     /// Where notifications are sent.
     pub recipient_list: Vec<DestinationValue>,
+    /// How many recipients the device has room for. `None` is unlimited.
+    pub recipient_capacity: Option<usize>,
 }
 
 impl NotificationClass {
@@ -50,6 +52,7 @@ impl NotificationClass {
             priority: [DEFAULT_PRIORITY; 3],
             ack_required: EventTransitionBits::none(),
             recipient_list: Vec::new(),
+            recipient_capacity: None,
         }
     }
 
@@ -194,14 +197,18 @@ impl BacnetObject for NotificationClass {
                 _ => Err(ObjectError::InvalidPropertyType),
             },
             PropertyIdentifier::RecipientList => match value {
-                PropertyValue::List(entries) | PropertyValue::Array(entries) => entries
-                    .into_iter()
-                    .map(|entry| match entry {
-                        PropertyValue::Destination(destination) => Ok(destination),
-                        _ => Err(ObjectError::InvalidPropertyType),
-                    })
-                    .collect::<Result<Vec<DestinationValue>>>()
-                    .map(|recipients| self.recipient_list = recipients),
+                PropertyValue::List(entries) | PropertyValue::Array(entries) => {
+                    let recipients = entries
+                        .into_iter()
+                        .map(|entry| match entry {
+                            PropertyValue::Destination(destination) => Ok(destination),
+                            _ => Err(ObjectError::InvalidPropertyType),
+                        })
+                        .collect::<Result<Vec<DestinationValue>>>()?;
+                    within_capacity(recipients.len(), self.recipient_capacity)?;
+                    self.recipient_list = recipients;
+                    Ok(())
+                }
                 _ => Err(ObjectError::InvalidPropertyType),
             },
             _ => Err(ObjectError::PropertyNotWritable),
@@ -341,5 +348,21 @@ mod tests {
             0
         );
         assert_eq!(class.recipients_for(EventTransition::ToNormal).count(), 0);
+    }
+
+    #[test]
+    fn a_recipient_list_longer_than_the_device_holds_is_refused() {
+        let mut class = NotificationClass::new(1, "NC".to_string())
+            .with_recipient(gateway(), 1)
+            .with_recipient(gateway(), 2);
+        let list = class
+            .get_property(PropertyIdentifier::RecipientList)
+            .unwrap();
+        class.recipient_capacity = Some(1);
+
+        assert!(matches!(
+            class.set_property(PropertyIdentifier::RecipientList, list),
+            Err(ObjectError::NoSpaceToWriteProperty)
+        ));
     }
 }

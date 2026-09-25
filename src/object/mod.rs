@@ -170,6 +170,10 @@ pub enum ObjectError {
     InvalidValue(String),
     /// Write access denied
     WriteAccessDenied,
+    /// A list the device keeps is full, so nothing more can be added to it.
+    NoSpaceToAddListElement,
+    /// A written value is larger than the device has room to store.
+    NoSpaceToWriteProperty,
     /// Invalid object configuration
     InvalidConfiguration(String),
 }
@@ -191,6 +195,8 @@ impl fmt::Display for ObjectError {
             ObjectError::InvalidPropertyType => write!(f, "Invalid property type"),
             ObjectError::InvalidValue(msg) => write!(f, "Invalid value: {}", msg),
             ObjectError::WriteAccessDenied => write!(f, "Write access denied"),
+            ObjectError::NoSpaceToAddListElement => write!(f, "No space to add list element"),
+            ObjectError::NoSpaceToWriteProperty => write!(f, "No space to write property"),
             ObjectError::InvalidConfiguration(msg) => write!(f, "Invalid configuration: {}", msg),
         }
     }
@@ -335,6 +341,15 @@ pub trait BacnetObject: Send + Sync {
 /// Update one slot in a BACnet command priority array and return the resulting
 /// effective value. Priority 1 is the highest; the relinquish default is used
 /// when every slot is null.
+/// Refuse a written list longer than the device has room for, as a controller
+/// with fixed storage does. `None` is unlimited.
+pub(crate) fn within_capacity(length: usize, capacity: Option<usize>) -> Result<()> {
+    match capacity {
+        Some(capacity) if length > capacity => Err(ObjectError::NoSpaceToWriteProperty),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn write_priority_slot<T: Copy>(
     priority_array: &mut [Option<T>; 16],
     priority: u8,
@@ -1027,7 +1042,7 @@ pub use intrinsic::{
 pub use multistate::{MultiStateInput, MultiStateOutput, MultiStateValue};
 pub use notification_class::NotificationClass;
 pub use reliability::Reliability;
-pub use schedule::Schedule;
+pub use schedule::{Schedule, ScheduleCapacity};
 
 #[cfg(feature = "std")]
 pub use database::{DatabaseBuilder, DatabaseStatistics, ObjectDatabase};
