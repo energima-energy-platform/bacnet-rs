@@ -9,7 +9,7 @@ use crate::{
     },
 };
 
-use super::{object_service::object_error_codes, ObjectService, ServerError};
+use super::{object_service::object_error_codes, ObjectService, Outcome, ServerError};
 
 /// Answers what a server receives on behalf of one device.
 ///
@@ -125,6 +125,36 @@ impl ServerDispatcher {
                     .min(self.objects.max_apdu_length_accepted());
                 enforce_max_apdu(invoke_id, response, limit, segmented_response_accepted)
             }
+            // Replies to what this device sent, not requests of it.
+            Apdu::SimpleAck {
+                invoke_id,
+                service_choice,
+            } => {
+                self.answered(
+                    source,
+                    invoke_id,
+                    Some(service_choice),
+                    Outcome::Acknowledged,
+                );
+                return Ok(None);
+            }
+            Apdu::Error {
+                invoke_id,
+                service_choice,
+                ..
+            } => {
+                self.answered(
+                    source,
+                    invoke_id,
+                    Some(service_choice as u8),
+                    Outcome::Refused,
+                );
+                return Ok(None);
+            }
+            Apdu::Reject { invoke_id, .. } | Apdu::Abort { invoke_id, .. } => {
+                self.answered(source, invoke_id, None, Outcome::Refused);
+                return Ok(None);
+            }
             _ => return Ok(None),
         };
 
@@ -138,6 +168,20 @@ impl ServerDispatcher {
             npdu: response_npdu,
             apdu: response_apdu,
         }))
+    }
+
+    fn answered(
+        &self,
+        source: Option<std::net::SocketAddr>,
+        invoke_id: u8,
+        service: Option<u8>,
+        outcome: Outcome,
+    ) {
+        if let Some(source) = source {
+            self.objects
+                .transactions()
+                .answer(source, invoke_id, service, outcome);
+        }
     }
 
     fn dispatch_confirmed(

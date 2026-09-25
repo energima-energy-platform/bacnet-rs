@@ -1,6 +1,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket},
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
@@ -16,7 +17,7 @@ use crate::{
 
 use super::{
     DatagramSocket, Dispatch, NotificationTarget, ObjectService, ServerDispatcher, ServerError,
-    ServerResponse,
+    ServerResponse, Transaction, Transactions,
 };
 
 #[cfg(feature = "async")]
@@ -434,6 +435,7 @@ pub struct Notifier {
     broadcast_address: SocketAddr,
     source: Option<NetworkAddress>,
     invoke_id: std::sync::atomic::AtomicU8,
+    transactions: Option<Transactions>,
 }
 
 impl Notifier {
@@ -455,6 +457,7 @@ impl Notifier {
             broadcast_address: SocketAddr::from((Ipv4Addr::BROADCAST, port)),
             source: None,
             invoke_id: std::sync::atomic::AtomicU8::new(1),
+            transactions: None,
         })
     }
 
@@ -469,7 +472,34 @@ impl Notifier {
             broadcast_address: self.broadcast_address,
             source: Some(source),
             invoke_id: std::sync::atomic::AtomicU8::new(1),
+            transactions: None,
         }
+    }
+
+    /// Wait for the answer to what this sends confirmed, and send it again
+    /// when none comes: pass the device's
+    /// [`ObjectService::transactions`](super::ObjectService::transactions),
+    /// which its dispatcher records the answers in. Without it a confirmed
+    /// notification is sent once and never followed up.
+    pub fn with_transactions(mut self, transactions: Transactions) -> Self {
+        self.transactions = Some(transactions);
+        self
+    }
+
+    /// Send again what has waited APDU_Timeout without an answer, and report
+    /// what has become of every confirmed request since the last poll.
+    ///
+    /// Time is passed in, as the engines take it. Call it often; how often
+    /// bounds how late a retry can be.
+    pub fn poll(&self, now: Instant) -> Result<Vec<Transaction>, ServerError> {
+        let Some(transactions) = &self.transactions else {
+            return Ok(Vec::new());
+        };
+        let due = transactions.due(now);
+        for (frame, destination) in &due.resend {
+            self.socket.send_to(frame, *destination)?;
+        }
+        Ok(due.transactions)
     }
 
     /// Send broadcasts to `address` rather than 255.255.255.255.
@@ -501,9 +531,7 @@ impl Notifier {
     /// entirely, so the choice has to come from its Recipient_List entry rather
     /// than from a device-wide default.
     ///
-    /// The SimpleAck a confirmed notification earns is not awaited. The server
-    /// loop owns the receive side of this socket, so consuming the reply here
-    /// would race it; unacknowledged notifications are not retried yet.
+    /// A confirmed one is followed up as [`Self::with_transactions`] says.
     pub fn send_event_notification(
         &self,
         destination: NotificationTarget,
@@ -515,32 +543,12 @@ impl Notifier {
             .encode(&mut service_data)
             .map_err(ServerError::from)?;
 
-        let apdu = if confirmed {
-            Apdu::ConfirmedRequest {
-                segmented: false,
-                more_follows: false,
-                segmented_response_accepted: false,
-                max_segments: MaxSegments::Unspecified,
-                max_response_size: MaxApduSize::Up1476,
-                invoke_id: self.next_invoke_id(),
-                sequence_number: None,
-                proposed_window_size: None,
-                service_choice: ConfirmedServiceChoice::ConfirmedEventNotification,
-                service_data,
-            }
-        } else {
-            Apdu::UnconfirmedRequest {
-                service_choice: UnconfirmedServiceChoice::UnconfirmedEventNotification,
-                service_data,
-            }
-        };
-
-        let npdu = self.npdu(confirmed);
-
-        let (address, function) = self.route(destination);
-        let frame = wrap_bvlc_parts(function, &[&npdu, &apdu.encode()]);
-        self.socket.send_to(&frame, address)?;
-        Ok(())
+        self.send(
+            destination,
+            service_data,
+            confirmed.then_some(ConfirmedServiceChoice::ConfirmedEventNotification),
+            UnconfirmedServiceChoice::UnconfirmedEventNotification,
+        )
     }
 
     /// Send a COV notification to `destination`.
@@ -558,31 +566,52 @@ impl Notifier {
             .encode(&mut service_data)
             .map_err(ServerError::from)?;
 
-        let apdu = if confirmed {
-            Apdu::ConfirmedRequest {
+        self.send(
+            destination,
+            service_data,
+            confirmed.then_some(ConfirmedServiceChoice::ConfirmedCovNotification),
+            UnconfirmedServiceChoice::UnconfirmedCOVNotification,
+        )
+    }
+
+    /// Send one notification, confirmed as `confirmed` says or else
+    /// unconfirmed, and follow a confirmed one up if this notifier tracks them.
+    fn send(
+        &self,
+        destination: NotificationTarget,
+        service_data: Vec<u8>,
+        confirmed: Option<ConfirmedServiceChoice>,
+        unconfirmed: UnconfirmedServiceChoice,
+    ) -> Result<(), ServerError> {
+        let (address, function) = self.route(destination);
+        let invoke_id = confirmed.map(|_| self.next_invoke_id(address));
+        let apdu = match (confirmed, invoke_id) {
+            (Some(service_choice), Some(invoke_id)) => Apdu::ConfirmedRequest {
                 segmented: false,
                 more_follows: false,
                 segmented_response_accepted: false,
                 max_segments: MaxSegments::Unspecified,
                 max_response_size: MaxApduSize::Up1476,
-                invoke_id: self.next_invoke_id(),
+                invoke_id,
                 sequence_number: None,
                 proposed_window_size: None,
-                service_choice: ConfirmedServiceChoice::ConfirmedCovNotification,
+                service_choice,
                 service_data,
-            }
-        } else {
-            Apdu::UnconfirmedRequest {
-                service_choice: UnconfirmedServiceChoice::UnconfirmedCOVNotification,
+            },
+            _ => Apdu::UnconfirmedRequest {
+                service_choice: unconfirmed,
                 service_data,
-            }
+            },
         };
 
-        let npdu = self.npdu(confirmed);
-
-        let (address, function) = self.route(destination);
+        let npdu = self.npdu(confirmed.is_some());
         let frame = wrap_bvlc_parts(function, &[&npdu, &apdu.encode()]);
         self.socket.send_to(&frame, address)?;
+        if let (Some(transactions), Some(service), Some(invoke_id)) =
+            (&self.transactions, confirmed, invoke_id)
+        {
+            transactions.register(address, invoke_id, service, frame, Instant::now());
+        }
         Ok(())
     }
 
@@ -596,11 +625,25 @@ impl Notifier {
         npdu.encode()
     }
 
-    /// Invoke ids cycle 0-255; confirmed notifications are not tracked, so this
-    /// only needs to avoid reusing an id for two requests in flight at once.
-    fn next_invoke_id(&self) -> u8 {
-        self.invoke_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// The next invoke id not already waiting on an answer from `destination`.
+    /// Ids cycle 0-255; with all 256 in flight the next is reused anyway.
+    fn next_invoke_id(&self, destination: SocketAddr) -> u8 {
+        let next = || {
+            self.invoke_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let Some(transactions) = &self.transactions else {
+            return next();
+        };
+        let first = next();
+        let mut id = first;
+        for _ in 0..u8::MAX {
+            if !transactions.in_flight(destination, id) {
+                return id;
+            }
+            id = next();
+        }
+        first
     }
 }
 

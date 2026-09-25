@@ -15,6 +15,7 @@ mod error;
 mod object_service;
 mod router;
 mod socket;
+mod transactions;
 
 pub use address_cache::{AddressCache, NotificationTarget};
 #[cfg(feature = "async")]
@@ -25,3 +26,4 @@ pub use error::ServerError;
 pub use object_service::ObjectService;
 pub use router::{RouterDevices, VirtualRouter};
 pub use socket::DatagramSocket;
+pub use transactions::{Outcome, Transaction, Transactions};
