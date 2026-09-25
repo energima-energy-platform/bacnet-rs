@@ -14,6 +14,21 @@ use std::{
 #[cfg(feature = "std")]
 const FIRST_PROPRIETARY: u32 = 512;
 
+/// What the device's clock reads, for Local_Date, Local_Time, UTC_Offset and
+/// Daylight_Savings_Status. The application owns the clock and sets this as it
+/// runs; the stack only reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceClock {
+    /// (year, month, day, weekday), weekday 1 for Monday.
+    pub local_date: (u16, u8, u8, u8),
+    /// (hour, minute, second, hundredths).
+    pub local_time: (u8, u8, u8, u8),
+    /// Minutes from local standard time to UTC: positive west of Greenwich,
+    /// so Oslo is -60.
+    pub utc_offset: i16,
+    pub daylight_savings: bool,
+}
+
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, collections::BTreeMap as HashMap, string::String, sync::Arc, vec::Vec};
 
@@ -52,6 +67,8 @@ pub struct ObjectDatabase {
     device_id: ObjectIdentifier,
     /// Vendor-defined properties, beyond what each object's type defines.
     proprietary: Arc<RwLock<HashMap<ObjectIdentifier, BTreeMap<u32, PropertyValue>>>>,
+    /// The device's clock, once the application has set it.
+    clock: Arc<RwLock<Option<DeviceClock>>>,
 }
 
 #[cfg(feature = "std")]
@@ -84,7 +101,13 @@ impl ObjectDatabase {
             last_modified: Arc::new(RwLock::new(Instant::now())),
             device_id,
             proprietary: Arc::default(),
+            clock: Arc::default(),
         }
+    }
+
+    /// Set what the device's clock reads.
+    pub fn set_clock(&self, clock: DeviceClock) {
+        *self.clock.write().unwrap() = Some(clock);
     }
 
     /// Add an object to the database
@@ -186,6 +209,25 @@ impl ObjectDatabase {
             return Ok(value);
         }
         if identifier == self.device_id {
+            if let Some(clock) = *self.clock.read().unwrap() {
+                let (year, month, day, weekday) = clock.local_date;
+                let (hour, minute, second, hundredths) = clock.local_time;
+                match property {
+                    PropertyIdentifier::LocalDate => {
+                        return Ok(PropertyValue::Date(year, month, day, weekday))
+                    }
+                    PropertyIdentifier::LocalTime => {
+                        return Ok(PropertyValue::Time(hour, minute, second, hundredths))
+                    }
+                    PropertyIdentifier::UtcOffset => {
+                        return Ok(PropertyValue::Signed(clock.utc_offset.into()))
+                    }
+                    PropertyIdentifier::DaylightSavingsStatus => {
+                        return Ok(PropertyValue::Boolean(clock.daylight_savings))
+                    }
+                    _ => {}
+                }
+            }
             match property {
                 PropertyIdentifier::DatabaseRevision => {
                     return Ok(PropertyValue::Unsigned(self.revision().into()));
@@ -257,6 +299,14 @@ impl ObjectDatabase {
         let entry = objects.get(&identifier).ok_or(ObjectError::NotFound)?;
         let object = entry.read().unwrap();
         let mut properties = object.property_list();
+        if identifier == self.device_id && self.clock.read().unwrap().is_some() {
+            properties.extend([
+                PropertyIdentifier::LocalDate,
+                PropertyIdentifier::LocalTime,
+                PropertyIdentifier::UtcOffset,
+                PropertyIdentifier::DaylightSavingsStatus,
+            ]);
+        }
         if let Some(proprietary) = self.proprietary.read().unwrap().get(&identifier) {
             properties.extend(proprietary.keys().map(|&id| PropertyIdentifier::from(id)));
         }
@@ -613,6 +663,39 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn the_device_reports_its_clock_once_it_has_one() {
+        let database = ObjectDatabase::new(Device::new(1, "Clock".to_string()));
+        let device = database.get_device_id();
+        assert!(database
+            .get_property(device, PropertyIdentifier::LocalTime)
+            .is_err());
+
+        database.set_clock(DeviceClock {
+            local_date: (2026, 9, 25, 5),
+            local_time: (8, 30, 0, 0),
+            utc_offset: -60,
+            daylight_savings: true,
+        });
+
+        assert_eq!(
+            database
+                .get_property(device, PropertyIdentifier::LocalTime)
+                .unwrap(),
+            PropertyValue::Time(8, 30, 0, 0)
+        );
+        assert_eq!(
+            database
+                .get_property(device, PropertyIdentifier::UtcOffset)
+                .unwrap(),
+            PropertyValue::Signed(-60)
+        );
+        assert!(database
+            .property_list(device)
+            .unwrap()
+            .contains(&PropertyIdentifier::DaylightSavingsStatus));
+    }
     use crate::object::{
         analog::{AnalogInput, AnalogValue},
         binary::BinaryInput,
