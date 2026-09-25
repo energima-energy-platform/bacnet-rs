@@ -11,9 +11,11 @@ use crate::object::{
         intrinsic_get, intrinsic_property_list, intrinsic_set, status_flags_bits, AlarmEvaluation,
         AlarmTrigger, IntrinsicReporting,
     },
+    override_permits_write,
     reliability::Reliability,
-    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, ObjectError,
-    ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue, Result,
+    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, LocalOverride,
+    ObjectError, ObjectIdentifier, ObjectType, OptionalProperties, PropertyIdentifier,
+    PropertyValue, Result,
 };
 
 #[cfg(not(feature = "std"))]
@@ -260,6 +262,7 @@ struct AnalogView<'a> {
     deadband: f32,
     cov_increment: Option<f32>,
     alarm: Option<&'a IntrinsicReporting>,
+    optional: OptionalProperties,
 }
 
 /// Read a property common to every analog object type.
@@ -278,6 +281,7 @@ fn shared_get(view: AnalogView<'_>, property: PropertyIdentifier) -> Option<Resu
             reliability: view.reliability,
             out_of_service: view.out_of_service,
             overridden: view.overridden,
+            optional: view.optional,
         },
         property,
     ) {
@@ -323,6 +327,7 @@ struct AnalogWritable<'a> {
     low_limit: &'a mut Option<f32>,
     deadband: &'a mut f32,
     alarm: Option<&'a mut IntrinsicReporting>,
+    optional: OptionalProperties,
 }
 
 /// Write a property common to every analog object type. `None` means the
@@ -341,6 +346,7 @@ fn shared_set(
         low_limit,
         deadband,
         alarm,
+        optional,
     } = fields;
 
     let value = match common_set(
@@ -349,6 +355,7 @@ fn shared_set(
             description,
             reliability,
             out_of_service,
+            optional,
         },
         property,
         value,
@@ -361,14 +368,33 @@ fn shared_set(
 }
 
 /// Whether a property shared by every analog object type accepts writes.
-fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool {
-    matches!(
-        property,
-        PropertyIdentifier::ObjectName
-            | PropertyIdentifier::Description
-            | PropertyIdentifier::OutOfService
-            | PropertyIdentifier::Reliability
-    ) || analog_alarm_writable(property, alarm_configured)
+fn shared_writable(
+    property: PropertyIdentifier,
+    alarm_configured: bool,
+    optional: OptionalProperties,
+) -> bool {
+    optional.has(property)
+        && matches!(
+            property,
+            PropertyIdentifier::ObjectName
+                | PropertyIdentifier::Description
+                | PropertyIdentifier::OutOfService
+                | PropertyIdentifier::Reliability
+        )
+        || analog_alarm_writable(property, alarm_configured)
+}
+
+/// Commandable, or written straight through: an Analog Value may be either,
+/// and only a commandable one has Priority_Array and Relinquish_Default.
+fn commandable_trailing(commandable: bool) -> &'static [PropertyIdentifier] {
+    if commandable {
+        &[
+            PropertyIdentifier::PriorityArray,
+            PropertyIdentifier::RelinquishDefault,
+        ]
+    } else {
+        &[]
+    }
 }
 
 /// Properties every analog object exposes, in the order they are reported.
@@ -380,11 +406,16 @@ fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool
 fn shared_property_list(
     device_type: bool,
     trailing: &[PropertyIdentifier],
-    cov_increment: Option<f32>,
-    high_limit: Option<f32>,
-    low_limit: Option<f32>,
-    alarm: Option<&IntrinsicReporting>,
+    view: &AnalogView<'_>,
 ) -> Vec<PropertyIdentifier> {
+    let AnalogView {
+        cov_increment,
+        high_limit,
+        low_limit,
+        alarm,
+        optional,
+        ..
+    } = *view;
     let mut properties = vec![
         PropertyIdentifier::ObjectIdentifier,
         PropertyIdentifier::ObjectName,
@@ -407,6 +438,7 @@ fn shared_property_list(
         properties.push(PropertyIdentifier::CovIncrement);
     }
     properties.extend(analog_alarm_property_list(high_limit, low_limit, alarm));
+    optional.retain(&mut properties);
     properties
 }
 
@@ -435,8 +467,8 @@ macro_rules! analog_views {
                 object_type: $object_type,
                 object_name: &self.object_name,
                 description: &self.description,
-                present_value: self.present_value,
-                overridden: self.overridden,
+                present_value: self.effective_present_value(),
+                overridden: self.overridden || self.local_override.is_some(),
                 event_state: self.event_state,
                 reliability: self.reliability,
                 out_of_service: self.out_of_service,
@@ -446,7 +478,14 @@ macro_rules! analog_views {
                 deadband: self.deadband,
                 cov_increment: self.cov_increment,
                 alarm: self.alarm.as_ref(),
+                optional: self.optional,
             }
+        }
+
+        /// What Present_Value reads: the local override while there is one.
+        pub fn effective_present_value(&self) -> f32 {
+            self.local_override
+                .map_or(self.present_value, |local| local.value)
         }
 
         fn writable(&mut self) -> AnalogWritable<'_> {
@@ -459,6 +498,7 @@ macro_rules! analog_views {
                 low_limit: &mut self.low_limit,
                 deadband: &mut self.deadband,
                 alarm: self.alarm.as_mut(),
+                optional: self.optional,
             }
         }
     };
@@ -476,7 +516,7 @@ macro_rules! analog_intrinsic_methods {
 
         fn evaluate_alarm(&self) -> Option<AlarmEvaluation> {
             evaluate_analog(
-                self.present_value,
+                self.effective_present_value(),
                 self.high_limit,
                 self.low_limit,
                 self.deadband,
@@ -536,6 +576,10 @@ pub struct AnalogInput {
     pub deadband: f32,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<f32>>,
 }
 
 /// Analog Output object
@@ -582,6 +626,10 @@ pub struct AnalogOutput {
     pub deadband: f32,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<f32>>,
 }
 
 /// Analog Value object
@@ -606,6 +654,9 @@ pub struct AnalogValue {
     pub out_of_service: bool,
     /// Units
     pub units: EngineeringUnits,
+    /// Whether Present_Value is commanded through a priority array, or
+    /// written straight through.
+    pub commandable: bool,
     /// Priority array (16 levels)
     pub priority_array: [Option<f32>; 16],
     /// Relinquish default
@@ -620,6 +671,10 @@ pub struct AnalogValue {
     pub deadband: f32,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<f32>>,
 }
 
 // EngineeringUnits enum moved to src/object/engineering_units.rs for complete implementation
@@ -646,6 +701,8 @@ impl AnalogInput {
             low_limit: None,
             deadband: 0.0,
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -717,6 +774,8 @@ impl AnalogOutput {
             low_limit: None,
             deadband: 0.0,
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -773,6 +832,7 @@ impl AnalogValue {
             reliability: Reliability::NoFaultDetected,
             out_of_service: false,
             units: EngineeringUnits::NoUnits,
+            commandable: true,
             priority_array: [None; 16],
             relinquish_default: 0.0,
             cov_increment: None,
@@ -780,6 +840,8 @@ impl AnalogValue {
             low_limit: None,
             deadband: 0.0,
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -837,18 +899,11 @@ impl BacnetObject for AnalogInput {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(property, self.alarm.is_some())
+        shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        shared_property_list(
-            true,
-            &[],
-            self.cov_increment,
-            self.high_limit,
-            self.low_limit,
-            self.alarm.as_ref(),
-        )
+        shared_property_list(true, &[], &self.view())
     }
 
     /// An input reflects a sensor, so its Present_Value has no priority array
@@ -902,27 +957,18 @@ impl BacnetObject for AnalogOutput {
         if property != PropertyIdentifier::PresentValue {
             return self.set_property(property, value);
         }
+        override_permits_write(&self.local_override)?;
 
         self.write_priority(priority.unwrap_or(16), commandable_real(value)?)
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
         property == PropertyIdentifier::PresentValue
-            || shared_writable(property, self.alarm.is_some())
+            || shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        shared_property_list(
-            true,
-            &[
-                PropertyIdentifier::PriorityArray,
-                PropertyIdentifier::RelinquishDefault,
-            ],
-            self.cov_increment,
-            self.high_limit,
-            self.low_limit,
-            self.alarm.as_ref(),
-        )
+        shared_property_list(true, commandable_trailing(true), &self.view())
     }
 
     analog_intrinsic_methods!();
@@ -935,8 +981,10 @@ impl BacnetObject for AnalogValue {
 
     fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
         match property {
-            PropertyIdentifier::PriorityArray => Ok(priority_array_value(&self.priority_array)),
-            PropertyIdentifier::RelinquishDefault => {
+            PropertyIdentifier::PriorityArray if self.commandable => {
+                Ok(priority_array_value(&self.priority_array))
+            }
+            PropertyIdentifier::RelinquishDefault if self.commandable => {
                 Ok(PropertyValue::Real(self.relinquish_default))
             }
             _ => shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty)),
@@ -961,27 +1009,25 @@ impl BacnetObject for AnalogValue {
         if property != PropertyIdentifier::PresentValue {
             return self.set_property(property, value);
         }
+        override_permits_write(&self.local_override)?;
 
+        // Not commandable: the value is simply written, and a priority has
+        // nothing to act on. Nor is there anything to relinquish to.
+        if !self.commandable {
+            let value = commandable_real(value)?.ok_or(ObjectError::InvalidPropertyType)?;
+            self.present_value = value;
+            return Ok(());
+        }
         self.write_priority(priority.unwrap_or(16), commandable_real(value)?)
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
         property == PropertyIdentifier::PresentValue
-            || shared_writable(property, self.alarm.is_some())
+            || shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        shared_property_list(
-            false,
-            &[
-                PropertyIdentifier::PriorityArray,
-                PropertyIdentifier::RelinquishDefault,
-            ],
-            self.cov_increment,
-            self.high_limit,
-            self.low_limit,
-            self.alarm.as_ref(),
-        )
+        shared_property_list(false, commandable_trailing(self.commandable), &self.view())
     }
 
     analog_intrinsic_methods!();
@@ -1200,6 +1246,107 @@ mod tests {
         assert!(matches!(
             value.set_sourced_value(PropertyValue::Real(5.0)),
             Err(ObjectError::OptionalFunctionalityNotSupported)
+        ));
+    }
+
+    fn status_flags(object: &impl BacnetObject) -> Vec<bool> {
+        match object
+            .get_property(PropertyIdentifier::StatusFlags)
+            .unwrap()
+        {
+            PropertyValue::BitString(bits) => bits,
+            other => panic!("expected a bit string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_value_that_is_not_commandable_is_written_straight_through() {
+        let mut value = AnalogValue::new(1, "Setpoint".to_string());
+        value.commandable = false;
+
+        assert!(matches!(
+            value.get_property(PropertyIdentifier::PriorityArray),
+            Err(ObjectError::UnknownProperty)
+        ));
+        assert!(!value
+            .property_list()
+            .contains(&PropertyIdentifier::RelinquishDefault));
+
+        value
+            .set_property_with_priority(
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Real(22.0),
+                Some(8),
+            )
+            .unwrap();
+        assert_eq!(value.present_value, 22.0);
+        assert!(value
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Null)
+            .is_err());
+    }
+
+    #[test]
+    fn an_absent_reliability_is_an_unknown_property() {
+        let mut input = AnalogInput::new(1, "Outdoor".to_string());
+        input.optional.reliability = false;
+
+        assert!(matches!(
+            input.get_property(PropertyIdentifier::Reliability),
+            Err(ObjectError::UnknownProperty)
+        ));
+        assert!(!input
+            .property_list()
+            .contains(&PropertyIdentifier::Reliability));
+        assert!(input
+            .property_list()
+            .contains(&PropertyIdentifier::Description));
+    }
+
+    #[test]
+    fn a_local_override_holds_the_value_until_it_is_released() {
+        let mut value = AnalogValue::new(1, "Setpoint".to_string());
+        value.local_override = Some(LocalOverride {
+            value: 19.0,
+            writes: crate::object::OverrideWrites::Accepted,
+        });
+
+        value
+            .set_property_with_priority(
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Real(22.0),
+                Some(8),
+            )
+            .unwrap();
+        assert_eq!(
+            value
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            PropertyValue::Real(19.0),
+            "the write waits behind the override"
+        );
+        assert!(status_flags(&value)[2], "OVERRIDDEN");
+
+        value.local_override = None;
+        assert_eq!(
+            value
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            PropertyValue::Real(22.0)
+        );
+        assert!(!status_flags(&value)[2]);
+    }
+
+    #[test]
+    fn a_local_override_can_refuse_writes_outright() {
+        let mut output = AnalogOutput::new(1, "Valve".to_string());
+        output.local_override = Some(LocalOverride {
+            value: 100.0,
+            writes: crate::object::OverrideWrites::Denied,
+        });
+
+        assert!(matches!(
+            output.set_property(PropertyIdentifier::PresentValue, PropertyValue::Real(0.0)),
+            Err(ObjectError::WriteAccessDenied)
         ));
     }
 }

@@ -380,6 +380,74 @@ pub(crate) fn effective_priority<T>(priority_array: &[Option<T>; 16]) -> Option<
         .map(|index| index as u8 + 1)
 }
 
+/// The optional properties an object can do without. All are present unless
+/// switched off, and one that is absent answers UNKNOWN_PROPERTY and is left
+/// out of Property_List, as on a device that never implemented it.
+///
+/// An absent Reliability still has a value inside the object, left at
+/// NO_FAULT_DETECTED: the standard reads Status_Flags FAULT from Reliability
+/// only where the property exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionalProperties {
+    pub description: bool,
+    pub reliability: bool,
+}
+
+impl Default for OptionalProperties {
+    fn default() -> Self {
+        Self {
+            description: true,
+            reliability: true,
+        }
+    }
+}
+
+impl OptionalProperties {
+    pub(crate) fn has(&self, property: PropertyIdentifier) -> bool {
+        match property {
+            PropertyIdentifier::Description => self.description,
+            PropertyIdentifier::Reliability => self.reliability,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn retain(&self, properties: &mut Vec<PropertyIdentifier>) {
+        properties.retain(|property| self.has(*property));
+    }
+}
+
+/// Present_Value held by a mechanism local to the device, such as a hand
+/// switch or an operator panel, rather than by what BACnet commands or a
+/// sensor reads.
+///
+/// Status_Flags reads OVERRIDDEN while it lasts. The standard leaves what a
+/// BACnet write does meanwhile to the device, hence [`OverrideWrites`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalOverride<T> {
+    pub value: T,
+    pub writes: OverrideWrites,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OverrideWrites {
+    /// Taken into the priority array, to take effect once the override ends.
+    #[default]
+    Accepted,
+    /// Refused with WRITE_ACCESS_DENIED.
+    Denied,
+}
+
+/// Refuse a BACnet write to Present_Value if a local override says so.
+pub(crate) fn override_permits_write<T>(local: &Option<LocalOverride<T>>) -> Result<()> {
+    match local {
+        Some(LocalOverride {
+            writes: OverrideWrites::Denied,
+            ..
+        }) => Err(ObjectError::WriteAccessDenied),
+        _ => Ok(()),
+    }
+}
+
 /// The identity and status properties every object type with intrinsic state
 /// exposes, borrowed from whichever object is answering.
 ///
@@ -395,6 +463,7 @@ pub(crate) struct CommonView<'a> {
     pub reliability: crate::object::reliability::Reliability,
     pub out_of_service: bool,
     pub overridden: bool,
+    pub optional: OptionalProperties,
 }
 
 /// Read one of the properties common to every stateful object type.
@@ -405,6 +474,9 @@ pub(crate) fn common_get(
     view: &CommonView<'_>,
     property: PropertyIdentifier,
 ) -> Option<Result<PropertyValue>> {
+    if !view.optional.has(property) {
+        return Some(Err(ObjectError::UnknownProperty));
+    }
     let value = match property {
         PropertyIdentifier::ObjectIdentifier => PropertyValue::ObjectIdentifier(view.identifier),
         PropertyIdentifier::ObjectName => {
@@ -439,6 +511,7 @@ pub(crate) struct CommonWritable<'a> {
     pub description: &'a mut String,
     pub reliability: &'a mut crate::object::reliability::Reliability,
     pub out_of_service: &'a mut bool,
+    pub optional: OptionalProperties,
 }
 
 /// What [`common_set`] did with a property write.
@@ -461,7 +534,11 @@ pub(crate) fn common_set(
         description,
         reliability,
         out_of_service,
+        optional,
     } = fields;
+    if !optional.has(property) {
+        return CommonWrite::Handled(Err(ObjectError::UnknownProperty));
+    }
 
     let result = match property {
         PropertyIdentifier::ObjectName => match value {
@@ -558,6 +635,8 @@ pub struct Device {
     pub device_address_binding: Vec<AddressBinding>,
     /// Database revision
     pub database_revision: u32,
+    /// Description, which a device need not have at all.
+    pub description: Option<String>,
 }
 
 impl Device {
@@ -583,6 +662,7 @@ impl Device {
             number_of_apdu_retries: 3,
             device_address_binding: Vec::new(),
             database_revision: 1,
+            description: None,
         }
     }
 
@@ -655,6 +735,11 @@ impl BacnetObject for Device {
             PropertyIdentifier::SystemStatus => {
                 Ok(PropertyValue::Enumerated(self.system_status as u32))
             }
+            PropertyIdentifier::Description => self
+                .description
+                .clone()
+                .map(PropertyValue::CharacterString)
+                .ok_or(ObjectError::UnknownProperty),
             PropertyIdentifier::VendorName => {
                 Ok(PropertyValue::CharacterString(self.vendor_name.clone()))
             }
@@ -763,10 +848,18 @@ impl BacnetObject for Device {
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        vec![
+        let description = self
+            .description
+            .as_ref()
+            .map(|_| PropertyIdentifier::Description);
+        [
             PropertyIdentifier::ObjectIdentifier,
             PropertyIdentifier::ObjectName,
             PropertyIdentifier::ObjectType,
+        ]
+        .into_iter()
+        .chain(description)
+        .chain([
             PropertyIdentifier::SystemStatus,
             PropertyIdentifier::VendorName,
             PropertyIdentifier::VendorIdentifier,
@@ -783,7 +876,8 @@ impl BacnetObject for Device {
             PropertyIdentifier::NumberOfApduRetries,
             PropertyIdentifier::DeviceAddressBinding,
             PropertyIdentifier::DatabaseRevision,
-        ]
+        ])
+        .collect()
     }
 }
 

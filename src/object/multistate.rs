@@ -10,9 +10,11 @@ use crate::object::{
         intrinsic_get, intrinsic_property_list, intrinsic_set, AlarmEvaluation, AlarmTrigger,
         IntrinsicReporting,
     },
+    override_permits_write,
     reliability::Reliability,
-    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, ObjectError,
-    ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue, Result,
+    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, LocalOverride,
+    ObjectError, ObjectIdentifier, ObjectType, OptionalProperties, PropertyIdentifier,
+    PropertyValue, Result,
 };
 
 #[cfg(not(feature = "std"))]
@@ -44,6 +46,7 @@ struct MultistateView<'a> {
     state_text: &'a [String],
     alarm_values: &'a [u32],
     alarm: Option<&'a IntrinsicReporting>,
+    optional: OptionalProperties,
 }
 
 /// Read a property common to every multi-state object type.
@@ -64,6 +67,7 @@ fn shared_get(
             reliability: view.reliability,
             out_of_service: view.out_of_service,
             overridden: view.overridden,
+            optional: view.optional,
         },
         property,
     ) {
@@ -101,6 +105,7 @@ struct MultistateWritable<'a> {
     reliability: &'a mut Reliability,
     alarm_values: &'a mut Vec<u32>,
     alarm: Option<&'a mut IntrinsicReporting>,
+    optional: OptionalProperties,
 }
 
 /// Write a property common to every multi-state object type. `None` means the
@@ -117,6 +122,7 @@ fn shared_set(
         reliability,
         alarm_values,
         alarm,
+        optional,
     } = fields;
 
     let value = match common_set(
@@ -125,6 +131,7 @@ fn shared_set(
             description,
             reliability,
             out_of_service,
+            optional,
         },
         property,
         value,
@@ -155,7 +162,10 @@ fn shared_set(
 
 /// Properties every multi-state object exposes, plus the alarm properties when
 /// intrinsic reporting is configured.
-fn shared_property_list(alarm: Option<&IntrinsicReporting>) -> Vec<PropertyIdentifier> {
+fn shared_property_list(
+    alarm: Option<&IntrinsicReporting>,
+    optional: OptionalProperties,
+) -> Vec<PropertyIdentifier> {
     let mut properties = vec![
         PropertyIdentifier::ObjectIdentifier,
         PropertyIdentifier::ObjectName,
@@ -175,11 +185,19 @@ fn shared_property_list(alarm: Option<&IntrinsicReporting>) -> Vec<PropertyIdent
         properties.extend(intrinsic_property_list());
     }
 
+    optional.retain(&mut properties);
     properties
 }
 
 /// Whether a shared property accepts writes.
-fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool {
+fn shared_writable(
+    property: PropertyIdentifier,
+    alarm_configured: bool,
+    optional: OptionalProperties,
+) -> bool {
+    if !optional.has(property) {
+        return false;
+    }
     match property {
         PropertyIdentifier::ObjectName
         | PropertyIdentifier::Description
@@ -246,7 +264,7 @@ macro_rules! multistate_intrinsic_methods {
 
         fn evaluate_alarm(&self) -> Option<AlarmEvaluation> {
             evaluate_multistate(
-                self.present_value,
+                self.effective_present_value(),
                 &self.alarm_values,
                 self.reliability,
                 self.alarm.as_ref(),
@@ -293,6 +311,10 @@ pub struct MultiStateInput {
     pub alarm_values: Vec<u32>,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<u32>>,
 }
 
 /// Multi-state Output object
@@ -329,6 +351,10 @@ pub struct MultiStateOutput {
     pub alarm_values: Vec<u32>,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<u32>>,
 }
 
 /// Multi-state Value object
@@ -355,6 +381,9 @@ pub struct MultiStateValue {
     pub number_of_states: u32,
     /// State text array
     pub state_text: Vec<String>,
+    /// Whether Present_Value is commanded through a priority array, or
+    /// written straight through.
+    pub commandable: bool,
     /// Priority array (16 levels)
     pub priority_array: [Option<u32>; 16],
     /// Relinquish default
@@ -363,6 +392,10 @@ pub struct MultiStateValue {
     pub alarm_values: Vec<u32>,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<u32>>,
 }
 
 impl MultiStateInput {
@@ -387,6 +420,8 @@ impl MultiStateInput {
             state_text,
             alarm_values: Vec::new(),
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -440,8 +475,8 @@ impl MultiStateInput {
             object_type: ObjectType::MultiStateInput,
             object_name: &self.object_name,
             description: &self.description,
-            present_value: self.present_value,
-            overridden: self.overridden,
+            present_value: self.effective_present_value(),
+            overridden: self.overridden || self.local_override.is_some(),
             event_state: self.event_state,
             reliability: self.reliability,
             out_of_service: self.out_of_service,
@@ -449,7 +484,14 @@ impl MultiStateInput {
             state_text: &self.state_text,
             alarm_values: &self.alarm_values,
             alarm: self.alarm.as_ref(),
+            optional: self.optional,
         }
+    }
+
+    /// What Present_Value reads: the local override while there is one.
+    pub fn effective_present_value(&self) -> u32 {
+        self.local_override
+            .map_or(self.present_value, |local| local.value)
     }
 }
 
@@ -477,6 +519,8 @@ impl MultiStateOutput {
             relinquish_default: 1,
             alarm_values: Vec::new(),
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -522,8 +566,8 @@ impl MultiStateOutput {
             object_type: ObjectType::MultiStateOutput,
             object_name: &self.object_name,
             description: &self.description,
-            present_value: self.present_value,
-            overridden: self.overridden,
+            present_value: self.effective_present_value(),
+            overridden: self.overridden || self.local_override.is_some(),
             event_state: self.event_state,
             reliability: self.reliability,
             out_of_service: self.out_of_service,
@@ -531,7 +575,14 @@ impl MultiStateOutput {
             state_text: &self.state_text,
             alarm_values: &self.alarm_values,
             alarm: self.alarm.as_ref(),
+            optional: self.optional,
         }
+    }
+
+    /// What Present_Value reads: the local override while there is one.
+    pub fn effective_present_value(&self) -> u32 {
+        self.local_override
+            .map_or(self.present_value, |local| local.value)
     }
 }
 
@@ -554,10 +605,13 @@ impl MultiStateValue {
             out_of_service: false,
             number_of_states,
             state_text,
+            commandable: true,
             priority_array: [None; 16],
             relinquish_default: 1,
             alarm_values: Vec::new(),
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -598,8 +652,8 @@ impl MultiStateValue {
             object_type: ObjectType::MultiStateValue,
             object_name: &self.object_name,
             description: &self.description,
-            present_value: self.present_value,
-            overridden: self.overridden,
+            present_value: self.effective_present_value(),
+            overridden: self.overridden || self.local_override.is_some(),
             event_state: self.event_state,
             reliability: self.reliability,
             out_of_service: self.out_of_service,
@@ -607,7 +661,14 @@ impl MultiStateValue {
             state_text: &self.state_text,
             alarm_values: &self.alarm_values,
             alarm: self.alarm.as_ref(),
+            optional: self.optional,
         }
+    }
+
+    /// What Present_Value reads: the local override while there is one.
+    pub fn effective_present_value(&self) -> u32 {
+        self.local_override
+            .map_or(self.present_value, |local| local.value)
     }
 }
 
@@ -633,6 +694,7 @@ impl BacnetObject for MultiStateInput {
                 reliability: &mut self.reliability,
                 alarm_values: &mut self.alarm_values,
                 alarm: self.alarm.as_mut(),
+                optional: self.optional,
             },
             property,
             value,
@@ -641,11 +703,11 @@ impl BacnetObject for MultiStateInput {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(property, self.alarm.is_some())
+        shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = shared_property_list(self.alarm.as_ref());
+        let mut properties = shared_property_list(self.alarm.as_ref(), self.optional);
         properties.push(PropertyIdentifier::DeviceType);
         properties
     }
@@ -709,6 +771,7 @@ impl BacnetObject for MultiStateOutput {
                 reliability: &mut self.reliability,
                 alarm_values: &mut self.alarm_values,
                 alarm: self.alarm.as_mut(),
+                optional: self.optional,
             },
             property,
             value,
@@ -725,17 +788,18 @@ impl BacnetObject for MultiStateOutput {
         if property != PropertyIdentifier::PresentValue {
             return self.set_property(property, value);
         }
+        override_permits_write(&self.local_override)?;
 
         self.write_priority(priority.unwrap_or(16), commandable_unsigned(value)?)
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
         property == PropertyIdentifier::PresentValue
-            || shared_writable(property, self.alarm.is_some())
+            || shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = shared_property_list(self.alarm.as_ref());
+        let mut properties = shared_property_list(self.alarm.as_ref(), self.optional);
         properties.extend([
             PropertyIdentifier::DeviceType,
             PropertyIdentifier::PriorityArray,
@@ -754,7 +818,7 @@ impl BacnetObject for MultiStateValue {
 
     fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
         match property {
-            PropertyIdentifier::PriorityArray => Ok(PropertyValue::Array(
+            PropertyIdentifier::PriorityArray if self.commandable => Ok(PropertyValue::Array(
                 self.priority_array
                     .iter()
                     .map(|&slot| match slot {
@@ -763,7 +827,7 @@ impl BacnetObject for MultiStateValue {
                     })
                     .collect(),
             )),
-            PropertyIdentifier::RelinquishDefault => {
+            PropertyIdentifier::RelinquishDefault if self.commandable => {
                 Ok(PropertyValue::Unsigned(self.relinquish_default.into()))
             }
             _ => shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty)),
@@ -783,6 +847,7 @@ impl BacnetObject for MultiStateValue {
                 reliability: &mut self.reliability,
                 alarm_values: &mut self.alarm_values,
                 alarm: self.alarm.as_mut(),
+                optional: self.optional,
             },
             property,
             value,
@@ -799,21 +864,37 @@ impl BacnetObject for MultiStateValue {
         if property != PropertyIdentifier::PresentValue {
             return self.set_property(property, value);
         }
+        override_permits_write(&self.local_override)?;
 
+        // Not commandable: the value is simply written, and a priority has
+        // nothing to act on. Nor is there anything to relinquish to.
+        if !self.commandable {
+            let state = commandable_unsigned(value)?.ok_or(ObjectError::InvalidPropertyType)?;
+            if !(1..=self.number_of_states).contains(&state) {
+                return Err(ObjectError::InvalidValue(format!(
+                    "State must be 1-{}",
+                    self.number_of_states
+                )));
+            }
+            self.present_value = state;
+            return Ok(());
+        }
         self.write_priority(priority.unwrap_or(16), commandable_unsigned(value)?)
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
         property == PropertyIdentifier::PresentValue
-            || shared_writable(property, self.alarm.is_some())
+            || shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        let mut properties = shared_property_list(self.alarm.as_ref());
-        properties.extend([
-            PropertyIdentifier::PriorityArray,
-            PropertyIdentifier::RelinquishDefault,
-        ]);
+        let mut properties = shared_property_list(self.alarm.as_ref(), self.optional);
+        if self.commandable {
+            properties.extend([
+                PropertyIdentifier::PriorityArray,
+                PropertyIdentifier::RelinquishDefault,
+            ]);
+        }
         properties
     }
 
@@ -948,5 +1029,37 @@ mod tests {
             );
         }
         assert_eq!(input.present_value, 3, "a rejected state changes nothing");
+    }
+
+    #[test]
+    fn a_multistate_value_that_is_not_commandable_checks_its_states() {
+        let mut value = MultiStateValue::new(1, "Mode".to_string(), 3);
+        value.commandable = false;
+
+        assert!(!value
+            .property_list()
+            .contains(&PropertyIdentifier::PriorityArray));
+        value
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Unsigned(3))
+            .unwrap();
+        assert_eq!(value.present_value, 3);
+        assert!(value
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Unsigned(4))
+            .is_err());
+    }
+
+    #[test]
+    fn an_absent_description_cannot_be_written_either() {
+        let mut value = MultiStateValue::new(1, "Mode".to_string(), 3);
+        value.optional.description = false;
+
+        assert!(matches!(
+            value.set_property(
+                PropertyIdentifier::Description,
+                PropertyValue::CharacterString("Hello".to_string())
+            ),
+            Err(ObjectError::UnknownProperty)
+        ));
+        assert!(!value.is_property_writable(PropertyIdentifier::Description));
     }
 }
