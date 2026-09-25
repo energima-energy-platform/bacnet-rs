@@ -382,7 +382,10 @@ mod tests {
                 30,
                 ANY,
             )),
-            time_values: Vec::new(),
+            time_values: vec![TimeValueValue {
+                time: (0, 0, 0, 0),
+                value: Box::new(PropertyValue::Real(16.0)),
+            }],
             priority: 8,
         }));
         let mut engine = ScheduleEngine::new();
@@ -392,7 +395,7 @@ mod tests {
         assert_eq!(
             present_value(&database, setpoint()),
             PropertyValue::Real(16.0),
-            "an empty exception means nothing is scheduled today"
+            "the exception's value from midnight, not the weekly one"
         );
     }
 

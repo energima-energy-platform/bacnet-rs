@@ -157,6 +157,12 @@ impl Schedule {
 
     /// The value this schedule commands at `date` and `time`.
     ///
+    /// As 135-2020 12.24.4 has it: the highest-priority non-NULL time/value
+    /// in effect, looking through today's exceptions in priority order, then
+    /// the Weekly_Schedule, then Schedule_Default. An exception with nothing in
+    /// effect yet, or a NULL in effect, hands over to the next one down rather
+    /// than ending the search.
+    ///
     /// `date` is (year, month, day, weekday) with weekday 1 for Monday.
     /// `calendar_covers` answers whether a referenced Calendar object includes
     /// the date; the schedule cannot reach other objects itself.
@@ -170,30 +176,34 @@ impl Schedule {
             return self.schedule_default.clone();
         }
 
-        let today = self
-            .active_exception(date, calendar_covers)
+        let weekly = self.weekday(date).map(|day| day.time_values.as_slice());
+        self.active_exceptions(date, calendar_covers)
+            .into_iter()
             .map(|event| event.time_values.as_slice())
-            .or_else(|| Some(self.weekday(date)?.time_values.as_slice()));
-
-        today
-            .and_then(|values| value_at_time(values, time))
+            .chain(weekly)
+            .find_map(|values| {
+                value_at_time(values, time).filter(|value| *value != PropertyValue::Null)
+            })
             .unwrap_or_else(|| self.schedule_default.clone())
     }
 
-    /// The exception covering `date`, or `None`. Lower `priority` wins; the
-    /// first entry wins a tie, which is the order the schedule was written in.
-    fn active_exception(
+    /// The exceptions covering `date`, most urgent first. Lower `priority`
+    /// wins; a tie goes to the one written first.
+    fn active_exceptions(
         &self,
         date: (u16, u8, u8, u8),
         calendar_covers: &dyn Fn(ObjectIdentifier) -> bool,
-    ) -> Option<&SpecialEventValue> {
-        self.exception_schedule
+    ) -> Vec<&SpecialEventValue> {
+        let mut active: Vec<_> = self
+            .exception_schedule
             .iter()
             .filter(|event| match &event.period {
                 SpecialEventPeriod::CalendarEntry(entry) => entry.matches(date),
                 SpecialEventPeriod::CalendarReference(calendar) => calendar_covers(*calendar),
             })
-            .min_by_key(|event| event.priority)
+            .collect();
+        active.sort_by_key(|event| event.priority);
+        active
     }
 
     /// Today's entry in the Weekly_Schedule, or `None` when the weekday is
@@ -601,24 +611,63 @@ mod tests {
         );
     }
 
-    /// An exception with no time values means "nothing is scheduled today",
-    /// which is how a holiday shuts the weekly profile off.
-    #[test]
-    fn an_empty_exception_suppresses_the_weekly_schedule() {
-        let schedule = office_hours().with_exception(SpecialEventValue {
+    fn on_thursday(time_values: Vec<TimeValueValue>) -> Schedule {
+        office_hours().with_exception(SpecialEventValue {
             period: SpecialEventPeriod::CalendarEntry(CalendarEntryValue::Date(
                 UNSPECIFIED_YEAR,
                 7,
                 30,
                 ANY,
             )),
-            time_values: Vec::new(),
+            time_values,
             priority: 8,
-        });
+        })
+    }
+
+    /// An exception with nothing in effect has nothing to say, so the weekly
+    /// schedule goes on (135-2020 12.24.4). A holiday that shuts the profile
+    /// off says so from midnight.
+    #[test]
+    fn an_exception_with_nothing_in_effect_defers_to_the_weekly_schedule() {
+        let empty = on_thursday(Vec::new());
+        assert_eq!(
+            empty.value_at(THURSDAY, (12, 0, 0, 0), &never_a_calendar),
+            PropertyValue::Real(21.0)
+        );
+
+        let later = on_thursday(vec![time_value(14, 15.0)]);
+        assert_eq!(
+            later.value_at(THURSDAY, (12, 0, 0, 0), &never_a_calendar),
+            PropertyValue::Real(21.0),
+            "not in effect until 14:00"
+        );
+
+        let holiday = on_thursday(vec![time_value(0, 16.0)]);
+        assert_eq!(
+            holiday.value_at(THURSDAY, (12, 0, 0, 0), &never_a_calendar),
+            PropertyValue::Real(16.0)
+        );
+    }
+
+    /// A NULL in effect relinquishes to what is below it, not to the default.
+    #[test]
+    fn a_null_in_effect_hands_over_to_the_next_level_down() {
+        let schedule = on_thursday(vec![
+            time_value(0, 15.0),
+            TimeValueValue {
+                time: (10, 0, 0, 0),
+                value: Box::new(PropertyValue::Null),
+            },
+        ]);
 
         assert_eq!(
+            schedule.value_at(THURSDAY, (9, 0, 0, 0), &never_a_calendar),
+            PropertyValue::Real(15.0)
+        );
+        assert_eq!(
             schedule.value_at(THURSDAY, (12, 0, 0, 0), &never_a_calendar),
-            PropertyValue::Real(16.0)
+            PropertyValue::Real(21.0),
+            "the weekly schedule's value"
         );
     }
 
