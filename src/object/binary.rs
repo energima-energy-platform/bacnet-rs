@@ -10,9 +10,11 @@ use crate::object::{
         intrinsic_get, intrinsic_property_list, intrinsic_set, status_flags_bits, AlarmEvaluation,
         AlarmTrigger, IntrinsicReporting,
     },
+    override_permits_write,
     reliability::Reliability,
-    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, ObjectError,
-    ObjectIdentifier, ObjectType, PropertyIdentifier, PropertyValue, Result,
+    write_priority_slot, BacnetObject, CommonView, CommonWritable, CommonWrite, LocalOverride,
+    ObjectError, ObjectIdentifier, ObjectType, OptionalProperties, PropertyIdentifier,
+    PropertyValue, Result,
 };
 
 #[cfg(not(feature = "std"))]
@@ -206,6 +208,7 @@ struct BinaryView<'a> {
     active_text: &'a str,
     alarm_value: BinaryPV,
     alarm: Option<&'a IntrinsicReporting>,
+    optional: OptionalProperties,
 }
 
 /// Read a property common to every binary object type.
@@ -223,6 +226,7 @@ fn shared_get(view: BinaryView<'_>, property: PropertyIdentifier) -> Option<Resu
             reliability: view.reliability,
             out_of_service: view.out_of_service,
             overridden: view.overridden,
+            optional: view.optional,
         },
         property,
     ) {
@@ -251,6 +255,7 @@ struct BinaryWritable<'a> {
     out_of_service: &'a mut bool,
     alarm_value: &'a mut BinaryPV,
     alarm: Option<&'a mut IntrinsicReporting>,
+    optional: OptionalProperties,
 }
 
 /// Write a property common to every binary object type. `None` means the
@@ -267,6 +272,7 @@ fn shared_set(
         out_of_service,
         alarm_value,
         alarm,
+        optional,
     } = fields;
 
     let value = match common_set(
@@ -275,6 +281,7 @@ fn shared_set(
             description,
             reliability,
             out_of_service,
+            optional,
         },
         property,
         value,
@@ -287,14 +294,20 @@ fn shared_set(
 }
 
 /// Whether a property shared by every binary object type accepts writes.
-fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool {
-    matches!(
-        property,
-        PropertyIdentifier::ObjectName
-            | PropertyIdentifier::Description
-            | PropertyIdentifier::OutOfService
-            | PropertyIdentifier::Reliability
-    ) || binary_alarm_writable(property, alarm_configured)
+fn shared_writable(
+    property: PropertyIdentifier,
+    alarm_configured: bool,
+    optional: OptionalProperties,
+) -> bool {
+    optional.has(property)
+        && matches!(
+            property,
+            PropertyIdentifier::ObjectName
+                | PropertyIdentifier::Description
+                | PropertyIdentifier::OutOfService
+                | PropertyIdentifier::Reliability
+        )
+        || binary_alarm_writable(property, alarm_configured)
 }
 
 /// Properties every binary object exposes, in the order they are reported.
@@ -304,6 +317,7 @@ fn shared_writable(property: PropertyIdentifier, alarm_configured: bool) -> bool
 fn shared_property_list(
     trailing: &[PropertyIdentifier],
     alarm: Option<&IntrinsicReporting>,
+    optional: OptionalProperties,
 ) -> Vec<PropertyIdentifier> {
     let mut properties = vec![
         PropertyIdentifier::ObjectIdentifier,
@@ -322,6 +336,7 @@ fn shared_property_list(
         PropertyIdentifier::ActiveText,
     ]);
     properties.extend(binary_alarm_property_list(alarm));
+    optional.retain(&mut properties);
     properties
 }
 
@@ -350,8 +365,8 @@ macro_rules! binary_views {
                 object_type: $object_type,
                 object_name: &self.object_name,
                 description: &self.description,
-                present_value: self.present_value,
-                overridden: self.overridden,
+                present_value: self.effective_present_value(),
+                overridden: self.overridden || self.local_override.is_some(),
                 event_state: self.event_state,
                 reliability: self.reliability,
                 out_of_service: self.out_of_service,
@@ -359,7 +374,14 @@ macro_rules! binary_views {
                 active_text: &self.active_text,
                 alarm_value: self.alarm_value,
                 alarm: self.alarm.as_ref(),
+                optional: self.optional,
             }
+        }
+
+        /// What Present_Value reads: the local override while there is one.
+        pub fn effective_present_value(&self) -> BinaryPV {
+            self.local_override
+                .map_or(self.present_value, |local| local.value)
         }
 
         fn writable(&mut self) -> BinaryWritable<'_> {
@@ -370,6 +392,7 @@ macro_rules! binary_views {
                 out_of_service: &mut self.out_of_service,
                 alarm_value: &mut self.alarm_value,
                 alarm: self.alarm.as_mut(),
+                optional: self.optional,
             }
         }
     };
@@ -387,7 +410,7 @@ macro_rules! binary_intrinsic_methods {
 
         fn evaluate_alarm(&self) -> Option<AlarmEvaluation> {
             evaluate_binary(
-                self.present_value,
+                self.effective_present_value(),
                 self.alarm_value,
                 self.reliability,
                 self.alarm.as_ref(),
@@ -442,6 +465,10 @@ pub struct BinaryInput {
     pub alarm_value: BinaryPV,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<BinaryPV>>,
 }
 
 /// Binary Output object
@@ -484,6 +511,10 @@ pub struct BinaryOutput {
     pub alarm_value: BinaryPV,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<BinaryPV>>,
 }
 
 /// Binary Value object
@@ -510,6 +541,9 @@ pub struct BinaryValue {
     pub inactive_text: String,
     /// Active text
     pub active_text: String,
+    /// Whether Present_Value is commanded through a priority array, or
+    /// written straight through.
+    pub commandable: bool,
     /// Priority array (16 levels)
     pub priority_array: [Option<BinaryPV>; 16],
     /// Relinquish default
@@ -518,6 +552,10 @@ pub struct BinaryValue {
     pub alarm_value: BinaryPV,
     /// Intrinsic reporting state; `None` when event detection is not configured.
     pub alarm: Option<IntrinsicReporting>,
+    /// Which optional properties the object has.
+    pub optional: OptionalProperties,
+    /// A local mechanism holding Present_Value, when one is.
+    pub local_override: Option<LocalOverride<BinaryPV>>,
 }
 
 impl BinaryInput {
@@ -541,6 +579,8 @@ impl BinaryInput {
             time_of_state_count_reset: None,
             alarm_value: BinaryPV::Active,
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -605,6 +645,8 @@ impl BinaryOutput {
             minimum_on_time: 0,
             alarm_value: BinaryPV::Active,
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -653,10 +695,13 @@ impl BinaryValue {
             out_of_service: false,
             inactive_text: "INACTIVE".to_string(),
             active_text: "ACTIVE".to_string(),
+            commandable: true,
             priority_array: [None; 16],
             relinquish_default: BinaryPV::Inactive,
             alarm_value: BinaryPV::Active,
             alarm: None,
+            optional: OptionalProperties::default(),
+            local_override: None,
         }
     }
 
@@ -701,11 +746,11 @@ impl BacnetObject for BinaryInput {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(property, self.alarm.is_some())
+        shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
-        shared_property_list(&[], self.alarm.as_ref())
+        shared_property_list(&[], self.alarm.as_ref(), self.optional)
     }
 
     /// An input reflects a physical contact, so its Present_Value has no
@@ -731,18 +776,24 @@ impl BacnetObject for BinaryInput {
 /// commanded state with a priority array behind it, and neither exposes anything
 /// the other does not — so the impl is written once here rather than twice.
 macro_rules! commandable_binary_object {
-    ($object:ty) => {
+    ($object:ty, $commandable:expr) => {
         impl BacnetObject for $object {
             fn identifier(&self) -> ObjectIdentifier {
                 self.identifier
             }
 
             fn get_property(&self, property: PropertyIdentifier) -> Result<PropertyValue> {
-                if property == PropertyIdentifier::PriorityArray {
-                    return Ok(priority_array_value(&self.priority_array));
+                let commandable: fn(&Self) -> bool = $commandable;
+                match property {
+                    PropertyIdentifier::PriorityArray if commandable(self) => {
+                        Ok(priority_array_value(&self.priority_array))
+                    }
+                    PropertyIdentifier::RelinquishDefault if commandable(self) => {
+                        Ok(PropertyValue::Enumerated(self.relinquish_default as u32))
+                    }
+                    _ => shared_get(self.view(), property)
+                        .unwrap_or(Err(ObjectError::UnknownProperty)),
                 }
-
-                shared_get(self.view(), property).unwrap_or(Err(ObjectError::UnknownProperty))
             }
 
             fn set_property(
@@ -767,17 +818,35 @@ macro_rules! commandable_binary_object {
                 if property != PropertyIdentifier::PresentValue {
                     return self.set_property(property, value);
                 }
+                override_permits_write(&self.local_override)?;
 
+                let commandable: fn(&Self) -> bool = $commandable;
+                // Not commandable: the value is simply written, and a priority
+                // has nothing to act on. Nor is there anything to relinquish to.
+                if !commandable(self) {
+                    self.present_value =
+                        commandable_binary(value)?.ok_or(ObjectError::InvalidPropertyType)?;
+                    return Ok(());
+                }
                 self.write_priority(priority.unwrap_or(16), commandable_binary(value)?)
             }
 
             fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
                 property == PropertyIdentifier::PresentValue
-                    || shared_writable(property, self.alarm.is_some())
+                    || shared_writable(property, self.alarm.is_some(), self.optional)
             }
 
             fn property_list(&self) -> Vec<PropertyIdentifier> {
-                shared_property_list(&[PropertyIdentifier::PriorityArray], self.alarm.as_ref())
+                let commandable: fn(&Self) -> bool = $commandable;
+                let trailing: &[PropertyIdentifier] = if commandable(self) {
+                    &[
+                        PropertyIdentifier::PriorityArray,
+                        PropertyIdentifier::RelinquishDefault,
+                    ]
+                } else {
+                    &[]
+                };
+                shared_property_list(trailing, self.alarm.as_ref(), self.optional)
             }
 
             binary_intrinsic_methods!();
@@ -785,8 +854,9 @@ macro_rules! commandable_binary_object {
     };
 }
 
-commandable_binary_object!(BinaryOutput);
-commandable_binary_object!(BinaryValue);
+// An output is always commanded; a value may be written straight through.
+commandable_binary_object!(BinaryOutput, |_| true);
+commandable_binary_object!(BinaryValue, |value| value.commandable);
 
 #[cfg(test)]
 mod tests {
@@ -927,5 +997,55 @@ mod tests {
             Err(ObjectError::InvalidPropertyType)
         ));
         assert_eq!(input.present_value, BinaryPV::Active);
+    }
+
+    #[test]
+    fn a_commandable_binary_object_serves_its_relinquish_default() {
+        let output = BinaryOutput::new(1, "Fan".to_string());
+        assert_eq!(
+            output
+                .get_property(PropertyIdentifier::RelinquishDefault)
+                .unwrap(),
+            PropertyValue::Enumerated(BinaryPV::Inactive as u32)
+        );
+        assert!(output
+            .property_list()
+            .contains(&PropertyIdentifier::RelinquishDefault));
+    }
+
+    #[test]
+    fn a_binary_value_that_is_not_commandable_has_no_priority_array() {
+        let mut value = BinaryValue::new(1, "Enable".to_string());
+        value.commandable = false;
+
+        assert!(value
+            .get_property(PropertyIdentifier::PriorityArray)
+            .is_err());
+        value
+            .set_property(
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Enumerated(BinaryPV::Active as u32),
+            )
+            .unwrap();
+        assert_eq!(value.present_value, BinaryPV::Active);
+    }
+
+    #[test]
+    fn a_binary_input_held_by_a_hand_switch_ignores_its_sensor() {
+        let mut input = BinaryInput::new(1, "Pump status".to_string());
+        input.local_override = Some(LocalOverride {
+            value: BinaryPV::Active,
+            writes: crate::object::OverrideWrites::Accepted,
+        });
+
+        input
+            .set_sourced_value(PropertyValue::Enumerated(BinaryPV::Inactive as u32))
+            .unwrap();
+        assert_eq!(
+            input
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            PropertyValue::Enumerated(BinaryPV::Active as u32)
+        );
     }
 }
