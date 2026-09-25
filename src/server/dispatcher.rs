@@ -11,6 +11,35 @@ use crate::{
 
 use super::{object_service::object_error_codes, ObjectService, ServerError};
 
+/// Answers what a server receives on behalf of one device.
+///
+/// [`ServerDispatcher`] is the stack's implementation of the standard services.
+/// The trait is for an application that wraps it — to add a service the stack
+/// does not implement, to log or rate-limit, or to refuse requests by policy —
+/// without taking over the framing around it.
+///
+/// Every APDU that decodes is handed over, replies such as a SimpleACK
+/// included, so a wrapper sees everything the device's peers send it.
+pub trait Dispatch: Send + Sync {
+    fn dispatch(
+        &self,
+        request_npdu: &Npdu,
+        request_apdu: Apdu,
+        source: Option<std::net::SocketAddr>,
+    ) -> Result<Option<ServerResponse>, ServerError>;
+}
+
+impl Dispatch for ServerDispatcher {
+    fn dispatch(
+        &self,
+        request_npdu: &Npdu,
+        request_apdu: Apdu,
+        source: Option<std::net::SocketAddr>,
+    ) -> Result<Option<ServerResponse>, ServerError> {
+        ServerDispatcher::dispatch(self, request_npdu, request_apdu, source)
+    }
+}
+
 /// A transport-independent response produced by [`ServerDispatcher`].
 #[derive(Debug)]
 pub struct ServerResponse {

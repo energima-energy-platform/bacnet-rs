@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    DatagramSocket, NotificationTarget, ObjectService, ServerDispatcher, ServerError,
+    DatagramSocket, Dispatch, NotificationTarget, ObjectService, ServerDispatcher, ServerError,
     ServerResponse,
 };
 
@@ -33,7 +33,7 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
 /// loop without creating a socket per object or remote device.
 pub struct BacnetIpServer {
     socket: Arc<dyn DatagramSocket>,
-    dispatcher: ServerDispatcher,
+    dispatcher: Arc<dyn Dispatch>,
     receive_buffer: Vec<u8>,
     observer: Option<RequestObserver>,
 }
@@ -72,13 +72,13 @@ impl BacnetIpServer {
     /// Serve a dispatcher built elsewhere, so the application can own the
     /// device's object service whether one server or a router fronts it.
     pub fn from_dispatcher(socket: UdpSocket, dispatcher: ServerDispatcher) -> Self {
-        Self::over(Arc::new(socket), dispatcher)
+        Self::over(Arc::new(socket), Arc::new(dispatcher))
     }
 
     /// Serve over a transport the application provides rather than a socket
-    /// of the server's own. A [`notifier`](Self::notifier) sends through the
-    /// same one.
-    pub fn over(socket: Arc<dyn DatagramSocket>, dispatcher: ServerDispatcher) -> Self {
+    /// of the server's own, answering with whatever `dispatcher` says. A
+    /// [`notifier`](Self::notifier) sends through the same socket.
+    pub fn over(socket: Arc<dyn DatagramSocket>, dispatcher: Arc<dyn Dispatch>) -> Self {
         Self {
             socket,
             dispatcher,
@@ -111,11 +111,7 @@ impl BacnetIpServer {
         &self.socket
     }
 
-    pub fn object_service(&self) -> &ObjectService {
-        self.dispatcher.object_service()
-    }
-
-    pub fn dispatcher(&self) -> &ServerDispatcher {
+    pub fn dispatcher(&self) -> &Arc<dyn Dispatch> {
         &self.dispatcher
     }
 
@@ -136,7 +132,7 @@ impl BacnetIpServer {
         let (length, source) = self.socket.recv_from(&mut self.receive_buffer)?;
 
         let Some(response) = process_datagram(
-            &self.dispatcher,
+            &*self.dispatcher,
             &self.receive_buffer[..length],
             Some(source),
             self.observer.as_ref(),
@@ -305,7 +301,7 @@ fn log_request_completion(
 }
 
 fn process_datagram(
-    dispatcher: &ServerDispatcher,
+    dispatcher: &dyn Dispatch,
     data: &[u8],
     source: Option<SocketAddr>,
     observer: Option<&RequestObserver>,
@@ -335,7 +331,7 @@ fn process_datagram(
 /// `request` is the APDU, or its raw bytes when it would not decode, which
 /// still earn a reject.
 pub(super) fn answer(
-    dispatcher: &ServerDispatcher,
+    dispatcher: &dyn Dispatch,
     request_npdu: &Npdu,
     request: Result<Apdu, &[u8]>,
     source: Option<SocketAddr>,
@@ -712,7 +708,7 @@ mod tests {
         });
         let mut server = BacnetIpServer::over(
             Arc::clone(&counting) as Arc<dyn DatagramSocket>,
-            ServerDispatcher::new(ObjectService::new(database)),
+            Arc::new(ServerDispatcher::new(ObjectService::new(database))),
         );
         let notifier = server.notifier().unwrap();
 
@@ -897,7 +893,7 @@ mod tests {
                 .push(format!("{service}: {answer}"));
         });
 
-        process_datagram(server.dispatcher(), &frame, None, Some(&observer)).unwrap();
+        process_datagram(&**server.dispatcher(), &frame, None, Some(&observer)).unwrap();
 
         assert_eq!(
             seen.lock().unwrap().as_slice(),
@@ -937,7 +933,7 @@ mod tests {
             );
         });
 
-        process_datagram(server.dispatcher(), &frame, None, Some(&observer)).unwrap();
+        process_datagram(&**server.dispatcher(), &frame, None, Some(&observer)).unwrap();
 
         assert!(!answered.load(std::sync::atomic::Ordering::Relaxed));
     }
@@ -967,7 +963,7 @@ mod tests {
         payload.extend_from_slice(&request.encode());
         let frame = wrap_bvlc(BvlcFunction::OriginalUnicastNpdu, &payload);
 
-        let response = process_datagram(server.dispatcher(), &frame, None, None)
+        let response = process_datagram(&**server.dispatcher(), &frame, None, None)
             .unwrap()
             .unwrap();
         let (_, apdu_data, _) = decode_bacnet_ip_frame(&response.frame).unwrap();
@@ -992,14 +988,14 @@ mod tests {
 
         let network_message = wrap_bvlc(BvlcFunction::OriginalBroadcastNpdu, &[0x01, 0x80, 0x00]);
         assert!(
-            process_datagram(server.dispatcher(), &network_message, None, None)
+            process_datagram(&**server.dispatcher(), &network_message, None, None)
                 .unwrap()
                 .is_none()
         );
 
         let malformed_apdu = wrap_bvlc(BvlcFunction::OriginalUnicastNpdu, &[0x01, 0x00, 0x00]);
         assert!(
-            process_datagram(server.dispatcher(), &malformed_apdu, None, None)
+            process_datagram(&**server.dispatcher(), &malformed_apdu, None, None)
                 .unwrap()
                 .is_none()
         );
@@ -1009,7 +1005,7 @@ mod tests {
             &[0x01, 0x00, 0x10, 0x08, 0x09, 0x01, 0xFF],
         );
         assert!(
-            process_datagram(server.dispatcher(), &malformed_who_is, None, None)
+            process_datagram(&**server.dispatcher(), &malformed_who_is, None, None)
                 .unwrap()
                 .is_none()
         );
@@ -1028,7 +1024,7 @@ mod tests {
             &[0x01, 0x00, 0x00, 0x05, 42, 18],
         );
 
-        let response = process_datagram(server.dispatcher(), &frame, None, None)
+        let response = process_datagram(&**server.dispatcher(), &frame, None, None)
             .unwrap()
             .unwrap();
         let (_, apdu_data, _) = decode_bacnet_ip_frame(&response.frame).unwrap();
@@ -1055,7 +1051,7 @@ mod tests {
         forwarded_payload.extend_from_slice(&[0x01, 0x00, 0x10, 0x08]);
         let frame = wrap_bvlc(BvlcFunction::ForwardedNpdu, &forwarded_payload);
 
-        let response = process_datagram(server.dispatcher(), &frame, None, None)
+        let response = process_datagram(&**server.dispatcher(), &frame, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(response.destination, Some(origin));

@@ -53,7 +53,7 @@ use bacnet_rs::{
         PropertyIdentifier, PropertyValue,
     },
     property::{DestinationValue, TimestampValue},
-    server::{AddressCache, BacnetIpServer, NotificationTarget},
+    server::{AddressCache, BacnetIpServer, NotificationTarget, ObjectService, ServerDispatcher},
 };
 use serde::{Deserialize, Serialize};
 
@@ -270,9 +270,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
     ))?;
 
-    let server = BacnetIpServer::bind(&bind_address, Arc::clone(&database))?;
-    let addresses = server.object_service().addresses().clone();
-    let subscriptions = server.object_service().subscriptions().clone();
+    let service = ObjectService::new(Arc::clone(&database));
+    let addresses = service.addresses().clone();
+    let subscriptions = service.subscriptions().clone();
+    let server = BacnetIpServer::from_dispatcher(
+        std::net::UdpSocket::bind(&bind_address)?,
+        ServerDispatcher::new(service),
+    );
 
     let path = state_path();
     let restored = load_state(&path);
