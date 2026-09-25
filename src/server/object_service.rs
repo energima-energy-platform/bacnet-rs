@@ -22,6 +22,7 @@ pub struct ObjectService {
     database: Arc<ObjectDatabase>,
     addresses: super::AddressCache,
     subscriptions: crate::cov::CovSubscriptions,
+    transactions: super::Transactions,
 }
 
 /// Decode the value carried by a WriteProperty request.
@@ -69,10 +70,18 @@ fn decode_written_value(
 impl ObjectService {
     pub fn new(database: Arc<ObjectDatabase>) -> Self {
         Self {
+            transactions: super::Transactions::new(Arc::clone(&database)),
             database,
             addresses: super::AddressCache::new(),
             subscriptions: crate::cov::CovSubscriptions::new(),
         }
+    }
+
+    /// The confirmed requests this device has sent and not yet had answered.
+    /// Give it to the device's [`Notifier`](super::Notifier) with
+    /// [`with_transactions`](super::Notifier::with_transactions).
+    pub fn transactions(&self) -> &super::Transactions {
+        &self.transactions
     }
 
     /// The device's COV subscription table.
