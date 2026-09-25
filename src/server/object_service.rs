@@ -785,6 +785,64 @@ mod tests {
 }
 
 #[cfg(test)]
+mod proprietary_tests {
+    use super::*;
+    use crate::object::{AnalogValue, Device};
+    use crate::service::{PropertyReference, ReadAccessSpecification};
+
+    fn vendor() -> PropertyIdentifier {
+        PropertyIdentifier::from(32518)
+    }
+
+    #[test]
+    fn a_proprietary_property_is_read_listed_and_part_of_all() {
+        let database = Arc::new(ObjectDatabase::new(Device::new(1234, "D".to_string())));
+        let object = ObjectIdentifier::new(ObjectType::AnalogValue, 1);
+        database
+            .add_object(Box::new(AnalogValue::new(1, "Setpoint".to_string())))
+            .unwrap();
+        database
+            .set_proprietary_property(object, vendor(), PropertyValue::Real(1.5))
+            .unwrap();
+        let service = ObjectService::new(Arc::clone(&database));
+
+        assert_eq!(
+            service
+                .read_property_values(object, vendor(), None)
+                .unwrap(),
+            vec![PropertyValue::Real(1.5)]
+        );
+        assert!(service
+            .read_property_values(object, PropertyIdentifier::PropertyList, None)
+            .unwrap()
+            .contains(&PropertyValue::Enumerated(32518)));
+
+        let all = service.read_property_multiple(&ReadPropertyMultipleRequest::new(vec![
+            ReadAccessSpecification::new(
+                object,
+                vec![PropertyReference::new(PropertyIdentifier::All)],
+            ),
+        ]));
+        assert!(all.read_access_results[0]
+            .results
+            .iter()
+            .any(|result| result.property_identifier == vendor()));
+    }
+
+    #[test]
+    fn a_standard_property_cannot_be_made_proprietary() {
+        let database = ObjectDatabase::new(Device::new(1234, "D".to_string()));
+        assert!(database
+            .set_proprietary_property(
+                database.get_device_id(),
+                PropertyIdentifier::Description,
+                PropertyValue::CharacterString("no".to_string()),
+            )
+            .is_err());
+    }
+}
+
+#[cfg(test)]
 mod list_write_tests {
     use super::*;
     use crate::object::{Calendar, Device, Schedule};

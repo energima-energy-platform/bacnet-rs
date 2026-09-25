@@ -5,10 +5,14 @@
 
 #[cfg(feature = "std")]
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, RwLock},
     time::Instant,
 };
+
+/// Property identifiers from here up are the vendors' to define.
+#[cfg(feature = "std")]
+const FIRST_PROPRIETARY: u32 = 512;
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, collections::BTreeMap as HashMap, string::String, sync::Arc, vec::Vec};
@@ -46,6 +50,8 @@ pub struct ObjectDatabase {
     last_modified: Arc<RwLock<Instant>>,
     /// Device object reference (must always exist)
     device_id: ObjectIdentifier,
+    /// Vendor-defined properties, beyond what each object's type defines.
+    proprietary: Arc<RwLock<HashMap<ObjectIdentifier, BTreeMap<u32, PropertyValue>>>>,
 }
 
 #[cfg(feature = "std")]
@@ -77,6 +83,7 @@ impl ObjectDatabase {
             revision: Arc::new(RwLock::new(1)),
             last_modified: Arc::new(RwLock::new(Instant::now())),
             device_id,
+            proprietary: Arc::default(),
         }
     }
 
@@ -160,6 +167,7 @@ impl ObjectDatabase {
 
             // Remove from name index
             name_index.remove(&object_name);
+            self.proprietary.write().unwrap().remove(&identifier);
 
             // Update database revision
             self.increment_revision();
@@ -174,6 +182,9 @@ impl ObjectDatabase {
         identifier: ObjectIdentifier,
         property: PropertyIdentifier,
     ) -> Result<PropertyValue> {
+        if let Some(value) = self.proprietary_property(identifier, property) {
+            return Ok(value);
+        }
         if identifier == self.device_id {
             match property {
                 PropertyIdentifier::DatabaseRevision => {
@@ -245,7 +256,55 @@ impl ObjectDatabase {
         let objects = self.objects.read().unwrap();
         let entry = objects.get(&identifier).ok_or(ObjectError::NotFound)?;
         let object = entry.read().unwrap();
-        Ok(object.property_list())
+        let mut properties = object.property_list();
+        if let Some(proprietary) = self.proprietary.read().unwrap().get(&identifier) {
+            properties.extend(proprietary.keys().map(|&id| PropertyIdentifier::from(id)));
+        }
+        Ok(properties)
+    }
+
+    /// Give an object a proprietary property, one its vendor defines beyond
+    /// what the object's type does. Read-only over BACnet, as vendor
+    /// configuration usually is, and listed in Property_List.
+    pub fn set_proprietary_property(
+        &self,
+        identifier: ObjectIdentifier,
+        property: PropertyIdentifier,
+        value: PropertyValue,
+    ) -> Result<()> {
+        let id = u32::from(property);
+        if id < FIRST_PROPRIETARY {
+            return Err(ObjectError::InvalidConfiguration(format!(
+                "property {id} is the standard's, not a proprietary one"
+            )));
+        }
+        if !self.objects.read().unwrap().contains_key(&identifier) {
+            return Err(ObjectError::NotFound);
+        }
+        self.proprietary
+            .write()
+            .unwrap()
+            .entry(identifier)
+            .or_default()
+            .insert(id, value);
+        Ok(())
+    }
+
+    fn proprietary_property(
+        &self,
+        identifier: ObjectIdentifier,
+        property: PropertyIdentifier,
+    ) -> Option<PropertyValue> {
+        let id = u32::from(property);
+        if id < FIRST_PROPRIETARY {
+            return None;
+        }
+        self.proprietary
+            .read()
+            .unwrap()
+            .get(&identifier)?
+            .get(&id)
+            .cloned()
     }
 
     /// Set a property value on an object
