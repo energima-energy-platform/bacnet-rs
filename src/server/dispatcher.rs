@@ -27,6 +27,12 @@ pub trait Dispatch: Send + Sync {
         request_apdu: Apdu,
         source: Option<std::net::SocketAddr>,
     ) -> Result<Option<ServerResponse>, ServerError>;
+
+    /// Where this dispatcher records the answers to the device's confirmed
+    /// requests, for a notifier on the same socket to wait on.
+    fn transactions(&self) -> Option<&super::Transactions> {
+        None
+    }
 }
 
 impl Dispatch for ServerDispatcher {
@@ -37,6 +43,10 @@ impl Dispatch for ServerDispatcher {
         source: Option<std::net::SocketAddr>,
     ) -> Result<Option<ServerResponse>, ServerError> {
         ServerDispatcher::dispatch(self, request_npdu, request_apdu, source)
+    }
+
+    fn transactions(&self) -> Option<&super::Transactions> {
+        Some(self.objects.transactions())
     }
 }
 

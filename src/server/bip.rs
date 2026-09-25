@@ -120,9 +120,14 @@ impl BacnetIpServer {
     ///
     /// Broadcast notifications go to 255.255.255.255 on the port this server is
     /// bound to; use [`Notifier::with_broadcast_address`] to direct them at a
-    /// subnet instead.
+    /// subnet instead. Confirmed ones are followed up through the dispatcher's
+    /// transactions, where it has them.
     pub fn notifier(&self) -> Result<Notifier, ServerError> {
-        Notifier::over(Arc::clone(&self.socket))
+        let notifier = Notifier::over(Arc::clone(&self.socket))?;
+        Ok(match self.dispatcher.transactions() {
+            Some(transactions) => notifier.with_transactions(transactions.clone()),
+            None => notifier,
+        })
     }
 
     /// Receive and process one UDP datagram.
@@ -606,11 +611,20 @@ impl Notifier {
 
         let npdu = self.npdu(confirmed.is_some());
         let frame = wrap_bvlc_parts(function, &[&npdu, &apdu.encode()]);
-        self.socket.send_to(&frame, address)?;
-        if let (Some(transactions), Some(service), Some(invoke_id)) =
-            (&self.transactions, confirmed, invoke_id)
-        {
-            transactions.register(address, invoke_id, service, frame, Instant::now());
+        // Registered before sending: the reply can be served before `send_to`
+        // returns, and one with nothing to answer is dropped.
+        let pending = match (&self.transactions, confirmed, invoke_id) {
+            (Some(transactions), Some(service), Some(invoke_id)) => {
+                transactions.register(address, invoke_id, service, frame.clone(), Instant::now());
+                Some((transactions, invoke_id))
+            }
+            _ => None,
+        };
+        if let Err(error) = self.socket.send_to(&frame, address) {
+            if let Some((transactions, invoke_id)) = pending {
+                transactions.withdraw(address, invoke_id);
+            }
+            return Err(error.into());
         }
         Ok(())
     }
@@ -637,11 +651,15 @@ impl Notifier {
         };
         let first = next();
         let mut id = first;
-        for _ in 0..u8::MAX {
+        for _ in 1..=u8::MAX {
             if !transactions.in_flight(destination, id) {
                 return id;
             }
             id = next();
+        }
+        // The 256th id, which the loop moved onto without checking.
+        if !transactions.in_flight(destination, id) {
+            return id;
         }
         first
     }
@@ -1357,5 +1375,117 @@ mod tests {
                 .expect("zero concurrency limit should fail");
             assert!(matches!(error, ServerError::InvalidConfiguration(_)));
         }
+    }
+
+    /// A socket that notes how many requests were waiting on an answer at
+    /// the moment each frame went out, and can refuse to send.
+    struct Watching {
+        transactions: Transactions,
+        outstanding_at_send: std::sync::Mutex<Vec<usize>>,
+        refuse: bool,
+    }
+
+    impl DatagramSocket for Watching {
+        fn recv_from(&self, _buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+
+        fn send_to(&self, frame: &[u8], _destination: SocketAddr) -> std::io::Result<usize> {
+            self.outstanding_at_send
+                .lock()
+                .unwrap()
+                .push(self.transactions.outstanding());
+            if self.refuse {
+                return Err(std::io::ErrorKind::ConnectionRefused.into());
+            }
+            Ok(frame.len())
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 47808)))
+        }
+    }
+
+    fn transactions() -> Transactions {
+        Transactions::new(Arc::new(ObjectDatabase::new(Device::new(
+            1,
+            "Test".to_string(),
+        ))))
+    }
+
+    fn peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 47809))
+    }
+
+    fn send_confirmed(notifier: &Notifier) -> Result<(), ServerError> {
+        notifier.send(
+            NotificationTarget::Unicast(peer()),
+            Vec::new(),
+            Some(ConfirmedServiceChoice::ConfirmedEventNotification),
+            UnconfirmedServiceChoice::UnconfirmedEventNotification,
+        )
+    }
+
+    /// A reply can be served before `send_to` returns, so the request has to
+    /// be waiting for it by then - and not left waiting if it never went out.
+    #[test]
+    fn a_confirmed_request_is_awaited_before_it_is_sent() {
+        for refuse in [false, true] {
+            let transactions = transactions();
+            let socket = Arc::new(Watching {
+                transactions: transactions.clone(),
+                outstanding_at_send: Default::default(),
+                refuse,
+            });
+            let notifier = Notifier::over(socket.clone())
+                .unwrap()
+                .with_transactions(transactions.clone());
+
+            assert_eq!(send_confirmed(&notifier).is_err(), refuse);
+            assert_eq!(*socket.outstanding_at_send.lock().unwrap(), vec![1]);
+            assert_eq!(
+                transactions.outstanding(),
+                usize::from(!refuse),
+                "a request that never went out is not awaited"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_free_invoke_id_is_found() {
+        let transactions = transactions();
+        let socket = Arc::new(Watching {
+            transactions: transactions.clone(),
+            outstanding_at_send: Default::default(),
+            refuse: false,
+        });
+        let notifier = Notifier::over(socket)
+            .unwrap()
+            .with_transactions(transactions.clone());
+        // Every id but the one just before where the counter starts, which
+        // the search reaches last.
+        let first = notifier
+            .invoke_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let free = first.wrapping_sub(1);
+        for id in (0..=u8::MAX).filter(|&id| id != free) {
+            transactions.register(
+                peer(),
+                id,
+                ConfirmedServiceChoice::ConfirmedEventNotification,
+                Vec::new(),
+                std::time::Instant::now(),
+            );
+        }
+        assert_eq!(notifier.next_invoke_id(peer()), free);
+    }
+
+    /// A server that built its own object service is the only one holding its
+    /// transactions, so its notifier has to be given them.
+    #[test]
+    fn a_servers_notifier_follows_up_its_confirmed_requests() {
+        let database = Arc::new(ObjectDatabase::new(Device::new(1, "Test".to_string())));
+        let server = BacnetIpServer::bind("127.0.0.1:0", database).unwrap();
+        assert!(server.notifier().unwrap().transactions.is_some());
     }
 }
