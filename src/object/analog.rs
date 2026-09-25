@@ -326,6 +326,7 @@ struct AnalogWritable<'a> {
     high_limit: &'a mut Option<f32>,
     low_limit: &'a mut Option<f32>,
     deadband: &'a mut f32,
+    cov_increment: &'a mut Option<f32>,
     alarm: Option<&'a mut IntrinsicReporting>,
     optional: OptionalProperties,
 }
@@ -345,6 +346,7 @@ fn shared_set(
         high_limit,
         low_limit,
         deadband,
+        cov_increment,
         alarm,
         optional,
     } = fields;
@@ -364,6 +366,24 @@ fn shared_set(
         CommonWrite::Unclaimed(value) => value,
     };
 
+    // Writable only where it is present: an object without one has no such
+    // property to write, and inventing it here would change what it reports.
+    if property == PropertyIdentifier::CovIncrement {
+        let Some(increment) = cov_increment else {
+            return Some(Err(ObjectError::UnknownProperty));
+        };
+        return Some(match value {
+            PropertyValue::Real(new) if new >= 0.0 => {
+                *increment = new;
+                Ok(())
+            }
+            PropertyValue::Real(new) => Err(ObjectError::InvalidValue(format!(
+                "COV_Increment cannot be negative, got {new}"
+            ))),
+            _ => Err(ObjectError::InvalidPropertyType),
+        });
+    }
+
     analog_alarm_set(high_limit, low_limit, deadband, alarm, property, value)
 }
 
@@ -371,16 +391,18 @@ fn shared_set(
 fn shared_writable(
     property: PropertyIdentifier,
     alarm_configured: bool,
+    has_cov_increment: bool,
     optional: OptionalProperties,
 ) -> bool {
-    optional.has(property)
-        && matches!(
-            property,
-            PropertyIdentifier::ObjectName
-                | PropertyIdentifier::Description
-                | PropertyIdentifier::OutOfService
-                | PropertyIdentifier::Reliability
-        )
+    property == PropertyIdentifier::CovIncrement && has_cov_increment
+        || optional.has(property)
+            && matches!(
+                property,
+                PropertyIdentifier::ObjectName
+                    | PropertyIdentifier::Description
+                    | PropertyIdentifier::OutOfService
+                    | PropertyIdentifier::Reliability
+            )
         || analog_alarm_writable(property, alarm_configured)
 }
 
@@ -497,6 +519,7 @@ macro_rules! analog_views {
                 high_limit: &mut self.high_limit,
                 low_limit: &mut self.low_limit,
                 deadband: &mut self.deadband,
+                cov_increment: &mut self.cov_increment,
                 alarm: self.alarm.as_mut(),
                 optional: self.optional,
             }
@@ -899,7 +922,12 @@ impl BacnetObject for AnalogInput {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(property, self.alarm.is_some(), self.optional)
+        shared_writable(
+            property,
+            self.alarm.is_some(),
+            self.cov_increment.is_some(),
+            self.optional,
+        )
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
@@ -964,7 +992,12 @@ impl BacnetObject for AnalogOutput {
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
         property == PropertyIdentifier::PresentValue
-            || shared_writable(property, self.alarm.is_some(), self.optional)
+            || shared_writable(
+                property,
+                self.alarm.is_some(),
+                self.cov_increment.is_some(),
+                self.optional,
+            )
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
@@ -1023,7 +1056,12 @@ impl BacnetObject for AnalogValue {
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
         property == PropertyIdentifier::PresentValue
-            || shared_writable(property, self.alarm.is_some(), self.optional)
+            || shared_writable(
+                property,
+                self.alarm.is_some(),
+                self.cov_increment.is_some(),
+                self.optional,
+            )
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
@@ -1234,6 +1272,48 @@ mod tests {
             assert!(object
                 .property_list()
                 .contains(&PropertyIdentifier::CovIncrement));
+        }
+    }
+
+    /// A client tunes how often it hears about a point by writing its
+    /// COV_Increment, which only makes sense where the object has one.
+    #[test]
+    fn a_cov_increment_is_writable_where_the_object_has_one() {
+        let mut input = AnalogInput::new(1, "Room CO2".to_string());
+        let mut output = AnalogOutput::new(1, "Damper".to_string());
+        let mut value = AnalogValue::new(1, "Setpoint".to_string());
+
+        for object in [&mut input as &mut dyn BacnetObject, &mut output, &mut value] {
+            assert!(!object.is_property_writable(PropertyIdentifier::CovIncrement));
+            assert!(matches!(
+                object.set_property(PropertyIdentifier::CovIncrement, PropertyValue::Real(1.0)),
+                Err(ObjectError::UnknownProperty)
+            ));
+        }
+
+        input.cov_increment = Some(25.0);
+        output.cov_increment = Some(2.0);
+        value.cov_increment = Some(0.5);
+
+        for object in [&mut input as &mut dyn BacnetObject, &mut output, &mut value] {
+            assert!(object.is_property_writable(PropertyIdentifier::CovIncrement));
+            object
+                .set_property(PropertyIdentifier::CovIncrement, PropertyValue::Real(0.0))
+                .unwrap();
+            assert_eq!(
+                object
+                    .get_property(PropertyIdentifier::CovIncrement)
+                    .unwrap(),
+                PropertyValue::Real(0.0)
+            );
+            assert!(matches!(
+                object.set_property(PropertyIdentifier::CovIncrement, PropertyValue::Real(-1.0)),
+                Err(ObjectError::InvalidValue(_))
+            ));
+            assert!(matches!(
+                object.set_property(PropertyIdentifier::CovIncrement, PropertyValue::Unsigned(1)),
+                Err(ObjectError::InvalidPropertyType)
+            ));
         }
     }
 
