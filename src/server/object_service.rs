@@ -35,11 +35,27 @@ fn decode_written_value(
     property: PropertyIdentifier,
     encoded: &[u8],
 ) -> Result<PropertyValue, ObjectError> {
-    if property == PropertyIdentifier::RecipientList {
-        // An empty payload clears the list, which is how a recipient deregisters.
-        return crate::property::complex::decode_destinations(encoded)
+    // A list is written whole, as a run of its elements, and a list of one is
+    // indistinguishable from a scalar: only the property says which it is. An
+    // empty payload clears the list, which is how a recipient deregisters.
+    if matches!(
+        property,
+        PropertyIdentifier::RecipientList
+            | PropertyIdentifier::DateList
+            | PropertyIdentifier::ExceptionSchedule
+            | PropertyIdentifier::WeeklySchedule
+            | PropertyIdentifier::ListOfObjectPropertyReferences
+    ) {
+        return crate::service::decode_values_for(property, encoded)
             .map(PropertyValue::List)
             .map_err(|_| ObjectError::InvalidPropertyType);
+    }
+    // One value, but a constructed one the application tags do not describe.
+    if property == PropertyIdentifier::EffectivePeriod {
+        return match crate::service::decode_values_for(property, encoded).as_deref() {
+            Ok([period]) => Ok(period.clone()),
+            _ => Err(ObjectError::InvalidPropertyType),
+        };
     }
 
     let (value, consumed) = crate::property::decode_property_value(encoded)
@@ -765,6 +781,88 @@ mod tests {
             object_error_codes(&ObjectError::OptionalFunctionalityNotSupported),
             (2, 45)
         );
+    }
+}
+
+#[cfg(test)]
+mod list_write_tests {
+    use super::*;
+    use crate::object::{Calendar, Device, Schedule};
+    use crate::property::{
+        encode_property_value, CalendarEntryValue, DailyScheduleValue, DateRangeValue,
+        SpecialEventPeriod, SpecialEventValue, TimeValueValue,
+    };
+
+    fn at_six(value: f32) -> TimeValueValue {
+        TimeValueValue {
+            time: (6, 0, 0, 0),
+            value: Box::new(PropertyValue::Real(value)),
+        }
+    }
+
+    /// Everything a client writes to a list property, read from one object and
+    /// written over the wire encoding into a blank one, must arrive whole.
+    #[test]
+    fn list_properties_written_whole_arrive_whole() {
+        let database = Arc::new(ObjectDatabase::new(Device::new(1234, "D".to_string())));
+        let christmas = CalendarEntryValue::Date(2026, 12, 24, 255);
+        let new_year = CalendarEntryValue::Date(2026, 12, 31, 255);
+        database
+            .add_object(Box::new(
+                Calendar::new(1, "Calendar from".to_string())
+                    .with_entry(christmas)
+                    .with_entry(new_year),
+            ))
+            .unwrap();
+        database
+            .add_object(Box::new(
+                Schedule::new(1, "Schedule from".to_string())
+                    .with_weekly_schedule(core::array::from_fn(|day| DailyScheduleValue {
+                        time_values: vec![at_six(day as f32)],
+                    }))
+                    .with_effective_period(DateRangeValue {
+                        start: (2026, 1, 1, 255),
+                        end: (2026, 12, 31, 255),
+                    })
+                    .with_exception(SpecialEventValue {
+                        period: SpecialEventPeriod::CalendarEntry(christmas),
+                        time_values: vec![at_six(15.0)],
+                        priority: 8,
+                    }),
+            ))
+            .unwrap();
+        database
+            .add_object(Box::new(Calendar::new(2, "Calendar to".to_string())))
+            .unwrap();
+        database
+            .add_object(Box::new(Schedule::new(2, "Schedule to".to_string())))
+            .unwrap();
+        let service = ObjectService::new(Arc::clone(&database));
+
+        for (object_type, property) in [
+            (ObjectType::Calendar, PropertyIdentifier::DateList),
+            (ObjectType::Schedule, PropertyIdentifier::WeeklySchedule),
+            (ObjectType::Schedule, PropertyIdentifier::ExceptionSchedule),
+            (ObjectType::Schedule, PropertyIdentifier::EffectivePeriod),
+        ] {
+            let from = ObjectIdentifier::new(object_type, 1);
+            let to = ObjectIdentifier::new(object_type, 2);
+            let value = database.get_property(from, property).unwrap();
+            let mut encoded = Vec::new();
+            encode_property_value(&value, &mut encoded).unwrap();
+
+            service
+                .write_property(
+                    &WritePropertyRequest::new(to, property.into(), encoded),
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("writing {property:?}: {error}"));
+            assert_eq!(
+                database.get_property(to, property).unwrap(),
+                value,
+                "{property:?}"
+            );
+        }
     }
 }
 
