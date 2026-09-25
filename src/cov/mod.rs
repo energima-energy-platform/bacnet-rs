@@ -75,11 +75,29 @@ impl Subscription {
     }
 }
 
+/// How many subscriptions a device has room for. `None` is unlimited.
+///
+/// A real controller's table is a fixed piece of memory, often sized per
+/// object, and a subscriber that finds it full is told
+/// NO_SPACE_TO_ADD_LIST_ELEMENT rather than silently never notified.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CovLimits {
+    /// Across the whole device.
+    pub total: Option<usize>,
+    /// On any one monitored object.
+    pub per_object: Option<usize>,
+}
+
+/// A subscription refused because the table is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableFull;
+
 /// The device's COV subscription table, shared between the request path that
 /// maintains it and the reporting path that walks it.
 #[derive(Clone, Default)]
 pub struct CovSubscriptions {
     subscriptions: Arc<RwLock<HashMap<SubscriptionKey, Subscription>>>,
+    limits: Arc<RwLock<CovLimits>>,
     /// The engine's clock, so a subscribe request arriving on the request thread
     /// can turn a lifetime into an expiry without reading a wall clock of its own.
     now_seconds: Arc<AtomicU64>,
@@ -112,15 +130,42 @@ impl CovSubscriptions {
         }
     }
 
+    pub fn limits(&self) -> CovLimits {
+        *self.limits.read().unwrap()
+    }
+
+    /// Size the table. Subscriptions already held are kept even past a new
+    /// limit; it only refuses new ones.
+    pub fn set_limits(&self, limits: CovLimits) {
+        *self.limits.write().unwrap() = limits;
+    }
+
     /// Add a subscription, or renew one that already exists.
     ///
     /// Re-subscribing is how BACnet renews a lifetime, so an existing key is
-    /// replaced rather than duplicated.
-    pub fn subscribe(&self, subscription: Subscription) {
-        self.subscriptions
-            .write()
-            .unwrap()
-            .insert(subscription.key, subscription);
+    /// replaced rather than duplicated, and a renewal is never refused for
+    /// space. A subscription that has lapsed but not yet been expired does not
+    /// take up room.
+    pub fn subscribe(&self, subscription: Subscription) -> Result<(), TableFull> {
+        let limits = self.limits();
+        let now = self.now();
+        let mut subscriptions = self.subscriptions.write().unwrap();
+        if !subscriptions.contains_key(&subscription.key) {
+            let live = || {
+                subscriptions
+                    .values()
+                    .filter(move |held| held.expires_at.is_none_or(|expiry| expiry > now))
+            };
+            let full = |limit: Option<usize>, held: usize| limit.is_some_and(|limit| held >= limit);
+            let on_object = live()
+                .filter(|held| held.key.monitored_object == subscription.key.monitored_object)
+                .count();
+            if full(limits.total, live().count()) || full(limits.per_object, on_object) {
+                return Err(TableFull);
+            }
+        }
+        subscriptions.insert(subscription.key, subscription);
+        Ok(())
     }
 
     /// Remove a subscription. Returns whether one was there.
@@ -396,7 +441,7 @@ mod tests {
     fn taking_the_object_out_of_service_reports_to_the_subscriber() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, None));
+        subscriptions.subscribe(subscription(false, None)).unwrap();
         let mut engine = CovEngine::new(1234);
 
         assert_eq!(
@@ -443,7 +488,7 @@ mod tests {
     fn a_transmitted_value_becomes_the_baseline_even_when_it_did_not_trigger() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, None));
+        subscriptions.subscribe(subscription(false, None)).unwrap();
         let mut engine = CovEngine::new(1234);
         engine.tick(&database, &subscriptions, 0);
 
@@ -491,7 +536,7 @@ mod tests {
     fn a_new_subscription_reports_its_initial_value() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, None));
+        subscriptions.subscribe(subscription(false, None)).unwrap();
         let mut engine = CovEngine::new(1234);
 
         let notifications = engine.tick(&database, &subscriptions, 0);
@@ -510,7 +555,7 @@ mod tests {
     fn the_cov_increment_suppresses_changes_that_are_too_small() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, None));
+        subscriptions.subscribe(subscription(false, None)).unwrap();
         let mut engine = CovEngine::new(1234);
         assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 1);
 
@@ -550,7 +595,7 @@ mod tests {
         let subscriptions = CovSubscriptions::new();
         let mut watching = subscription(false, None);
         watching.key.monitored_object = input;
-        subscriptions.subscribe(watching);
+        subscriptions.subscribe(watching).unwrap();
         let mut engine = CovEngine::new(1234);
         assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 1);
 
@@ -576,7 +621,7 @@ mod tests {
     fn a_notification_reports_the_whole_monitored_set() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, None));
+        subscriptions.subscribe(subscription(false, None)).unwrap();
         let mut engine = CovEngine::new(1234);
 
         let notifications = engine.tick(&database, &subscriptions, 0);
@@ -611,7 +656,7 @@ mod tests {
         let subscriptions = CovSubscriptions::new();
         let mut key = subscription(false, None);
         key.key.monitored_object = object;
-        subscriptions.subscribe(key);
+        subscriptions.subscribe(key).unwrap();
 
         let mut engine = CovEngine::new(1234);
         assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 1);
@@ -630,7 +675,9 @@ mod tests {
     fn a_subscription_expires_and_stops_reporting() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, Some(60)));
+        subscriptions
+            .subscribe(subscription(false, Some(60)))
+            .unwrap();
         let mut engine = CovEngine::new(1234);
 
         assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 1);
@@ -662,8 +709,12 @@ mod tests {
     #[test]
     fn resubscribing_renews_rather_than_duplicating() {
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, Some(60)));
-        subscriptions.subscribe(subscription(true, Some(600)));
+        subscriptions
+            .subscribe(subscription(false, Some(60)))
+            .unwrap();
+        subscriptions
+            .subscribe(subscription(true, Some(600)))
+            .unwrap();
 
         assert_eq!(subscriptions.len(), 1);
         let held = &subscriptions.all()[0];
@@ -675,7 +726,7 @@ mod tests {
     fn cancelling_removes_the_subscription() {
         let subscriptions = CovSubscriptions::new();
         let held = subscription(false, None);
-        subscriptions.subscribe(held.clone());
+        subscriptions.subscribe(held.clone()).unwrap();
 
         assert!(subscriptions.cancel(&held.key));
         assert!(subscriptions.is_empty());
@@ -689,7 +740,7 @@ mod tests {
         let mut held = subscription(false, None);
         held.key.monitored_property = Some(PropertyIdentifier::PresentValue);
         held.cov_increment = Some(5.0);
-        subscriptions.subscribe(held);
+        subscriptions.subscribe(held).unwrap();
 
         let mut engine = CovEngine::new(1234);
         let notifications = engine.tick(&database, &subscriptions, 0);
@@ -725,10 +776,10 @@ mod tests {
 
         let mut value = subscription(false, None);
         value.key.monitored_property = Some(PropertyIdentifier::PresentValue);
-        subscriptions.subscribe(value);
+        subscriptions.subscribe(value).unwrap();
         let mut flags = subscription(false, None);
         flags.key.monitored_property = Some(PropertyIdentifier::StatusFlags);
-        subscriptions.subscribe(flags);
+        subscriptions.subscribe(flags).unwrap();
 
         assert_eq!(subscriptions.len(), 2);
 
@@ -758,7 +809,7 @@ mod tests {
         let mut held = subscription(false, None);
         held.key.monitored_property = Some(PropertyIdentifier::HighLimit);
         held.cov_increment = Some(1.0);
-        subscriptions.subscribe(held);
+        subscriptions.subscribe(held).unwrap();
 
         let mut engine = CovEngine::new(1234);
         assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 1);
@@ -786,11 +837,11 @@ mod tests {
     fn two_subscribers_are_tracked_independently() {
         let database = database();
         let subscriptions = CovSubscriptions::new();
-        subscriptions.subscribe(subscription(false, None));
+        subscriptions.subscribe(subscription(false, None)).unwrap();
         let mut other = subscription(false, None);
         other.key.process_identifier = 888;
         other.key.address = "192.168.6.2:47808".parse().unwrap();
-        subscriptions.subscribe(other);
+        subscriptions.subscribe(other).unwrap();
 
         let mut engine = CovEngine::new(1234);
         assert_eq!(engine.tick(&database, &subscriptions, 0).len(), 2);
@@ -803,5 +854,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(engine.tick(&database, &subscriptions, 1).len(), 2);
+    }
+
+    fn subscriber(process_identifier: u32, object: u32) -> Subscription {
+        let mut subscription = subscription(false, None);
+        subscription.key.process_identifier = process_identifier;
+        subscription.key.monitored_object = ObjectIdentifier::new(ObjectType::AnalogValue, object);
+        subscription
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_subscriber_but_renews_an_old_one() {
+        let subscriptions = CovSubscriptions::new();
+        subscriptions.set_limits(CovLimits {
+            total: Some(2),
+            per_object: None,
+        });
+        subscriptions.subscribe(subscriber(1, 1)).unwrap();
+        subscriptions.subscribe(subscriber(2, 2)).unwrap();
+
+        assert_eq!(subscriptions.subscribe(subscriber(3, 3)), Err(TableFull));
+        assert_eq!(subscriptions.subscribe(subscriber(1, 1)), Ok(()));
+        assert_eq!(subscriptions.len(), 2);
+    }
+
+    #[test]
+    fn a_per_object_limit_leaves_room_on_other_objects() {
+        let subscriptions = CovSubscriptions::new();
+        subscriptions.set_limits(CovLimits {
+            total: None,
+            per_object: Some(1),
+        });
+        subscriptions.subscribe(subscriber(1, 1)).unwrap();
+
+        assert_eq!(subscriptions.subscribe(subscriber(2, 1)), Err(TableFull));
+        assert_eq!(subscriptions.subscribe(subscriber(2, 2)), Ok(()));
+    }
+
+    #[test]
+    fn a_lapsed_subscription_takes_no_room() {
+        let subscriptions = CovSubscriptions::new();
+        subscriptions.set_limits(CovLimits {
+            total: Some(1),
+            per_object: None,
+        });
+        let mut lapsing = subscriber(1, 1);
+        lapsing.expires_at = Some(10);
+        subscriptions.subscribe(lapsing).unwrap();
+        subscriptions.set_now(10);
+
+        assert_eq!(subscriptions.subscribe(subscriber(2, 2)), Ok(()));
     }
 }

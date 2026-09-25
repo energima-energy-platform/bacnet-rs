@@ -1,5 +1,5 @@
 use crate::{
-    app::{Apdu, MaxApduSize},
+    app::Apdu,
     network::Npdu,
     object::ObjectError,
     service::{
@@ -89,12 +89,12 @@ impl ServerDispatcher {
             } => {
                 let response =
                     self.dispatch_confirmed(invoke_id, service_choice, &service_data, source)?;
-                enforce_max_apdu(
-                    invoke_id,
-                    response,
-                    max_response_size,
-                    segmented_response_accepted,
-                )
+                // A device cannot send more than it can itself hold, whatever
+                // the requester would accept.
+                let limit = max_response_size
+                    .size()
+                    .min(self.objects.max_apdu_length_accepted());
+                enforce_max_apdu(invoke_id, response, limit, segmented_response_accepted)
             }
             _ => return Ok(None),
         };
@@ -221,10 +221,10 @@ fn abort(invoke_id: u8, reason: AbortReason) -> Apdu {
 fn enforce_max_apdu(
     invoke_id: u8,
     response: Apdu,
-    max_response_size: MaxApduSize,
+    limit: usize,
     segmented_response_accepted: bool,
 ) -> Apdu {
-    if response.encoded_len() <= max_response_size.size() {
+    if response.encoded_len() <= limit {
         return response;
     }
 
@@ -555,5 +555,55 @@ mod tests {
                 } if abort_reason == expected_reason
             ));
         }
+    }
+
+    /// A small controller can answer a read of one index but not of the whole
+    /// list, which is what sends a client walking Object_List element by
+    /// element.
+    #[test]
+    fn a_reply_larger_than_the_device_holds_aborts_however_much_the_client_takes() {
+        let database = Arc::new(ObjectDatabase::new({
+            let mut device = Device::new(1234, "Small".to_string());
+            device.max_apdu_length_accepted = 50;
+            device
+        }));
+        for instance in 1..=20 {
+            database
+                .add_object(Box::new(AnalogValue::new(
+                    instance,
+                    format!("Value {instance}"),
+                )))
+                .unwrap();
+        }
+        let dispatcher = ServerDispatcher::new(ObjectService::new(database));
+        let device = ObjectIdentifier::new(ObjectType::Device, 1234);
+
+        let read = |index: Option<u32>| {
+            let mut service_data = Vec::new();
+            ReadPropertyRequest {
+                object_identifier: device,
+                property_identifier: PropertyIdentifier::ObjectList,
+                property_array_index: index,
+            }
+            .encode(&mut service_data)
+            .unwrap();
+            dispatcher
+                .dispatch(
+                    &Npdu::new(),
+                    confirmed_request(
+                        ConfirmedServiceChoice::ReadProperty,
+                        service_data,
+                        MaxApduSize::Up1476,
+                        false,
+                    ),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+                .apdu
+        };
+
+        assert!(matches!(read(None), Apdu::Abort { .. }));
+        assert!(matches!(read(Some(1)), Apdu::ComplexAck { .. }));
     }
 }

@@ -106,13 +106,14 @@ impl ObjectService {
             return Ok(());
         }
 
-        self.subscriptions.subscribe(crate::cov::Subscription {
-            key,
-            confirmed: request.issue_confirmed_notifications.unwrap_or(false),
-            expires_at: self.subscriptions.expiry_for(request.lifetime),
-            cov_increment: None,
-        });
-        Ok(())
+        self.subscriptions
+            .subscribe(crate::cov::Subscription {
+                key,
+                confirmed: request.issue_confirmed_notifications.unwrap_or(false),
+                expires_at: self.subscriptions.expiry_for(request.lifetime),
+                cov_increment: None,
+            })
+            .map_err(|_| ObjectError::NoSpaceToAddListElement)
     }
 
     /// Register, renew or cancel a subscription to one named property.
@@ -158,13 +159,14 @@ impl ObjectService {
             return Ok(());
         }
 
-        self.subscriptions.subscribe(crate::cov::Subscription {
-            key,
-            confirmed: request.issue_confirmed_notifications.unwrap_or(false),
-            expires_at: self.subscriptions.expiry_for(request.lifetime),
-            cov_increment: request.cov_increment,
-        });
-        Ok(())
+        self.subscriptions
+            .subscribe(crate::cov::Subscription {
+                key,
+                confirmed: request.issue_confirmed_notifications.unwrap_or(false),
+                expires_at: self.subscriptions.expiry_for(request.lifetime),
+                cov_increment: request.cov_increment,
+            })
+            .map_err(|_| ObjectError::NoSpaceToAddListElement)
     }
 
     /// Device-to-address bindings this service has learned from requests.
@@ -461,6 +463,19 @@ impl ObjectService {
         )
     }
 
+    /// The largest APDU this device sends or receives, from its Device object.
+    pub fn max_apdu_length_accepted(&self) -> usize {
+        let device = self.database.get_device_id();
+        unsigned_property(
+            &self.database,
+            device,
+            PropertyIdentifier::MaxApduLengthAccepted,
+        )
+        .ok()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(usize::MAX)
+    }
+
     pub fn i_am(&self) -> Result<IAmRequest, ObjectError> {
         let device = self.database.get_device_id();
         if device.object_type != ObjectType::Device {
@@ -532,6 +547,8 @@ pub(crate) fn object_error_codes(error: &ObjectError) -> (u32, u32) {
         ObjectError::PropertyIsNotArray => (2, 50),
         ObjectError::InvalidArrayIndex => (2, 42),
         ObjectError::OptionalFunctionalityNotSupported => (2, 45),
+        ObjectError::NoSpaceToAddListElement => (3, 19),
+        ObjectError::NoSpaceToWriteProperty => (3, 20),
         ObjectError::TypeNotSupported | ObjectError::InvalidConfiguration(_) => (1, 0),
     }
 }
@@ -867,6 +884,25 @@ mod cov_subscription_tests {
             issue_confirmed_notifications: confirmed,
             lifetime,
         }
+    }
+
+    #[test]
+    fn a_full_subscription_table_is_no_space_to_add_list_element() {
+        let service = service();
+        service.subscriptions().set_limits(crate::cov::CovLimits {
+            total: None,
+            per_object: Some(1),
+        });
+        service
+            .subscribe_cov(&request(Some(60), Some(false)), Some(subscriber()))
+            .unwrap();
+
+        let mut another = request(Some(60), Some(false));
+        another.subscriber_process_identifier = 778;
+        let error = service
+            .subscribe_cov(&another, Some(subscriber()))
+            .unwrap_err();
+        assert_eq!(object_error_codes(&error), (3, 19));
     }
 
     #[test]

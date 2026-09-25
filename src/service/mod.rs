@@ -427,6 +427,7 @@ generate_custom_enum!(
     ErrorCode{
     Other = 0,
     InvalidDataType = 9,
+    NoSpaceToAddListElement = 19,
     NoSpaceToWriteProperty = 20,
     ObjectDeletionNotPermitted = 23,
     ReadAccessDenied = 27,
