@@ -24,7 +24,7 @@ use super::{
         answer, decode_bacnet_ip_frame, encode_response, wrap_bvlc_parts, RequestObserver,
         ServedRequest,
     },
-    Notifier, ServerDispatcher, ServerError,
+    DatagramSocket, Notifier, ServerDispatcher, ServerError,
 };
 
 const MAX_BACNET_IP_FRAME: usize = 65_535;
@@ -164,7 +164,7 @@ impl RouterDevices {
 /// real router. Clients find the devices through Who-Is-Router-To-Network and a
 /// Who-Is sent to each network, or through a global broadcast.
 pub struct VirtualRouter {
-    socket: UdpSocket,
+    socket: Arc<dyn DatagramSocket>,
     devices: RouterDevices,
     receive_buffer: Vec<u8>,
     observer: Option<RequestObserver>,
@@ -176,6 +176,12 @@ impl VirtualRouter {
     }
 
     pub fn from_socket(socket: UdpSocket, devices: RouterDevices) -> Self {
+        Self::over(Arc::new(socket), devices)
+    }
+
+    /// Route over a transport the application provides; see
+    /// [`BacnetIpServer::over`](super::BacnetIpServer::over).
+    pub fn over(socket: Arc<dyn DatagramSocket>, devices: RouterDevices) -> Self {
         Self {
             socket,
             devices,
@@ -201,14 +207,14 @@ impl VirtualRouter {
         Ok(self.socket.local_addr()?)
     }
 
-    pub fn socket(&self) -> &UdpSocket {
+    pub fn socket(&self) -> &Arc<dyn DatagramSocket> {
         &self.socket
     }
 
     /// A notifier on the router's socket. Give each device its own with
     /// [`Notifier::routed_from`].
     pub fn notifier(&self) -> Result<Notifier, ServerError> {
-        Notifier::new(&self.socket)
+        Notifier::over(Arc::clone(&self.socket))
     }
 
     /// Receive one datagram and send whatever it earns — one reply per device
@@ -222,7 +228,7 @@ impl VirtualRouter {
             self.observer.as_ref(),
         )?;
         for (frame, destination) in &replies {
-            self.socket.send_to(frame, destination)?;
+            self.socket.send_to(frame, *destination)?;
         }
         Ok(!replies.is_empty())
     }

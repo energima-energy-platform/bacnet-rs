@@ -14,7 +14,10 @@ use crate::{
     },
 };
 
-use super::{NotificationTarget, ObjectService, ServerDispatcher, ServerError, ServerResponse};
+use super::{
+    DatagramSocket, NotificationTarget, ObjectService, ServerDispatcher, ServerError,
+    ServerResponse,
+};
 
 #[cfg(feature = "async")]
 use tokio::task::JoinSet;
@@ -29,7 +32,7 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
 /// exactly one datagram, which lets applications integrate it into their own
 /// loop without creating a socket per object or remote device.
 pub struct BacnetIpServer {
-    socket: UdpSocket,
+    socket: Arc<dyn DatagramSocket>,
     dispatcher: ServerDispatcher,
     receive_buffer: Vec<u8>,
     observer: Option<RequestObserver>,
@@ -69,6 +72,13 @@ impl BacnetIpServer {
     /// Serve a dispatcher built elsewhere, so the application can own the
     /// device's object service whether one server or a router fronts it.
     pub fn from_dispatcher(socket: UdpSocket, dispatcher: ServerDispatcher) -> Self {
+        Self::over(Arc::new(socket), dispatcher)
+    }
+
+    /// Serve over a transport the application provides rather than a socket
+    /// of the server's own. A [`notifier`](Self::notifier) sends through the
+    /// same one.
+    pub fn over(socket: Arc<dyn DatagramSocket>, dispatcher: ServerDispatcher) -> Self {
         Self {
             socket,
             dispatcher,
@@ -97,7 +107,7 @@ impl BacnetIpServer {
         Ok(self.socket.local_addr()?)
     }
 
-    pub fn socket(&self) -> &UdpSocket {
+    pub fn socket(&self) -> &Arc<dyn DatagramSocket> {
         &self.socket
     }
 
@@ -115,7 +125,7 @@ impl BacnetIpServer {
     /// bound to; use [`Notifier::with_broadcast_address`] to direct them at a
     /// subnet instead.
     pub fn notifier(&self) -> Result<Notifier, ServerError> {
-        Notifier::new(&self.socket)
+        Notifier::over(Arc::clone(&self.socket))
     }
 
     /// Receive and process one UDP datagram.
@@ -424,7 +434,7 @@ pub(super) fn decode_bacnet_ip_frame(data: &[u8]) -> Option<(Npdu, &[u8], Option
 /// its own handle on the server's socket so it can transmit while the loop is
 /// blocked in `recv_from`.
 pub struct Notifier {
-    socket: Arc<UdpSocket>,
+    socket: Arc<dyn DatagramSocket>,
     broadcast_address: SocketAddr,
     source: Option<NetworkAddress>,
     invoke_id: std::sync::atomic::AtomicU8,
@@ -434,13 +444,18 @@ impl Notifier {
     /// A notifier sending from `socket`, which it shares with whatever serves
     /// on it.
     pub fn new(socket: &UdpSocket) -> Result<Self, ServerError> {
-        let socket = socket.try_clone()?;
+        Self::over(Arc::new(socket.try_clone()?))
+    }
+
+    /// A notifier sending through `socket`, typically the one a server was
+    /// built [`over`](BacnetIpServer::over).
+    pub fn over(socket: Arc<dyn DatagramSocket>) -> Result<Self, ServerError> {
         // A broadcast recipient needs this; a device that never has one is
         // unaffected by it being set.
         socket.set_broadcast(true)?;
         let port = socket.local_addr()?.port();
         Ok(Self {
-            socket: Arc::new(socket),
+            socket,
             broadcast_address: SocketAddr::from((Ipv4Addr::BROADCAST, port)),
             source: None,
             invoke_id: std::sync::atomic::AtomicU8::new(1),
@@ -660,6 +675,74 @@ mod tests {
         let header = BvlcHeader::decode(&frame[..length]).expect("decode BVLC");
 
         assert_eq!(header.function, BvlcFunction::OriginalBroadcastNpdu);
+    }
+
+    /// A socket that counts what goes out through it.
+    struct Counting {
+        socket: UdpSocket,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DatagramSocket for Counting {
+        fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            self.socket.recv_from(buffer)
+        }
+
+        fn send_to(&self, frame: &[u8], destination: SocketAddr) -> std::io::Result<usize> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.socket.send_to(frame, destination)
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.socket.local_addr()
+        }
+    }
+
+    #[test]
+    fn replies_and_notifications_go_through_the_socket_the_server_is_given() {
+        let database = Arc::new(ObjectDatabase::new(Device::new(1234, "Test".to_string())));
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let address = socket.local_addr().unwrap();
+        let counting = Arc::new(Counting {
+            socket,
+            sent: Default::default(),
+        });
+        let mut server = BacnetIpServer::over(
+            Arc::clone(&counting) as Arc<dyn DatagramSocket>,
+            ServerDispatcher::new(ObjectService::new(database)),
+        );
+        let notifier = server.notifier().unwrap();
+
+        let serving = thread::spawn(move || assert!(server.serve_once().unwrap()));
+        let client = BacnetClient::builder()
+            .local_addr("127.0.0.1")
+            .port(0)
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        assert_eq!(client.discover_device(address).unwrap().device_id, 1234);
+        serving.join().unwrap();
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let notification = CovNotification {
+            subscriber_process_identifier: 0,
+            initiating_device: ObjectIdentifier::new(ObjectType::Device, 1234),
+            monitored_object: ObjectIdentifier::new(ObjectType::Device, 1234),
+            time_remaining: 0,
+            list_of_values: Vec::new(),
+        };
+        notifier
+            .send_cov_notification(
+                NotificationTarget::Unicast(receiver.local_addr().unwrap()),
+                &notification,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(counting.sent.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
