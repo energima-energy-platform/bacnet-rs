@@ -132,6 +132,13 @@ impl Transactions {
         });
     }
 
+    /// Forget a request that never went out.
+    pub(super) fn withdraw(&self, destination: SocketAddr, invoke_id: u8) {
+        self.table()
+            .pending
+            .retain(|pending| pending.destination != destination || pending.invoke_id != invoke_id);
+    }
+
     /// A reply from `source` to `invoke_id`.
     ///
     /// Matched by peer and invoke id, which is what identifies a transaction
