@@ -14,6 +14,7 @@ mod dispatcher;
 mod error;
 mod object_service;
 mod router;
+mod socket;
 
 pub use address_cache::{AddressCache, NotificationTarget};
 #[cfg(feature = "async")]
@@ -23,3 +24,4 @@ pub use dispatcher::{ServerDispatcher, ServerResponse};
 pub use error::ServerError;
 pub use object_service::ObjectService;
 pub use router::{RouterDevices, VirtualRouter};
+pub use socket::DatagramSocket;
