@@ -126,33 +126,14 @@ impl ServerDispatcher {
                 enforce_max_apdu(invoke_id, response, limit, segmented_response_accepted)
             }
             // Replies to what this device sent, not requests of it.
-            Apdu::SimpleAck {
-                invoke_id,
-                service_choice,
-            } => {
-                self.answered(
-                    source,
-                    invoke_id,
-                    Some(service_choice),
-                    Outcome::Acknowledged,
-                );
+            Apdu::SimpleAck { invoke_id, .. } => {
+                self.answered(source, invoke_id, Outcome::Acknowledged);
                 return Ok(None);
             }
-            Apdu::Error {
-                invoke_id,
-                service_choice,
-                ..
-            } => {
-                self.answered(
-                    source,
-                    invoke_id,
-                    Some(service_choice as u8),
-                    Outcome::Refused,
-                );
-                return Ok(None);
-            }
-            Apdu::Reject { invoke_id, .. } | Apdu::Abort { invoke_id, .. } => {
-                self.answered(source, invoke_id, None, Outcome::Refused);
+            Apdu::Error { invoke_id, .. }
+            | Apdu::Reject { invoke_id, .. }
+            | Apdu::Abort { invoke_id, .. } => {
+                self.answered(source, invoke_id, Outcome::Refused);
                 return Ok(None);
             }
             _ => return Ok(None),
@@ -170,17 +151,11 @@ impl ServerDispatcher {
         }))
     }
 
-    fn answered(
-        &self,
-        source: Option<std::net::SocketAddr>,
-        invoke_id: u8,
-        service: Option<u8>,
-        outcome: Outcome,
-    ) {
+    fn answered(&self, source: Option<std::net::SocketAddr>, invoke_id: u8, outcome: Outcome) {
         if let Some(source) = source {
             self.objects
                 .transactions()
-                .answer(source, invoke_id, service, outcome);
+                .answer(source, invoke_id, outcome);
         }
     }
 
