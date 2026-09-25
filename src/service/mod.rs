@@ -1004,7 +1004,7 @@ fn find_constructed_value_end(
 /// Every complex form falls back to the generic reader, so a device that encodes
 /// one differently than expected still yields whatever does parse instead of
 /// failing the whole read.
-fn decode_values_for(
+pub(crate) fn decode_values_for(
     property: PropertyIdentifier,
     encoded: &[u8],
 ) -> EncodingResult<Vec<PropertyValue>> {
