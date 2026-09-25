@@ -91,6 +91,20 @@ impl Transactions {
         self.table().pending.len()
     }
 
+    /// The service of the request `invoke_id` is waiting on an answer from
+    /// `destination`, if one is.
+    pub fn pending_service(
+        &self,
+        destination: SocketAddr,
+        invoke_id: u8,
+    ) -> Option<ConfirmedServiceChoice> {
+        self.table()
+            .pending
+            .iter()
+            .find(|pending| pending.destination == destination && pending.invoke_id == invoke_id)
+            .map(|pending| pending.service)
+    }
+
     /// Whether an invoke id is waiting on an answer from `destination`, so the
     /// notifier can pick another.
     pub(super) fn in_flight(&self, destination: SocketAddr, invoke_id: u8) -> bool {
@@ -118,25 +132,19 @@ impl Transactions {
         });
     }
 
-    /// A reply from `source` to `invoke_id`. `service` is the service choice a
-    /// SimpleACK or Error names; a Reject or Abort names none.
+    /// A reply from `source` to `invoke_id`.
     ///
-    /// A SimpleACK naming another service does not answer the request: it is
-    /// not the acknowledgement the service earns, so the request stays
-    /// outstanding and is sent again.
-    pub(super) fn answer(
-        &self,
-        source: SocketAddr,
-        invoke_id: u8,
-        service: Option<u8>,
-        outcome: Outcome,
-    ) {
+    /// Matched by peer and invoke id, which is what identifies a transaction
+    /// (135-2020 5.4). A reply naming another service than the request's still
+    /// ends it: a peer that gets the service choice wrong has answered all the
+    /// same, and sending again would only repeat what it already has.
+    pub(super) fn answer(&self, source: SocketAddr, invoke_id: u8, outcome: Outcome) {
         let mut table = self.table();
-        let Some(index) = table.pending.iter().position(|pending| {
-            pending.destination == source
-                && pending.invoke_id == invoke_id
-                && service.is_none_or(|service| service == pending.service as u8)
-        }) else {
+        let Some(index) = table
+            .pending
+            .iter()
+            .position(|pending| pending.destination == source && pending.invoke_id == invoke_id)
+        else {
             return;
         };
         let pending = table.pending.remove(index);
@@ -311,10 +319,10 @@ mod tests {
         );
     }
 
-    /// The Go-IoT gateway bug: a SimpleACK naming another service is not an
-    /// acknowledgement, so the request goes out again.
+    /// The Go-IoT gateway's bug: a SimpleACK naming another service still
+    /// answers the request, so a sloppy peer does not bring on a retry storm.
     #[test]
-    fn an_acknowledgement_for_another_service_is_not_one() {
+    fn an_acknowledgement_naming_another_service_still_ends_it() {
         let (notifier, dispatcher, peer) = device();
         let invoke_id = notify(&notifier, &peer);
 
@@ -329,7 +337,7 @@ mod tests {
 
         assert_eq!(
             outcomes(&notifier, Instant::now() + Duration::from_millis(60)),
-            [Outcome::Retried { attempt: 1 }]
+            [Outcome::Acknowledged]
         );
     }
 }
