@@ -1143,7 +1143,7 @@ pub use reliability::Reliability;
 pub use schedule::{Schedule, ScheduleCapacity};
 
 #[cfg(feature = "std")]
-pub use database::{DatabaseBuilder, DatabaseStatistics, ObjectDatabase};
+pub use database::{DatabaseBuilder, DatabaseStatistics, DeviceClock, ObjectDatabase};
 
 use crate::EncodingError;
 
