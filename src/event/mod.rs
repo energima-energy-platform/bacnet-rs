@@ -37,6 +37,14 @@ pub struct AddressedNotification {
     pub destination: DestinationValue,
 }
 
+/// An alarm an operator has acknowledged, waiting to be announced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acknowledgement {
+    pub object: ObjectIdentifier,
+    /// The state whose transition was acknowledged.
+    pub state: EventState,
+}
+
 /// A transition whose condition is waiting out its dwell time.
 #[derive(Debug, Clone, Copy)]
 struct Pending {
@@ -89,6 +97,58 @@ impl EventEngine {
         }
 
         notifications
+    }
+
+    /// The ACK_NOTIFICATIONs an acknowledgement owes, one per recipient of the
+    /// acknowledged transition, stamped `timestamp`.
+    pub fn acknowledged(
+        &self,
+        database: &ObjectDatabase,
+        acknowledgement: Acknowledgement,
+        timestamp: TimestampValue,
+    ) -> Vec<AddressedNotification> {
+        let Some((notification_class, trigger, out_of_service)) = database
+            .with_object(acknowledgement.object, |object| {
+                Some((
+                    object.intrinsic()?.notification_class,
+                    object.evaluate_alarm()?.trigger,
+                    object.is_out_of_service(),
+                ))
+            })
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let transition = EventTransition::for_state(acknowledgement.state);
+        let (priority, _) = notification_class_settings(database, notification_class, transition);
+        let base = EventNotification {
+            process_identifier: 0,
+            initiating_device: self.device,
+            event_object: acknowledgement.object,
+            timestamp,
+            notification_class,
+            priority,
+            notify_type: crate::object::intrinsic::NotifyType::AckNotification,
+            ack_required: false,
+            from_state: acknowledgement.state,
+            to_state: acknowledgement.state,
+            message_text: None,
+            // Only its event type goes out; the values are omitted.
+            parameters: parameters_for(
+                trigger,
+                StatusFlags::for_event_state(acknowledgement.state, out_of_service),
+            ),
+        };
+        notification_class_recipients(database, notification_class, transition)
+            .into_iter()
+            .map(|destination| AddressedNotification {
+                notification: EventNotification {
+                    process_identifier: destination.process_identifier,
+                    ..base.clone()
+                },
+                destination,
+            })
+            .collect()
     }
 
     /// Evaluate one object, committing a transition if its dwell has elapsed.
@@ -946,5 +1006,57 @@ mod tests {
             notifications[0].destination.issue_confirmed_notifications,
             "the caller needs this to pick the confirmed service"
         );
+    }
+
+    #[test]
+    fn an_acknowledgement_must_name_the_transition_it_acknowledges() {
+        use crate::server::ObjectService;
+        use crate::service::acknowledge_alarm::AcknowledgeAlarmRequest;
+
+        let database = database();
+        database
+            .add_object(Box::new(
+                MultiStateValue::new(1, "Mode".to_string(), 5)
+                    .with_intrinsic_reporting(NC, vec![5]),
+            ))
+            .unwrap();
+        let object = ObjectIdentifier::new(ObjectType::MultiStateValue, 1);
+        let mut engine = EventEngine::new(1234);
+        database
+            .set_property(
+                object,
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Unsigned(5),
+            )
+            .unwrap();
+        let raised_at = TimestampValue::SequenceNumber(42);
+        assert_eq!(engine.tick(&database, 1, raised_at.clone()).len(), 1);
+        let service = ObjectService::new(Arc::clone(&database));
+
+        let acknowledge = |time_stamp| AcknowledgeAlarmRequest {
+            acknowledging_process_identifier: 777,
+            event_object_identifier: object,
+            event_state_acknowledged: EventState::Offnormal,
+            time_stamp,
+            acknowledgment_source: "operator".to_string(),
+            time_of_acknowledgment: TimestampValue::SequenceNumber(50),
+        };
+        assert!(matches!(
+            service.acknowledge_alarm(&acknowledge(TimestampValue::SequenceNumber(41))),
+            Err(crate::object::ObjectError::InvalidTimeStamp)
+        ));
+        service.acknowledge_alarm(&acknowledge(raised_at)).unwrap();
+
+        let acknowledgements = service.take_acknowledgements();
+        assert_eq!(acknowledgements.len(), 1);
+        let announced = engine.acknowledged(&database, acknowledgements[0], stamp());
+        assert_eq!(announced.len(), 1, "one per recipient");
+        let notification = &announced[0].notification;
+        assert_eq!(
+            notification.notify_type,
+            crate::object::intrinsic::NotifyType::AckNotification
+        );
+        assert_eq!(notification.to_state, EventState::Offnormal);
+        assert_eq!(notification.process_identifier, 777);
     }
 }

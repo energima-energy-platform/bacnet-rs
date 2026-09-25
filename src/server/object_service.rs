@@ -23,6 +23,7 @@ pub struct ObjectService {
     addresses: super::AddressCache,
     subscriptions: crate::cov::CovSubscriptions,
     transactions: super::Transactions,
+    acknowledgements: Arc<std::sync::Mutex<Vec<crate::event::Acknowledgement>>>,
 }
 
 /// Decode the value carried by a WriteProperty request.
@@ -74,7 +75,55 @@ impl ObjectService {
             database,
             addresses: super::AddressCache::new(),
             subscriptions: crate::cov::CovSubscriptions::new(),
+            acknowledgements: Arc::default(),
         }
+    }
+
+    /// Acknowledge an alarm, as 135-2020 13.5.1.3 has it.
+    ///
+    /// The time stamp must be the one recorded for the transition into the
+    /// acknowledged state; anything else, including an object with no
+    /// transitions to match, is INVALID_TIME_STAMP. The acknowledgement is
+    /// queued for [`take_acknowledgements`](Self::take_acknowledgements), since
+    /// telling the recipients needs a clock and a socket this does not have.
+    pub fn acknowledge_alarm(
+        &self,
+        request: &crate::service::acknowledge_alarm::AcknowledgeAlarmRequest,
+    ) -> Result<(), ObjectError> {
+        let transition =
+            crate::object::intrinsic::EventTransition::for_state(request.event_state_acknowledged);
+        self.database
+            .with_object_mut(request.event_object_identifier, |object| {
+                let reporting = object
+                    .intrinsic_mut()
+                    .ok_or(ObjectError::InvalidTimeStamp)?;
+                if reporting.event_time_stamps[transition.bit_index()] != request.time_stamp {
+                    return Err(ObjectError::InvalidTimeStamp);
+                }
+                reporting.acked_transitions.set(transition, true);
+                Ok(())
+            })
+            .ok_or(ObjectError::NotFound)??;
+        self.acknowledgements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(crate::event::Acknowledgement {
+                object: request.event_object_identifier,
+                state: request.event_state_acknowledged,
+            });
+        Ok(())
+    }
+
+    /// Acknowledgements received since the last call, for
+    /// [`EventEngine::acknowledged`](crate::event::EventEngine::acknowledged)
+    /// to turn into ACK_NOTIFICATIONs.
+    pub fn take_acknowledgements(&self) -> Vec<crate::event::Acknowledgement> {
+        std::mem::take(
+            &mut *self
+                .acknowledgements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// The confirmed requests this device has sent and not yet had answered.
@@ -553,6 +602,7 @@ impl ObjectService {
 /// object advertises.
 fn services_supported_bit(service: ConfirmedServiceChoice) -> Option<usize> {
     match service {
+        ConfirmedServiceChoice::AcknowledgeAlarm => Some(0),
         ConfirmedServiceChoice::SubscribeCOV => Some(5),
         ConfirmedServiceChoice::ReadProperty => Some(12),
         ConfirmedServiceChoice::ReadPropertyMultiple => Some(14),
@@ -574,6 +624,7 @@ pub(crate) fn object_error_codes(error: &ObjectError) -> (u32, u32) {
         ObjectError::OptionalFunctionalityNotSupported => (2, 45),
         ObjectError::NoSpaceToAddListElement => (3, 19),
         ObjectError::NoSpaceToWriteProperty => (3, 20),
+        ObjectError::InvalidTimeStamp => (5, 14),
         ObjectError::TypeNotSupported | ObjectError::InvalidConfiguration(_) => (1, 0),
     }
 }

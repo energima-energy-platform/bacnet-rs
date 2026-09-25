@@ -160,6 +160,8 @@
 //! and provides a consistent programming interface regardless of the underlying
 //! communication technology.
 
+/// The AcknowledgeAlarm service
+pub mod acknowledge_alarm;
 /// ConfirmedEventNotification and UnconfirmedEventNotification services
 pub mod cov_notification;
 /// ConfirmedEventNotification and UnconfirmedEventNotification services
@@ -427,6 +429,7 @@ generate_custom_enum!(
     ErrorCode{
     Other = 0,
     InvalidDataType = 9,
+    InvalidTimeStamp = 14,
     NoSpaceToAddListElement = 19,
     NoSpaceToWriteProperty = 20,
     ObjectDeletionNotPermitted = 23,
