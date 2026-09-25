@@ -922,6 +922,44 @@ mod list_write_tests {
             );
         }
     }
+
+    /// What real devices hold, read back exactly: a weekday on a wildcard
+    /// date, a range open at both ends, a NULL time-value, and the priority 0
+    /// some leave in an unused slot.
+    #[test]
+    fn odd_but_legal_schedule_values_survive_the_wire() {
+        let values = [
+            (
+                PropertyIdentifier::EffectivePeriod,
+                PropertyValue::DateRange(DateRangeValue {
+                    start: (255, 255, 255, 255),
+                    end: (255, 255, 255, 2),
+                }),
+            ),
+            (
+                PropertyIdentifier::ExceptionSchedule,
+                PropertyValue::SpecialEvent(SpecialEventValue {
+                    period: SpecialEventPeriod::CalendarEntry(CalendarEntryValue::Date(
+                        255, 5, 17, 5,
+                    )),
+                    time_values: vec![TimeValueValue {
+                        time: (0, 0, 0, 0),
+                        value: Box::new(PropertyValue::Null),
+                    }],
+                    priority: 0,
+                }),
+            ),
+        ];
+        for (property, value) in values {
+            let mut encoded = Vec::new();
+            encode_property_value(&value, &mut encoded).unwrap();
+            assert_eq!(
+                crate::service::decode_values_for(property, &encoded).unwrap(),
+                vec![value],
+                "{property:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
