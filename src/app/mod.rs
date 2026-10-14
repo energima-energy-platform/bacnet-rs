@@ -52,8 +52,12 @@ use alloc::{string::String, vec::Vec};
 #[cfg(not(feature = "std"))]
 use core::time::Duration;
 
-use crate::encoding::{decode_enumerated, encode_enumerated};
+use crate::encoding::{
+    decode_closing_tag, decode_enumerated, decode_opening_tag, encode_closing_tag,
+    encode_enumerated, encode_opening_tag, is_opening_tag,
+};
 use crate::object::Segmentation;
+use crate::property::ObjectPropertyReference;
 use crate::service::{AbortReason, ConfirmedServiceChoice, RejectReason, UnconfirmedServiceChoice};
 
 /// Result type for application layer operations
@@ -165,6 +169,9 @@ pub enum Apdu {
         service_choice: ConfirmedServiceChoice,
         error_class: u32,
         error_code: u32,
+        /// WritePropertyMultiple-Error's firstFailedWriteAttempt: the writes
+        /// before it were performed, those after it were not.
+        first_failed_write: Option<ObjectPropertyReference>,
     },
 
     /// Reject PDU
@@ -294,8 +301,19 @@ impl Apdu {
             Apdu::Error {
                 error_class,
                 error_code,
+                first_failed_write,
                 ..
-            } => 3 + encoded_enumerated_len(*error_class) + encoded_enumerated_len(*error_code),
+            } => {
+                // An extended error adds two pairs of one-octet tags.
+                let detail = first_failed_write.as_ref().map_or(0, |reference| {
+                    let mut encoded = Vec::new();
+                    let _ = reference.encode(&mut encoded);
+                    4 + encoded.len()
+                });
+                3 + encoded_enumerated_len(*error_class)
+                    + encoded_enumerated_len(*error_code)
+                    + detail
+            }
             Apdu::Reject { .. } | Apdu::Abort { .. } => 3,
         }
     }
@@ -447,6 +465,7 @@ impl Apdu {
                 service_choice,
                 error_class,
                 error_code,
+                first_failed_write,
             } => {
                 // PDU Type
                 buffer.push((ApduType::Error as u8) << 4);
@@ -454,8 +473,22 @@ impl Apdu {
                 buffer.push(*invoke_id);
                 // Service choice
                 buffer.push(*service_choice as u8);
-                encode_enumerated(&mut buffer, *error_class);
-                encode_enumerated(&mut buffer, *error_code);
+                match first_failed_write {
+                    // Tags 0 and 1 take one octet each, so these cannot fail.
+                    Some(reference) => {
+                        let _ = encode_opening_tag(&mut buffer, 0);
+                        encode_enumerated(&mut buffer, *error_class);
+                        encode_enumerated(&mut buffer, *error_code);
+                        let _ = encode_closing_tag(&mut buffer, 0);
+                        let _ = encode_opening_tag(&mut buffer, 1);
+                        let _ = reference.encode(&mut buffer);
+                        let _ = encode_closing_tag(&mut buffer, 1);
+                    }
+                    None => {
+                        encode_enumerated(&mut buffer, *error_class);
+                        encode_enumerated(&mut buffer, *error_code);
+                    }
+                }
             }
 
             Apdu::Reject {
@@ -734,18 +767,39 @@ impl Apdu {
                     ApplicationError::InvalidApdu("Unknown confirmed service choice".to_string())
                 })?;
                 pos += 1;
-                let (error_class, offset) = decode_enumerated(&data[pos..]).map_err(|_| {
-                    ApplicationError::InvalidApdu("Invalid error class".to_string())
-                })?;
+                let invalid = |what: &str| ApplicationError::InvalidApdu(format!("Invalid {what}"));
+                // Some services wrap the Error in [0] and add detail after it.
+                let extended = is_opening_tag(&data[pos..], 0);
+                if extended {
+                    pos += decode_opening_tag(&data[pos..], 0).map_err(|_| invalid("error"))?;
+                }
+                let (error_class, offset) =
+                    decode_enumerated(&data[pos..]).map_err(|_| invalid("error class"))?;
                 pos += offset;
-                let (error_code, _) = decode_enumerated(&data[pos..])
-                    .map_err(|_| ApplicationError::InvalidApdu("Invalid error code".to_string()))?;
+                let (error_code, offset) =
+                    decode_enumerated(&data[pos..]).map_err(|_| invalid("error code"))?;
+                pos += offset;
+                let mut first_failed_write = None;
+                if extended {
+                    pos += decode_closing_tag(&data[pos..], 0).map_err(|_| invalid("error"))?;
+                    if service_choice == ConfirmedServiceChoice::WritePropertyMultiple {
+                        pos += decode_opening_tag(&data[pos..], 1)
+                            .map_err(|_| invalid("first failed write"))?;
+                        let (reference, offset) = ObjectPropertyReference::decode(&data[pos..])
+                            .map_err(|_| invalid("first failed write"))?;
+                        pos += offset;
+                        decode_closing_tag(&data[pos..], 1)
+                            .map_err(|_| invalid("first failed write"))?;
+                        first_failed_write = Some(reference);
+                    }
+                }
 
                 Ok(Apdu::Error {
                     invoke_id,
                     service_choice,
                     error_class,
                     error_code,
+                    first_failed_write,
                 })
             }
 
@@ -1301,6 +1355,7 @@ impl ApplicationLayerHandler {
                 service_choice,
                 error_class,
                 error_code,
+                ..
             } => self.process_error(*invoke_id, *service_choice, *error_class, *error_code),
             Apdu::Reject {
                 invoke_id,
@@ -1355,6 +1410,7 @@ impl ApplicationLayerHandler {
                                 service_choice,
                                 error_class: 0, // Object
                                 error_code: 0,  // Unknown object
+                                first_failed_write: None,
                             }))
                         }
                     }
@@ -1817,6 +1873,7 @@ mod tests {
             service_choice: ConfirmedServiceChoice::ReadProperty,
             error_class: 300,
             error_code: 70_000,
+            first_failed_write: None,
         };
 
         let encoded = apdu.encode();
@@ -1829,6 +1886,39 @@ mod tests {
                 error_code: 70_000,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn a_write_property_multiple_error_names_the_write_that_failed() {
+        let reference = ObjectPropertyReference {
+            object_identifier: crate::object::ObjectIdentifier::new(
+                crate::object::ObjectType::Schedule,
+                1,
+            ),
+            property_identifier: crate::object::PropertyIdentifier::ExceptionSchedule,
+            array_index: Some(3),
+        };
+        let apdu = Apdu::Error {
+            invoke_id: 7,
+            service_choice: ConfirmedServiceChoice::WritePropertyMultiple,
+            error_class: 2,
+            error_code: 37,
+            first_failed_write: Some(reference.clone()),
+        };
+
+        let encoded = apdu.encode();
+
+        assert_eq!(encoded.len(), apdu.encoded_len());
+        assert_eq!(&encoded[3..5], &[0x0E, 0x91]);
+        assert!(matches!(
+            Apdu::decode(&encoded).unwrap(),
+            Apdu::Error {
+                error_class: 2,
+                error_code: 37,
+                first_failed_write: Some(decoded),
+                ..
+            } if decoded == reference
         ));
     }
 

@@ -271,6 +271,7 @@ fn read_property_surfaces_error_pdu() {
         service_choice: ConfirmedServiceChoice::ReadProperty,
         error_class: 1,
         error_code: 32,
+        first_failed_write: None,
     });
 
     let err = test_client()
@@ -424,6 +425,7 @@ fn object_list_does_not_hide_read_access_errors() {
             service_choice,
             error_class: 2,
             error_code: 27,
+            first_failed_write: None,
         }
     });
 
@@ -685,6 +687,7 @@ fn object_properties_surfaces_unsupported_rpm_without_rp_fallback() {
                         service_choice,
                         error_class: 2,
                         error_code: 32,
+                        first_failed_write: None,
                     }
                 } else {
                     let values = match request.property_identifier {

@@ -5,7 +5,7 @@ use crate::{
     service::{
         AbortReason, ConfirmedServiceChoice, ReadPropertyMultipleRequest, ReadPropertyRequest,
         RejectReason, SubscribeCovPropertyRequest, SubscribeCovRequest, UnconfirmedServiceChoice,
-        WhoIsRequest, WritePropertyRequest,
+        WhoIsRequest, WritePropertyMultipleRequest, WritePropertyRequest,
     },
 };
 
@@ -254,6 +254,27 @@ impl ServerDispatcher {
                     Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
                 }
             }
+            ConfirmedServiceChoice::WritePropertyMultiple => {
+                match WritePropertyMultipleRequest::decode(service_data) {
+                    Ok(request) => match self.objects.write_property_multiple(&request, source) {
+                        Ok(()) => Ok(Apdu::SimpleAck {
+                            invoke_id,
+                            service_choice: service_choice as u8,
+                        }),
+                        Err((error, first_failed)) => {
+                            let (error_class, error_code) = object_error_codes(&error);
+                            Ok(Apdu::Error {
+                                invoke_id,
+                                service_choice,
+                                error_class,
+                                error_code,
+                                first_failed_write: Some(first_failed),
+                            })
+                        }
+                    },
+                    Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
+                }
+            }
             _ => Ok(reject(invoke_id, RejectReason::UnrecognizedService)),
         }
     }
@@ -319,6 +340,7 @@ fn object_error_apdu(
         service_choice,
         error_class,
         error_code,
+        first_failed_write: None,
     }
 }
 

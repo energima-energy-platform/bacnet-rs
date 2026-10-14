@@ -4,17 +4,21 @@ use std::{sync::Arc, time::Duration};
 
 use bacnet_rs::{
     app::{Apdu, MaxApduSize},
-    client::{AsyncBacnetClient, BacnetTarget, ClientConfig, DiscoveredRouter},
+    client::{AsyncBacnetClient, BacnetTarget, ClientConfig, ClientError, DiscoveredRouter},
     network::{NetworkAddress, Npdu},
     object::{
         database::ObjectDatabase, AnalogValue, Device, ObjectIdentifier, ObjectType,
-        PropertyIdentifier, Segmentation,
+        PropertyIdentifier, Schedule, Segmentation,
     },
-    property::PropertyValue,
+    property::{
+        CalendarEntryValue, DailyScheduleValue, ObjectPropertyReference, PropertyValue,
+        SpecialEventPeriod, SpecialEventValue, TimeValueValue,
+    },
     server::AsyncBacnetIpServer,
     service::{
-        ConfirmedServiceChoice, IAmRequest, ReadPropertyRequest, ReadPropertyResponse,
-        UnconfirmedServiceChoice,
+        ConfirmedServiceChoice, IAmRequest, PropertyWrite, ReadPropertyRequest,
+        ReadPropertyResponse, UnconfirmedServiceChoice, WriteAccessSpecification,
+        WritePropertyMultipleRequest,
     },
 };
 use tokio::net::UdpSocket;
@@ -388,6 +392,99 @@ async fn hosted_server_supports_async_object_inspection_and_writes() {
             .unwrap(),
         vec![PropertyValue::Real(24.0)]
     );
+
+    shutdown.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
+}
+
+fn day_at(hour: u8, state: u32) -> PropertyValue {
+    PropertyValue::DailySchedule(DailyScheduleValue {
+        time_values: vec![TimeValueValue {
+            time: (hour, 0, 0, 0),
+            value: Box::new(PropertyValue::Enumerated(state)),
+        }],
+    })
+}
+
+fn christmas_at(priority: u32) -> PropertyValue {
+    PropertyValue::SpecialEvent(SpecialEventValue {
+        period: SpecialEventPeriod::CalendarEntry(CalendarEntryValue::Date(2026, 12, 24, 255)),
+        time_values: vec![],
+        priority,
+    })
+}
+
+#[tokio::test]
+async fn hosted_server_writes_schedules_by_element_and_several_at_once() {
+    let database = Arc::new(ObjectDatabase::new(Device::new(1234, "D".to_string())));
+    let schedule = ObjectIdentifier::new(ObjectType::Schedule, 1);
+    database
+        .add_object(Box::new(Schedule::new(1, "Schedule".to_string())))
+        .unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let server = AsyncBacnetIpServer::from_socket(socket, Arc::clone(&database));
+    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(server.run_until(async {
+        let _ = stopped.await;
+    }));
+    let client = test_client(Duration::from_secs(1), 0).await;
+    let write = |property, index, value: &PropertyValue| {
+        PropertyWrite::of(property, index, value, None).unwrap()
+    };
+    let week = PropertyValue::Array((0..7).map(|_| day_at(8, 1)).collect());
+
+    // The week lands; the exception after it is refused, and named.
+    let request = WritePropertyMultipleRequest::new(vec![WriteAccessSpecification::new(
+        schedule,
+        vec![
+            write(PropertyIdentifier::WeeklySchedule, None, &week),
+            write(
+                PropertyIdentifier::ExceptionSchedule,
+                None,
+                &PropertyValue::Array(vec![christmas_at(17)]),
+            ),
+        ],
+    )]);
+    let refused = client.write_property_multiple(address, &request).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(ClientError::WriteFailedAt { first_failed, .. }) if *first_failed
+                == ObjectPropertyReference {
+                    object_identifier: schedule,
+                    property_identifier: PropertyIdentifier::ExceptionSchedule,
+                    array_index: None,
+                }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        client
+            .read_property(address, schedule, PropertyIdentifier::WeeklySchedule)
+            .await
+            .unwrap(),
+        (0..7).map(|_| day_at(8, 1)).collect::<Vec<_>>()
+    );
+
+    // One day rewritten leaves the other six.
+    client
+        .write_property_at(
+            address,
+            schedule,
+            PropertyIdentifier::WeeklySchedule,
+            3,
+            &day_at(9, 2),
+            None,
+        )
+        .await
+        .unwrap();
+    let days = client
+        .read_property(address, schedule, PropertyIdentifier::WeeklySchedule)
+        .await
+        .unwrap();
+    assert_eq!(days[2], day_at(9, 2));
+    assert_eq!(days.iter().filter(|day| **day == day_at(8, 1)).count(), 6);
 
     shutdown.send(()).unwrap();
     server_task.await.unwrap().unwrap();
