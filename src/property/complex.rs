@@ -591,26 +591,9 @@ impl CovSubscriptionValue {
     }
 }
 
-pub(crate) fn decode_cov_subscriptions(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut subscriptions = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (subscription, length) = CovSubscriptionValue::decode(&data[consumed..])?;
-        if length == 0 {
-            return Err(EncodingError::InvalidLength);
-        }
-        consumed += length;
-        subscriptions.push(PropertyValue::CovSubscription(subscription));
-    }
-    Ok(subscriptions)
-}
-
-pub(crate) fn decode_address_bindings(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut bindings = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (device_identifier, length) = decode_property_value(&data[consumed..])?;
-        consumed += length;
+impl AddressBindingValue {
+    pub fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
+        let (device_identifier, mut consumed) = decode_property_value(data)?;
         let PropertyValue::ObjectIdentifier(device_identifier) = device_identifier else {
             return Err(EncodingError::InvalidFormat(
                 "address binding device is not an object identifier".into(),
@@ -631,97 +614,17 @@ pub(crate) fn decode_address_bindings(data: &[u8]) -> EncodingResult<Vec<Propert
                 "address binding MAC is not an octet string".into(),
             ));
         };
-        bindings.push(PropertyValue::AddressBinding(AddressBindingValue {
-            device_identifier,
-            address: BacnetAddress {
-                network,
-                mac_address,
+        Ok((
+            Self {
+                device_identifier,
+                address: BacnetAddress {
+                    network,
+                    mac_address,
+                },
             },
-        }));
+            consumed,
+        ))
     }
-    Ok(bindings)
-}
-
-pub(crate) fn decode_timestamps(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = TimestampValue::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::Timestamp(value));
-    }
-    Ok(values)
-}
-
-pub(crate) fn decode_destinations(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = DestinationValue::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::Destination(value));
-    }
-    Ok(values)
-}
-
-pub(crate) fn decode_weekly_schedule(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = DailyScheduleValue::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::DailySchedule(value));
-    }
-    Ok(values)
-}
-
-pub(crate) fn decode_date_list(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = CalendarEntryValue::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::CalendarEntry(value));
-    }
-    Ok(values)
-}
-
-pub(crate) fn decode_exception_schedule(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = SpecialEventValue::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::SpecialEvent(value));
-    }
-    Ok(values)
-}
-
-pub(crate) fn decode_date_range(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let (value, _) = DateRangeValue::decode(data)?;
-    Ok(vec![PropertyValue::DateRange(value)])
-}
-
-pub(crate) fn decode_value_sources(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = ValueSourceValue::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::ValueSource(value));
-    }
-    Ok(values)
-}
-
-pub(crate) fn decode_object_property_references(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
-    let mut values = Vec::new();
-    let mut consumed = 0;
-    while consumed < data.len() {
-        let (value, length) = ObjectPropertyReference::decode(&data[consumed..])?;
-        consumed += length;
-        values.push(PropertyValue::ObjectPropertyReference(value));
-    }
-    Ok(values)
 }
 
 fn encode_recipient_process(
@@ -999,6 +902,7 @@ fn context_tag_matches(data: &[u8], tag: u8, length: Option<usize>) -> bool {
 mod tests {
     use super::*;
     use crate::object::ObjectType;
+    use crate::property::datatype::Element;
 
     #[test]
     fn decodes_and_reencodes_real_active_cov_subscription() {
@@ -1086,7 +990,7 @@ mod tests {
             binding.encode(&mut encoded).unwrap();
         }
 
-        let decoded = decode_address_bindings(&encoded).unwrap();
+        let decoded = Element::AddressBinding.decode_all(&encoded).unwrap();
 
         assert_eq!(
             decoded,
@@ -1256,7 +1160,7 @@ mod tests {
         }
 
         assert_eq!(
-            decode_date_list(&encoded).unwrap(),
+            Element::CalendarEntry.decode_all(&encoded).unwrap(),
             list.into_iter()
                 .map(PropertyValue::CalendarEntry)
                 .collect::<Vec<_>>()
@@ -1336,7 +1240,7 @@ mod tests {
         }
 
         assert_eq!(
-            decode_exception_schedule(&encoded).unwrap(),
+            Element::SpecialEvent.decode_all(&encoded).unwrap(),
             events
                 .into_iter()
                 .map(PropertyValue::SpecialEvent)
@@ -1355,7 +1259,7 @@ mod tests {
         range.encode(&mut encoded).unwrap();
 
         assert_eq!(
-            decode_date_range(&encoded).unwrap(),
+            Element::DateRange.decode_all(&encoded).unwrap(),
             vec![PropertyValue::DateRange(range)]
         );
     }

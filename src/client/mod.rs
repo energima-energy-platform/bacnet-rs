@@ -40,7 +40,7 @@ use crate::{
     datalink::bip::BACNET_IP_PORT,
     network::{NetworkAddress, NetworkLayerMessage, NetworkMessageType, Npdu},
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier, Segmentation},
-    property::{encode_property_value, PropertyValue},
+    property::PropertyValue,
     service::{
         ConfirmedServiceChoice, IAmRequest, PropertyReference, PropertyResult, PropertyResultValue,
         ReadAccessSpecification, ReadPropertyMultipleRequest, ReadPropertyMultipleResponse,
@@ -577,14 +577,7 @@ impl BacnetClient {
         T: Into<BacnetTarget>,
     {
         let target = target.into();
-        let mut encoded_value = Vec::new();
-        encode_property_value(value, &mut encoded_value)?;
-
-        let property_id: u32 = property.into();
-        let request = match priority {
-            Some(p) => WritePropertyRequest::with_priority(object, property_id, encoded_value, p),
-            None => WritePropertyRequest::new(object, property_id, encoded_value),
-        };
+        let request = WritePropertyRequest::of(object, property, None, value, priority)?;
 
         let mut service_data = Vec::new();
         request.encode(&mut service_data)?;
@@ -999,11 +992,13 @@ impl BacnetClient {
                 invoke_id,
                 error_class,
                 error_code,
+                first_failed_write,
                 ..
-            } if invoke_id == expected_invoke_id => Err(ClientError::PropertyError {
-                class: error_class.into(),
-                code: error_code.into(),
-            }),
+            } if invoke_id == expected_invoke_id => Err(ClientError::refused(
+                error_class,
+                error_code,
+                first_failed_write,
+            )),
             Apdu::Reject {
                 invoke_id,
                 reject_reason,

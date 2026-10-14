@@ -26,12 +26,12 @@ use crate::{
     datalink::bip::BACNET_IP_PORT,
     network::{NetworkAddress, Npdu},
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier, Segmentation},
-    property::{encode_property_value, PropertyValue},
+    property::PropertyValue,
     service::{
         cov_notification::CovNotification, AbortReason, ConfirmedServiceChoice, PropertyReference,
         ReadAccessSpecification, ReadPropertyMultipleRequest, ReadPropertyMultipleResponse,
         ReadPropertyRequest, ReadPropertyResponse, RejectReason, SubscribeCovRequest,
-        UnconfirmedServiceChoice, WhoIsRequest, WritePropertyRequest,
+        UnconfirmedServiceChoice, WhoIsRequest, WritePropertyMultipleRequest, WritePropertyRequest,
     },
 };
 
@@ -458,18 +458,54 @@ impl AsyncBacnetClient {
     where
         T: Into<BacnetTarget>,
     {
-        let target = target.into();
-        let mut encoded_value = Vec::new();
-        encode_property_value(value, &mut encoded_value)?;
-        let request = match priority {
-            Some(priority) => WritePropertyRequest::with_priority(
-                object,
-                property.into(),
-                encoded_value,
-                priority,
-            ),
-            None => WritePropertyRequest::new(object, property.into(), encoded_value),
-        };
+        let request = WritePropertyRequest::of(object, property, None, value, priority)?;
+        self.write(target.into(), &request).await
+    }
+
+    /// Write one element of an array property and await its SimpleAck.
+    pub async fn write_property_at<T>(
+        &self,
+        target: T,
+        object: ObjectIdentifier,
+        property: PropertyIdentifier,
+        array_index: u32,
+        value: &PropertyValue,
+        priority: Option<u8>,
+    ) -> Result<(), ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let request =
+            WritePropertyRequest::of(object, property, Some(array_index), value, priority)?;
+        self.write(target.into(), &request).await
+    }
+
+    /// Execute one WritePropertyMultiple request. A write the device refuses
+    /// fails it with [`ClientError::WriteFailedAt`], naming that write.
+    pub async fn write_property_multiple<T>(
+        &self,
+        target: T,
+        request: &WritePropertyMultipleRequest,
+    ) -> Result<(), ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let mut service_data = Vec::new();
+        request.encode(&mut service_data)?;
+        self.send_confirmed_request(
+            &target.into(),
+            ConfirmedServiceChoice::WritePropertyMultiple,
+            service_data,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write(
+        &self,
+        target: BacnetTarget,
+        request: &WritePropertyRequest,
+    ) -> Result<(), ClientError> {
         let mut service_data = Vec::new();
         request.encode(&mut service_data)?;
         self.send_confirmed_request(&target, ConfirmedServiceChoice::WriteProperty, service_data)
@@ -1958,11 +1994,13 @@ fn response_result(apdu: Apdu) -> Result<Vec<u8>, ClientError> {
         Apdu::Error {
             error_class,
             error_code,
+            first_failed_write,
             ..
-        } => Err(ClientError::PropertyError {
-            class: error_class.into(),
-            code: error_code.into(),
-        }),
+        } => Err(ClientError::refused(
+            error_class,
+            error_code,
+            first_failed_write,
+        )),
         Apdu::Reject { reject_reason, .. } => Err(ClientError::Rejected(reject_reason)),
         Apdu::Abort { abort_reason, .. } => {
             Err(ClientError::Abort(AbortReason::from(abort_reason)))

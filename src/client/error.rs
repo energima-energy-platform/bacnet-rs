@@ -6,6 +6,7 @@
 //! rejects/aborts, per-property errors, etc.) instead of inspecting strings.
 
 use crate::encoding::EncodingError;
+use crate::property::ObjectPropertyReference;
 use crate::service::{AbortReason, ErrorClass, ErrorCode, RejectReason};
 use crate::util::describe_bacnet_error;
 use thiserror::Error;
@@ -67,7 +68,35 @@ pub enum ClientError {
         code: ErrorCode,
     },
 
+    /// A WritePropertyMultiple stopped at `first_failed`: the writes before it
+    /// were performed, it and those after it were not.
+    #[error("{} writing {first_failed:?}", describe_bacnet_error(*class, *code))]
+    WriteFailedAt {
+        class: ErrorClass,
+        code: ErrorCode,
+        first_failed: ObjectPropertyReference,
+    },
+
     /// A supplied address could not be parsed or resolved.
     #[error("invalid address: {0}")]
     AddressParse(String),
+}
+
+impl ClientError {
+    /// The error an Error PDU carries.
+    pub(crate) fn refused(
+        class: u32,
+        code: u32,
+        first_failed_write: Option<ObjectPropertyReference>,
+    ) -> Self {
+        let (class, code) = (class.into(), code.into());
+        match first_failed_write {
+            Some(first_failed) => ClientError::WriteFailedAt {
+                class,
+                code,
+                first_failed,
+            },
+            None => ClientError::PropertyError { class, code },
+        }
+    }
 }

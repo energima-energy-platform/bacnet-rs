@@ -26,6 +26,7 @@ use crate::{
 };
 
 pub mod complex;
+pub mod datatype;
 pub use complex::{
     AddressBindingValue, BacnetAddress, CalendarEntryValue, CovSubscriptionValue,
     DailyScheduleValue, DateRangeValue, DestinationValue, ObjectPropertyReference, Recipient,

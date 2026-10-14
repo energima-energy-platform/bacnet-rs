@@ -888,6 +888,25 @@ impl WritePropertyRequest {
         }
     }
 
+    /// A request writing `value`, encoded, at any index and priority.
+    pub fn of(
+        object_identifier: ObjectIdentifier,
+        property: PropertyIdentifier,
+        property_array_index: Option<u32>,
+        value: &PropertyValue,
+        priority: Option<u8>,
+    ) -> EncodingResult<Self> {
+        let mut property_value = Vec::new();
+        encode_property_value(value, &mut property_value)?;
+        Ok(Self {
+            object_identifier,
+            property_identifier: property.into(),
+            property_array_index,
+            property_value,
+            priority,
+        })
+    }
+
     /// Encode the Write Property request
     pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
         buffer.extend_from_slice(&encode_context_object_id(self.object_identifier, 0)?);
@@ -1011,54 +1030,13 @@ pub(crate) fn decode_values_for(
     property: PropertyIdentifier,
     encoded: &[u8],
 ) -> EncodingResult<Vec<PropertyValue>> {
-    let values = if property == PropertyIdentifier::ActiveCovSubscriptions {
-        crate::property::complex::decode_cov_subscriptions(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if property == PropertyIdentifier::DeviceAddressBinding {
-        crate::property::complex::decode_address_bindings(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if matches!(
-        property,
-        PropertyIdentifier::EventTimeStamps
-            | PropertyIdentifier::CommandTimeArray
-            | PropertyIdentifier::LastCommandTime
-    ) {
-        crate::property::complex::decode_timestamps(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if matches!(
-        property,
-        PropertyIdentifier::ListOfObjectPropertyReferences
-            | PropertyIdentifier::EventAlgorithmInhibitRef
-            | PropertyIdentifier::ObjectPropertyReference
-    ) {
-        crate::property::complex::decode_object_property_references(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if property == PropertyIdentifier::RecipientList {
-        crate::property::complex::decode_destinations(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if property == PropertyIdentifier::WeeklySchedule {
-        crate::property::complex::decode_weekly_schedule(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if property == PropertyIdentifier::DateList {
-        crate::property::complex::decode_date_list(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if property == PropertyIdentifier::ExceptionSchedule {
-        crate::property::complex::decode_exception_schedule(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if property == PropertyIdentifier::EffectivePeriod {
-        crate::property::complex::decode_date_range(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else if matches!(
-        property,
-        PropertyIdentifier::ValueSource | PropertyIdentifier::ValueSourceArray
-    ) {
-        crate::property::complex::decode_value_sources(encoded)
-            .or_else(|_| decode_property_result_values(encoded))?
-    } else {
-        decode_property_result_values(encoded)?
-    };
-
-    Ok(values)
+    match crate::property::datatype::datatype(property) {
+        Some(datatype) if datatype.element() != crate::property::datatype::Element::Any => datatype
+            .element()
+            .decode_all(encoded)
+            .or_else(|_| decode_property_result_values(encoded)),
+        _ => decode_property_result_values(encoded),
+    }
 }
 
 fn decode_property_result_values(data: &[u8]) -> EncodingResult<Vec<PropertyValue>> {
@@ -1104,6 +1082,192 @@ fn decode_property_result_values(data: &[u8]) -> EncodingResult<Vec<PropertyValu
     }
 
     Ok(values)
+}
+
+/// WritePropertyMultiple request (confirmed service).
+///
+/// The device performs the writes in order and stops at the first that fails,
+/// naming it in the error: those before it stand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WritePropertyMultipleRequest {
+    pub write_access_specifications: Vec<WriteAccessSpecification>,
+}
+
+/// The writes to one object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteAccessSpecification {
+    pub object_identifier: ObjectIdentifier,
+    pub list_of_properties: Vec<PropertyWrite>,
+}
+
+/// One write, a BACnetPropertyValue: the property, where in it, the encoded
+/// value and the priority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyWrite {
+    pub property_identifier: PropertyIdentifier,
+    pub property_array_index: Option<u32>,
+    pub value: Vec<u8>,
+    pub priority: Option<u8>,
+}
+
+impl WritePropertyMultipleRequest {
+    pub fn new(write_access_specifications: Vec<WriteAccessSpecification>) -> Self {
+        Self {
+            write_access_specifications,
+        }
+    }
+
+    pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
+        for specification in &self.write_access_specifications {
+            specification.encode(buffer)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode(data: &[u8]) -> EncodingResult<Self> {
+        let mut write_access_specifications = Vec::new();
+        let mut consumed = 0;
+        while consumed < data.len() {
+            let (specification, length) = WriteAccessSpecification::decode(&data[consumed..])?;
+            consumed += length;
+            write_access_specifications.push(specification);
+        }
+        if write_access_specifications.is_empty() {
+            return Err(EncodingError::InvalidLength);
+        }
+        Ok(Self {
+            write_access_specifications,
+        })
+    }
+
+    /// Each write as the WriteProperty that would make it, in order.
+    pub fn writes(&self) -> impl Iterator<Item = WritePropertyRequest> + '_ {
+        self.write_access_specifications
+            .iter()
+            .flat_map(|specification| {
+                specification
+                    .list_of_properties
+                    .iter()
+                    .map(|write| WritePropertyRequest {
+                        object_identifier: specification.object_identifier,
+                        property_identifier: write.property_identifier.into(),
+                        property_array_index: write.property_array_index,
+                        property_value: write.value.clone(),
+                        priority: write.priority,
+                    })
+            })
+    }
+}
+
+impl WriteAccessSpecification {
+    pub fn new(
+        object_identifier: ObjectIdentifier,
+        list_of_properties: Vec<PropertyWrite>,
+    ) -> Self {
+        Self {
+            object_identifier,
+            list_of_properties,
+        }
+    }
+
+    pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
+        buffer.extend_from_slice(&encode_context_object_id(self.object_identifier, 0)?);
+        encode_opening_tag(buffer, 1)?;
+        for write in &self.list_of_properties {
+            write.encode(buffer)?;
+        }
+        encode_closing_tag(buffer, 1)?;
+        Ok(())
+    }
+
+    fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
+        let (object_identifier, mut consumed) = decode_context_object_id(data, 0)?;
+        consumed += decode_opening_tag(&data[consumed..], 1)?;
+        let mut list_of_properties = Vec::new();
+        while !crate::encoding::is_closing_tag(&data[consumed..], 1) {
+            let (write, length) = PropertyWrite::decode(&data[consumed..])?;
+            consumed += length;
+            list_of_properties.push(write);
+        }
+        consumed += decode_closing_tag(&data[consumed..], 1)?;
+        if list_of_properties.is_empty() {
+            return Err(EncodingError::InvalidLength);
+        }
+        Ok((
+            Self {
+                object_identifier,
+                list_of_properties,
+            },
+            consumed,
+        ))
+    }
+}
+
+impl PropertyWrite {
+    /// A write of `value`, encoded.
+    pub fn of(
+        property_identifier: PropertyIdentifier,
+        property_array_index: Option<u32>,
+        value: &PropertyValue,
+        priority: Option<u8>,
+    ) -> EncodingResult<Self> {
+        let mut encoded = Vec::new();
+        encode_property_value(value, &mut encoded)?;
+        Ok(Self {
+            property_identifier,
+            property_array_index,
+            value: encoded,
+            priority,
+        })
+    }
+
+    pub fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
+        buffer.extend_from_slice(&encode_context_enumerated(
+            self.property_identifier.into(),
+            0,
+        )?);
+        if let Some(index) = self.property_array_index {
+            buffer.extend_from_slice(&encode_context_unsigned(index, 1)?);
+        }
+        encode_opening_tag(buffer, 2)?;
+        buffer.extend_from_slice(&self.value);
+        encode_closing_tag(buffer, 2)?;
+        if let Some(priority) = self.priority {
+            buffer.extend_from_slice(&encode_context_unsigned(priority.into(), 3)?);
+        }
+        Ok(())
+    }
+
+    fn decode(data: &[u8]) -> EncodingResult<(Self, usize)> {
+        let (property_identifier, mut consumed) = decode_context_enumerated(data, 0)?;
+        let property_array_index = if is_context_tag(&data[consumed..], 1) {
+            let (index, length) = decode_context_unsigned(&data[consumed..], 1)?;
+            consumed += length;
+            Some(index)
+        } else {
+            None
+        };
+        consumed += decode_opening_tag(&data[consumed..], 2)?;
+        let value_end = find_constructed_value_end(data, consumed, 2)?;
+        let value = data[consumed..value_end].to_vec();
+        consumed = value_end + decode_closing_tag(&data[value_end..], 2)?;
+        let priority = if is_context_tag(&data[consumed..], 3) {
+            let (priority, length) = decode_context_unsigned(&data[consumed..], 3)?;
+            consumed += length;
+            Some(u8::try_from(priority).map_err(|_| EncodingError::ValueOutOfRange)?)
+        } else {
+            None
+        };
+        Ok((
+            Self {
+                property_identifier: property_identifier.into(),
+                property_array_index,
+                value,
+                priority,
+            },
+            consumed,
+        ))
+    }
 }
 
 /// Read Property Multiple request (confirmed service)
@@ -2429,6 +2593,43 @@ impl UtcTimeSynchronizationRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_property_multiple_request_round_trips() {
+        let schedule = ObjectIdentifier::new(ObjectType::Schedule, 4);
+        let request = WritePropertyMultipleRequest::new(vec![WriteAccessSpecification::new(
+            schedule,
+            vec![
+                PropertyWrite::of(
+                    PropertyIdentifier::ScheduleDefault,
+                    None,
+                    &PropertyValue::Enumerated(0),
+                    None,
+                )
+                .unwrap(),
+                PropertyWrite::of(
+                    PropertyIdentifier::WeeklySchedule,
+                    Some(2),
+                    &PropertyValue::DailySchedule(crate::property::DailyScheduleValue {
+                        time_values: vec![],
+                    }),
+                    Some(9),
+                )
+                .unwrap(),
+            ],
+        )]);
+        let mut encoded = Vec::new();
+        request.encode(&mut encoded).unwrap();
+
+        assert_eq!(
+            WritePropertyMultipleRequest::decode(&encoded).unwrap(),
+            request
+        );
+        let writes: Vec<_> = request.writes().collect();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].property_array_index, Some(2));
+        assert_eq!(writes[1].priority, Some(9));
+    }
     use crate::object::{ObjectIdentifier, ObjectType};
     use crate::property::{
         BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient, RecipientProcess,

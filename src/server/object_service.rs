@@ -6,13 +6,14 @@ use crate::{
         PropertyValue, Segmentation,
     },
     property::{
-        BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient, RecipientProcess,
+        datatype::Element, BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient,
+        RecipientProcess,
     },
     service::{
         ConfirmedServiceChoice, IAmRequest, PropertyReference, PropertyResult, ReadAccessResult,
         ReadPropertyMultipleRequest, ReadPropertyMultipleResponse, ReadPropertyRequest,
         ReadPropertyResponse, SubscribeCovPropertyRequest, SubscribeCovRequest,
-        WritePropertyRequest,
+        WritePropertyMultipleRequest, WritePropertyRequest,
     },
 };
 
@@ -30,37 +31,27 @@ pub struct ObjectService {
 ///
 /// Application tags alone cannot describe BACnet's constructed datatypes: a
 /// `BACnetDestination` is a context-tagged sequence, and `Recipient_List` is a
-/// list of them. The property identifier is what tells a device how to read
-/// those, so they need decoding before the generic tag-driven path, which would
-/// otherwise reject them as an invalid data type.
+/// list of them. The property's datatype is what tells a device how to read
+/// those, and whether a run of values is an array, a list, or one value.
 fn decode_written_value(
     property: PropertyIdentifier,
     encoded: &[u8],
 ) -> Result<PropertyValue, ObjectError> {
-    // A list is written whole, as a run of its elements, and a list of one is
-    // indistinguishable from a scalar: only the property says which it is. An
-    // empty payload clears the list, which is how a recipient deregisters.
-    if matches!(
-        property,
-        PropertyIdentifier::RecipientList
-            | PropertyIdentifier::DateList
-            | PropertyIdentifier::ExceptionSchedule
-            | PropertyIdentifier::WeeklySchedule
-            | PropertyIdentifier::ListOfObjectPropertyReferences
-    ) {
-        return crate::service::decode_values_for(property, encoded)
-            .map(PropertyValue::List)
-            .map_err(|_| ObjectError::InvalidPropertyType);
+    match crate::property::datatype::datatype(property) {
+        // An empty payload clears a list or array, which is how a recipient
+        // deregisters.
+        Some(datatype) => crate::service::decode_values_for(property, encoded)
+            .ok()
+            .and_then(|values| datatype.collect(values))
+            .ok_or(ObjectError::InvalidPropertyType),
+        None => decode_one(Element::Any, encoded),
     }
-    // One value, but a constructed one the application tags do not describe.
-    if property == PropertyIdentifier::EffectivePeriod {
-        return match crate::service::decode_values_for(property, encoded).as_deref() {
-            Ok([period]) => Ok(period.clone()),
-            _ => Err(ObjectError::InvalidPropertyType),
-        };
-    }
+}
 
-    let (value, consumed) = crate::property::decode_property_value(encoded)
+/// Decode a value that must fill `encoded` exactly.
+fn decode_one(element: Element, encoded: &[u8]) -> Result<PropertyValue, ObjectError> {
+    let (value, consumed) = element
+        .decode(encoded)
         .map_err(|_| ObjectError::InvalidPropertyType)?;
     if consumed != encoded.len() {
         return Err(ObjectError::InvalidPropertyType);
@@ -507,21 +498,11 @@ impl ObjectService {
         request: &WritePropertyRequest,
         source: Option<SocketAddr>,
     ) -> Result<(), ObjectError> {
-        if let Some(index) = request.property_array_index {
-            match self.database.get_property(
-                request.object_identifier,
-                request.property_identifier.into(),
-            )? {
-                PropertyValue::Array(values) if index == 0 || (index as usize) <= values.len() => {
-                    return Err(ObjectError::OptionalFunctionalityNotSupported)
-                }
-                PropertyValue::Array(_) => return Err(ObjectError::InvalidArrayIndex),
-                _ => return Err(ObjectError::PropertyIsNotArray),
-            }
-        }
-
         let property: PropertyIdentifier = request.property_identifier.into();
-        let value = decode_written_value(property, &request.property_value)?;
+        let value = match request.property_array_index {
+            Some(index) => self.write_element(request, property, index)?,
+            None => decode_written_value(property, &request.property_value)?,
+        };
 
         // A recipient registering itself tells us where it is: bind the devices it
         // names to the address the request came from.
@@ -543,6 +524,54 @@ impl ObjectService {
             value,
             request.priority,
         )
+    }
+
+    /// The whole array `property` becomes once element `index` is written.
+    fn write_element(
+        &self,
+        request: &WritePropertyRequest,
+        property: PropertyIdentifier,
+        index: u32,
+    ) -> Result<PropertyValue, ObjectError> {
+        let PropertyValue::Array(mut values) = self
+            .database
+            .get_property(request.object_identifier, property)?
+        else {
+            return Err(ObjectError::PropertyIsNotArray);
+        };
+        // Element 0 is the length, and no array here can be resized.
+        if index == 0 {
+            return Err(ObjectError::WriteAccessDenied);
+        }
+        let slot = values
+            .get_mut(index as usize - 1)
+            .ok_or(ObjectError::InvalidArrayIndex)?;
+        let element = crate::property::datatype::datatype(property)
+            .map_or(Element::Any, |datatype| datatype.element());
+        *slot = decode_one(element, &request.property_value)?;
+        Ok(PropertyValue::Array(values))
+    }
+
+    /// Perform the writes in order, stopping at the first that fails: that one
+    /// is returned with the reason, and those before it stand.
+    pub fn write_property_multiple(
+        &self,
+        request: &WritePropertyMultipleRequest,
+        source: Option<SocketAddr>,
+    ) -> Result<(), (ObjectError, ObjectPropertyReference)> {
+        for write in request.writes() {
+            self.write_property(&write, source).map_err(|error| {
+                (
+                    error,
+                    ObjectPropertyReference {
+                        object_identifier: write.object_identifier,
+                        property_identifier: write.property_identifier.into(),
+                        array_index: write.property_array_index,
+                    },
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// The largest APDU this device sends or receives, from its Device object.
@@ -615,6 +644,7 @@ fn services_supported_bit(service: ConfirmedServiceChoice) -> Option<usize> {
         ConfirmedServiceChoice::ReadProperty => Some(12),
         ConfirmedServiceChoice::ReadPropertyMultiple => Some(14),
         ConfirmedServiceChoice::WriteProperty => Some(15),
+        ConfirmedServiceChoice::WritePropertyMultiple => Some(16),
         ConfirmedServiceChoice::SubscribeCOVProperty => Some(38),
         _ => None,
     }
@@ -835,20 +865,22 @@ mod tests {
             Err(ObjectError::PropertyIsNotArray)
         ));
 
+        // Priority_Array is an array, but written only through Present_Value.
         request.property_identifier = PropertyIdentifier::PriorityArray.into();
         assert!(matches!(
             service.write_property(&request, None),
-            Err(ObjectError::OptionalFunctionalityNotSupported)
+            Err(ObjectError::PropertyNotWritable | ObjectError::WriteAccessDenied)
+        ));
+        request.property_array_index = Some(0);
+        assert!(matches!(
+            service.write_property(&request, None),
+            Err(ObjectError::WriteAccessDenied)
         ));
         request.property_array_index = Some(17);
         assert!(matches!(
             service.write_property(&request, None),
             Err(ObjectError::InvalidArrayIndex)
         ));
-        assert_eq!(
-            object_error_codes(&ObjectError::OptionalFunctionalityNotSupported),
-            (2, 45)
-        );
     }
 }
 
