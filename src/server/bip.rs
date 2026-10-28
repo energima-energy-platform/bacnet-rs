@@ -11,7 +11,7 @@ use crate::{
     object::database::ObjectDatabase,
     service::{
         cov_notification::CovNotification, event_notification::EventNotification, AbortReason,
-        ConfirmedServiceChoice, RejectReason, UnconfirmedServiceChoice,
+        ConfirmedServiceChoice, IAmRequest, RejectReason, UnconfirmedServiceChoice,
     },
 };
 
@@ -579,6 +579,18 @@ impl Notifier {
         )
     }
 
+    /// Broadcast an I-Am unprompted, as a device does when it comes back up.
+    pub fn send_i_am(&self, i_am: &IAmRequest) -> Result<(), ServerError> {
+        let mut service_data = Vec::new();
+        i_am.encode(&mut service_data).map_err(ServerError::from)?;
+        self.send(
+            NotificationTarget::Broadcast,
+            service_data,
+            None,
+            UnconfirmedServiceChoice::IAm,
+        )
+    }
+
     /// Send one notification, confirmed as `confirmed` says or else
     /// unconfirmed, and follow a confirmed one up if this notifier tracks them.
     fn send(
@@ -732,6 +744,42 @@ mod tests {
         let header = BvlcHeader::decode(&frame[..length]).expect("decode BVLC");
 
         assert_eq!(header.function, BvlcFunction::OriginalBroadcastNpdu);
+    }
+
+    #[test]
+    fn an_unprompted_i_am_is_broadcast_from_the_routed_device() {
+        let database = Arc::new(ObjectDatabase::new(Device::new(1234, "Test".to_string())));
+        let server = BacnetIpServer::bind("127.0.0.1:0", database).expect("bind");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let source = NetworkAddress::new(1001, vec![3]);
+        let notifier = server
+            .notifier()
+            .expect("notifier")
+            .with_broadcast_address(receiver.local_addr().expect("addr"))
+            .routed_from(source.clone());
+
+        let device = ObjectIdentifier::new(ObjectType::Device, 1234);
+        let i_am = IAmRequest::new(device, 1476, crate::object::Segmentation::NoSegmentation, 1);
+        notifier.send_i_am(&i_am).expect("send");
+
+        let mut frame = [0u8; MAX_BACNET_IP_FRAME];
+        let (length, _) = receiver.recv_from(&mut frame).expect("receive");
+        let header = BvlcHeader::decode(&frame[..length]).expect("decode BVLC");
+        assert_eq!(header.function, BvlcFunction::OriginalBroadcastNpdu);
+        let (npdu, apdu_data, _) = decode_bacnet_ip_frame(&frame[..length]).expect("decode");
+        assert_eq!(npdu.source, Some(source));
+        let Apdu::UnconfirmedRequest {
+            service_choice: UnconfirmedServiceChoice::IAm,
+            service_data,
+        } = Apdu::decode(apdu_data).expect("decode APDU")
+        else {
+            panic!("not an I-Am");
+        };
+        let decoded = IAmRequest::decode(&service_data).expect("decode I-Am");
+        assert_eq!(decoded.device_identifier, device);
     }
 
     /// A socket that counts what goes out through it.
