@@ -686,6 +686,9 @@ impl BacnetObject for MultiStateInput {
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
+        if property == PropertyIdentifier::PresentValue && self.out_of_service {
+            return self.take_reading(value);
+        }
         shared_set(
             MultistateWritable {
                 object_name: &mut self.object_name,
@@ -703,7 +706,8 @@ impl BacnetObject for MultiStateInput {
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(property, self.alarm.is_some(), self.optional)
+        (property == PropertyIdentifier::PresentValue && self.out_of_service)
+            || shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
@@ -715,18 +719,11 @@ impl BacnetObject for MultiStateInput {
     /// An input reflects a sensor, so its Present_Value has no priority array
     /// and is simply what the source last read. States are numbered from 1.
     fn set_sourced_value(&mut self, value: PropertyValue) -> Result<()> {
-        let PropertyValue::Unsigned(state) = value else {
-            return Err(ObjectError::InvalidPropertyType);
-        };
-        let state = u32::try_from(state).map_err(|_| ObjectError::InvalidPropertyType)?;
-        if !(1..=self.number_of_states).contains(&state) {
-            return Err(ObjectError::InvalidValue(format!(
-                "State must be 1-{}",
-                self.number_of_states
-            )));
+        // Out of service, Present_Value is decoupled from what it reads.
+        if self.out_of_service {
+            return Ok(());
         }
-        self.present_value = state;
-        Ok(())
+        self.take_reading(value)
     }
 
     multistate_intrinsic_methods!();
@@ -901,6 +898,25 @@ impl BacnetObject for MultiStateValue {
     multistate_intrinsic_methods!();
 }
 
+impl MultiStateInput {
+    /// Set Present_Value to a reading, from its sensor or from a client while
+    /// out of service.
+    fn take_reading(&mut self, value: PropertyValue) -> Result<()> {
+        let PropertyValue::Unsigned(state) = value else {
+            return Err(ObjectError::InvalidPropertyType);
+        };
+        let state = u32::try_from(state).map_err(|_| ObjectError::InvalidPropertyType)?;
+        if !(1..=self.number_of_states).contains(&state) {
+            return Err(ObjectError::InvalidValue(format!(
+                "State must be 1-{}",
+                self.number_of_states
+            )));
+        }
+        self.present_value = state;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1061,5 +1077,30 @@ mod tests {
             Err(ObjectError::UnknownProperty)
         ));
         assert!(!value.is_property_writable(PropertyIdentifier::Description));
+    }
+
+    #[test]
+    fn an_input_out_of_service_takes_writes_and_ignores_its_sensor() {
+        let mut input = MultiStateInput::new(1, "Mode".to_string(), 3);
+        assert!(input
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Unsigned(3))
+            .is_err());
+
+        input
+            .set_property(
+                PropertyIdentifier::OutOfService,
+                PropertyValue::Boolean(true),
+            )
+            .unwrap();
+        input
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Unsigned(3))
+            .unwrap();
+        input.set_sourced_value(PropertyValue::Unsigned(1)).unwrap();
+        assert_eq!(
+            input
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            PropertyValue::Unsigned(3)
+        );
     }
 }

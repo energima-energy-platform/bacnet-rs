@@ -741,12 +741,16 @@ impl BacnetObject for BinaryInput {
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
+        if property == PropertyIdentifier::PresentValue && self.out_of_service {
+            return self.take_reading(value);
+        }
         shared_set(self.writable(), property, value)
             .unwrap_or(Err(ObjectError::PropertyNotWritable))
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(property, self.alarm.is_some(), self.optional)
+        (property == PropertyIdentifier::PresentValue && self.out_of_service)
+            || shared_writable(property, self.alarm.is_some(), self.optional)
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
@@ -756,15 +760,11 @@ impl BacnetObject for BinaryInput {
     /// An input reflects a physical contact, so its Present_Value has no
     /// priority array and is simply what the source last read.
     fn set_sourced_value(&mut self, value: PropertyValue) -> Result<()> {
-        // Null relinquishes a commandable object; an input has nothing to
-        // relinquish to, so it is not a value a source can supply.
-        match commandable_binary(value)? {
-            Some(state) => {
-                self.present_value = state;
-                Ok(())
-            }
-            None => Err(ObjectError::InvalidPropertyType),
+        // Out of service, Present_Value is decoupled from what it reads.
+        if self.out_of_service {
+            return Ok(());
         }
+        self.take_reading(value)
     }
 
     binary_intrinsic_methods!();
@@ -857,6 +857,22 @@ macro_rules! commandable_binary_object {
 // An output is always commanded; a value may be written straight through.
 commandable_binary_object!(BinaryOutput, |_| true);
 commandable_binary_object!(BinaryValue, |value| value.commandable);
+
+impl BinaryInput {
+    /// Set Present_Value to a reading, from its sensor or from a client while
+    /// out of service.
+    fn take_reading(&mut self, value: PropertyValue) -> Result<()> {
+        // Null relinquishes a commandable object; an input has nothing to
+        // relinquish to, so it is not a value a source can supply.
+        match commandable_binary(value)? {
+            Some(state) => {
+                self.present_value = state;
+                Ok(())
+            }
+            None => Err(ObjectError::InvalidPropertyType),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1046,6 +1062,34 @@ mod tests {
                 .get_property(PropertyIdentifier::PresentValue)
                 .unwrap(),
             PropertyValue::Enumerated(BinaryPV::Active as u32)
+        );
+    }
+
+    #[test]
+    fn an_input_out_of_service_takes_writes_and_ignores_its_contact() {
+        let mut input = BinaryInput::new(1, "Fan running".to_string());
+        let active = PropertyValue::Enumerated(1);
+        assert!(input
+            .set_property(PropertyIdentifier::PresentValue, active.clone())
+            .is_err());
+
+        input
+            .set_property(
+                PropertyIdentifier::OutOfService,
+                PropertyValue::Boolean(true),
+            )
+            .unwrap();
+        input
+            .set_property(PropertyIdentifier::PresentValue, active.clone())
+            .unwrap();
+        input
+            .set_sourced_value(PropertyValue::Enumerated(0))
+            .unwrap();
+        assert_eq!(
+            input
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            active
         );
     }
 }
