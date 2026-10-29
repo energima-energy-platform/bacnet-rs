@@ -917,17 +917,21 @@ impl BacnetObject for AnalogInput {
     }
 
     fn set_property(&mut self, property: PropertyIdentifier, value: PropertyValue) -> Result<()> {
+        if property == PropertyIdentifier::PresentValue && self.out_of_service {
+            return self.take_reading(value);
+        }
         shared_set(self.writable(), property, value)
             .unwrap_or(Err(ObjectError::PropertyNotWritable))
     }
 
     fn is_property_writable(&self, property: PropertyIdentifier) -> bool {
-        shared_writable(
-            property,
-            self.alarm.is_some(),
-            self.cov_increment.is_some(),
-            self.optional,
-        )
+        (property == PropertyIdentifier::PresentValue && self.out_of_service)
+            || shared_writable(
+                property,
+                self.alarm.is_some(),
+                self.cov_increment.is_some(),
+                self.optional,
+            )
     }
 
     fn property_list(&self) -> Vec<PropertyIdentifier> {
@@ -937,13 +941,11 @@ impl BacnetObject for AnalogInput {
     /// An input reflects a sensor, so its Present_Value has no priority array
     /// and is simply what the source last read.
     fn set_sourced_value(&mut self, value: PropertyValue) -> Result<()> {
-        match value {
-            PropertyValue::Real(value) => {
-                self.present_value = value;
-                Ok(())
-            }
-            _ => Err(ObjectError::InvalidPropertyType),
+        // Out of service, Present_Value is decoupled from what it reads.
+        if self.out_of_service {
+            return Ok(());
         }
+        self.take_reading(value)
     }
 
     analog_intrinsic_methods!();
@@ -1069,6 +1071,20 @@ impl BacnetObject for AnalogValue {
     }
 
     analog_intrinsic_methods!();
+}
+
+impl AnalogInput {
+    /// Set Present_Value to a reading, from its sensor or from a client while
+    /// out of service.
+    fn take_reading(&mut self, value: PropertyValue) -> Result<()> {
+        match value {
+            PropertyValue::Real(value) => {
+                self.present_value = value;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidPropertyType),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1428,5 +1444,47 @@ mod tests {
             output.set_property(PropertyIdentifier::PresentValue, PropertyValue::Real(0.0)),
             Err(ObjectError::WriteAccessDenied)
         ));
+    }
+
+    /// Out of service, an input's Present_Value is decoupled from its sensor:
+    /// a client may write it, and the sensor no longer moves it.
+    #[test]
+    fn an_input_out_of_service_takes_writes_and_ignores_its_sensor() {
+        let mut input = AnalogInput::new(1, "Room temperature".to_string());
+        assert!(input
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Real(30.0))
+            .is_err());
+
+        input
+            .set_property(
+                PropertyIdentifier::OutOfService,
+                PropertyValue::Boolean(true),
+            )
+            .unwrap();
+        assert!(input.is_property_writable(PropertyIdentifier::PresentValue));
+        input
+            .set_property(PropertyIdentifier::PresentValue, PropertyValue::Real(30.0))
+            .unwrap();
+        input.set_sourced_value(PropertyValue::Real(5.0)).unwrap();
+        assert_eq!(
+            input
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            PropertyValue::Real(30.0)
+        );
+
+        input
+            .set_property(
+                PropertyIdentifier::OutOfService,
+                PropertyValue::Boolean(false),
+            )
+            .unwrap();
+        input.set_sourced_value(PropertyValue::Real(5.0)).unwrap();
+        assert_eq!(
+            input
+                .get_property(PropertyIdentifier::PresentValue)
+                .unwrap(),
+            PropertyValue::Real(5.0)
+        );
     }
 }
