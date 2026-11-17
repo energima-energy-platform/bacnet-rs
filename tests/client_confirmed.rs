@@ -272,6 +272,7 @@ fn read_property_surfaces_error_pdu() {
         error_class: 1,
         error_code: 32,
         first_failed_write: None,
+        first_failed_element: None,
     });
 
     let err = test_client()
@@ -426,6 +427,7 @@ fn object_list_does_not_hide_read_access_errors() {
             error_class: 2,
             error_code: 27,
             first_failed_write: None,
+            first_failed_element: None,
         }
     });
 
@@ -688,6 +690,7 @@ fn object_properties_surfaces_unsupported_rpm_without_rp_fallback() {
                         error_class: 2,
                         error_code: 32,
                         first_failed_write: None,
+                        first_failed_element: None,
                     }
                 } else {
                     let values = match request.property_identifier {

@@ -678,11 +678,11 @@ impl ObjectService {
     /// leaves the list as it was.
     pub fn remove_list_element(&self, request: &ListElementRequest) -> Result<(), ObjectError> {
         self.change_list(request, |list| {
-            for element in &request.list_of_elements {
+            for (number, element) in (1..).zip(&request.list_of_elements) {
                 let at = list
                     .iter()
                     .position(|present| present == element)
-                    .ok_or(ObjectError::ListElementNotFound)?;
+                    .ok_or(ObjectError::ListElementNotFound { element: number })?;
                 list.remove(at);
             }
             Ok(())
@@ -876,7 +876,7 @@ pub(crate) fn object_error_codes(error: &ObjectError) -> (u32, u32) {
         ObjectError::NoSpaceToAddListElement => (3, 19),
         ObjectError::NoSpaceToWriteProperty => (3, 20),
         ObjectError::InvalidTimeStamp => (5, 14),
-        ObjectError::ListElementNotFound => (5, 81),
+        ObjectError::ListElementNotFound { .. } => (5, 81),
         ObjectError::TypeNotSupported | ObjectError::InvalidConfiguration(_) => (1, 0),
     }
 }
@@ -989,6 +989,16 @@ mod tests {
                 .lookup(ObjectIdentifier::new(ObjectType::Device, 9000)),
             Some(sender)
         );
+    }
+
+    #[test]
+    fn a_removal_names_the_element_it_could_not_find() {
+        let service = service_with_class();
+        service.add_list_element(&adding([9000]), None).unwrap();
+        assert!(matches!(
+            service.remove_list_element(&adding([9000, 9001])),
+            Err(ObjectError::ListElementNotFound { element: 2 })
+        ));
     }
 
     /// Each change is read, made and written under one lock, so changes made

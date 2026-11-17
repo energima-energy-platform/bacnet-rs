@@ -176,8 +176,9 @@ pub enum ObjectError {
     NoSpaceToWriteProperty,
     /// A time stamp does not match the one the device recorded.
     InvalidTimeStamp,
-    /// An element to remove from a list is not in it.
-    ListElementNotFound,
+    /// An element to remove from a list is not in it: the request's
+    /// `element`th, counted from 1.
+    ListElementNotFound { element: u32 },
     /// Invalid object configuration
     InvalidConfiguration(String),
 }
@@ -202,7 +203,9 @@ impl fmt::Display for ObjectError {
             ObjectError::NoSpaceToAddListElement => write!(f, "No space to add list element"),
             ObjectError::NoSpaceToWriteProperty => write!(f, "No space to write property"),
             ObjectError::InvalidTimeStamp => write!(f, "Invalid time stamp"),
-            ObjectError::ListElementNotFound => write!(f, "List element not found"),
+            ObjectError::ListElementNotFound { element } => {
+                write!(f, "List element {element} not found")
+            }
             ObjectError::InvalidConfiguration(msg) => write!(f, "Invalid configuration: {}", msg),
         }
     }

@@ -312,6 +312,7 @@ impl ServerDispatcher {
                                 error_class,
                                 error_code,
                                 first_failed_write: Some(first_failed),
+                                first_failed_element: None,
                             })
                         }
                     },
@@ -378,12 +379,17 @@ fn object_error_apdu(
     error: ObjectError,
 ) -> Apdu {
     let (error_class, error_code) = object_error_codes(&error);
+    let first_failed_element = match error {
+        ObjectError::ListElementNotFound { element } => Some(element),
+        _ => None,
+    };
     Apdu::Error {
         invoke_id,
         service_choice,
         error_class,
         error_code,
         first_failed_write: None,
+        first_failed_element,
     }
 }
 
