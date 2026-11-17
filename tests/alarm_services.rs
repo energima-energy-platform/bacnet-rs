@@ -6,15 +6,21 @@
 use std::{sync::Arc, time::Duration};
 
 use bacnet_rs::{
+    app::{Apdu, MaxApduSize, MaxSegments},
     client::{AsyncBacnetClient, ClientConfig, ClientError},
     event::EventEngine,
+    network::Npdu,
     object::{
         database::ObjectDatabase, intrinsic::EventTransitionBits, BinaryPV, BinaryValue, Device,
         EventState, NotificationClass, ObjectIdentifier, ObjectType, PropertyIdentifier,
     },
     property::{BacnetAddress, DestinationValue, PropertyValue, Recipient, TimestampValue},
     server::AsyncBacnetIpServer,
-    service::acknowledge_alarm::AcknowledgeAlarmRequest,
+    service::{
+        acknowledge_alarm::AcknowledgeAlarmRequest,
+        event_information::{GetEventInformationAck, GetEventInformationRequest},
+        ConfirmedServiceChoice,
+    },
 };
 use tokio::net::UdpSocket;
 
@@ -189,4 +195,122 @@ async fn a_recipient_catches_up_and_acknowledges() {
         .unwrap();
     let summaries = client.get_event_information(address).await.unwrap();
     assert_eq!(summaries[0].acknowledged_transitions, [true, true, true]);
+}
+
+/// Nine alarms stamped with a date and time are over 480 bytes as one page,
+/// so a client that takes no more than that must get them in several.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_taking_480_bytes_is_paged_within_them() {
+    let database = Arc::new(ObjectDatabase::new(Device::new(3016, "Plant".to_string())));
+    database
+        .add_object(Box::new(
+            NotificationClass::new(CLASS, "Alarms".to_string())
+                .with_ack_required(EventTransitionBits::all())
+                .with_recipient(ObjectIdentifier::new(ObjectType::Device, 9000), 1),
+        ))
+        .unwrap();
+    for instance in 1..=9 {
+        database
+            .add_object(Box::new(
+                BinaryValue::new(instance, format!("Pump {instance}"))
+                    .with_intrinsic_reporting(CLASS, BinaryPV::Active),
+            ))
+            .unwrap();
+        database
+            .set_property(
+                ObjectIdentifier::new(ObjectType::BinaryValue, instance),
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Enumerated(1),
+            )
+            .unwrap();
+    }
+    // Off-normal, back to normal, then a fault: all three transitions
+    // stamped with a date and time, as a summary is at its largest.
+    let mut engine = EventEngine::new(3016);
+    let at = |minute| TimestampValue::DateTime {
+        date: (2026, 11, 17, 2),
+        time: (10, minute, 0, 0),
+    };
+    engine.tick(&database, 0, at(15));
+    for instance in 1..=9 {
+        database
+            .set_property(
+                ObjectIdentifier::new(ObjectType::BinaryValue, instance),
+                PropertyIdentifier::PresentValue,
+                PropertyValue::Enumerated(0),
+            )
+            .unwrap();
+    }
+    engine.tick(&database, 60, at(16));
+    for instance in 1..=9 {
+        database
+            .set_property(
+                ObjectIdentifier::new(ObjectType::BinaryValue, instance),
+                PropertyIdentifier::Reliability,
+                PropertyValue::Enumerated(7),
+            )
+            .unwrap();
+    }
+    engine.tick(&database, 120, at(17));
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let server = AsyncBacnetIpServer::from_socket(socket, database);
+    tokio::spawn(server.run_until(std::future::pending::<()>()));
+    // Asked as a device that takes neither more than 480 bytes nor segments.
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut last = None;
+    let mut seen = 0;
+    loop {
+        let mut service_data = Vec::new();
+        GetEventInformationRequest {
+            last_received_object_identifier: last,
+        }
+        .encode(&mut service_data)
+        .unwrap();
+        let request = Apdu::ConfirmedRequest {
+            segmented: false,
+            more_follows: false,
+            segmented_response_accepted: false,
+            max_segments: MaxSegments::Unspecified,
+            max_response_size: MaxApduSize::Up480,
+            invoke_id: 1,
+            sequence_number: None,
+            proposed_window_size: None,
+            service_choice: ConfirmedServiceChoice::GetEventInformation,
+            service_data,
+        };
+        let mut payload = Npdu::new().encode();
+        payload.extend_from_slice(&request.encode());
+        let mut frame = vec![0x81, 0x0a, 0, (payload.len() + 4) as u8];
+        frame.extend_from_slice(&payload);
+        peer.send_to(&frame, address).unwrap();
+
+        let mut buffer = [0u8; 1500];
+        let (length, _) = peer.recv_from(&mut buffer).unwrap();
+        assert!(
+            length - 4 <= 480 + 2,
+            "a {length}-byte frame for a 480-byte APDU"
+        );
+        let (_, npdu_length) = Npdu::decode(&buffer[4..length]).unwrap();
+        let reply = Apdu::decode(&buffer[4 + npdu_length..length]).unwrap();
+        let Apdu::ComplexAck { service_data, .. } = reply else {
+            panic!("not a page of summaries: {reply:?}")
+        };
+        let page = GetEventInformationAck::decode(&service_data).unwrap();
+        assert!(page.list_of_event_summaries.iter().all(|summary| summary
+            .event_time_stamps
+            .iter()
+            .all(|stamp| matches!(stamp, TimestampValue::DateTime { .. }))));
+        seen += page.list_of_event_summaries.len();
+        last = page
+            .list_of_event_summaries
+            .last()
+            .map(|summary| summary.object_identifier);
+        if !page.more_events {
+            break;
+        }
+    }
+    assert_eq!(seen, 9);
 }

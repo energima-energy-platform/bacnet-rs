@@ -533,19 +533,42 @@ impl ObjectService {
 
     /// GetEventInformation: objects outside normal or awaiting acknowledgement,
     /// in identifier order, a page at a time.
+    ///
+    /// A page is as many summaries as fit `max_apdu`, the most the requester
+    /// takes in one APDU, so it never needs segmenting. Summaries are built
+    /// only until one does not fit, which is how the page knows more follow.
     pub fn get_event_information(
         &self,
         request: &GetEventInformationRequest,
+        max_apdu: usize,
     ) -> GetEventInformationAck {
-        let mut summaries = self.event_summaries().into_iter().filter(|summary| {
-            request
-                .last_received_object_identifier
-                .is_none_or(|last| object_order(summary.object_identifier) > object_order(last))
+        let mut objects = self.database.get_all_objects();
+        objects.sort_unstable_by_key(|&object| object_order(object));
+        let after = request.last_received_object_identifier.map(object_order);
+        let start = after.map_or(0, |after| {
+            objects.partition_point(|&object| object_order(object) <= after)
         });
-        let page: Vec<EventSummary> = summaries.by_ref().take(EVENT_SUMMARIES_PER_PAGE).collect();
+        let summaries = objects[start..]
+            .iter()
+            .filter_map(|&object| self.event_summary(object));
+
+        let mut room = max_apdu.saturating_sub(PAGE_OVERHEAD);
+        let mut page = Vec::new();
+        let mut more_events = false;
+        for summary in summaries {
+            let length = summary.encoded_len();
+            // The first goes in whatever its size: a page of none would have
+            // the requester ask for the same page forever.
+            if length > room && !page.is_empty() {
+                more_events = true;
+                break;
+            }
+            room = room.saturating_sub(length);
+            page.push(summary);
+        }
         GetEventInformationAck {
             list_of_event_summaries: page,
-            more_events: summaries.next().is_some(),
+            more_events,
         }
     }
 
@@ -817,9 +840,9 @@ fn services_supported_bit(service: ConfirmedServiceChoice) -> Option<usize> {
     }
 }
 
-/// Small enough that a page fits the smallest APDU a client is likely to
-/// accept, so a page never needs segmenting.
-const EVENT_SUMMARIES_PER_PAGE: usize = 8;
+/// A GetEventInformation-ACK around its summaries: the ComplexAck header,
+/// listOfEventSummaries' opening and closing tags, and moreEvents.
+const PAGE_OVERHEAD: usize = 3 + 2 + 2;
 
 /// The order GetEventInformation pages through objects in.
 fn object_order(object: ObjectIdentifier) -> (u32, u32) {

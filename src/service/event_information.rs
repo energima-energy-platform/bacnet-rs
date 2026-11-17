@@ -58,6 +58,12 @@ pub struct EventSummary {
 }
 
 impl EventSummary {
+    /// Octets this summary takes in a GetEventInformation-ACK.
+    pub fn encoded_len(&self) -> usize {
+        let mut buffer = Vec::new();
+        self.encode(&mut buffer).map_or(0, |()| buffer.len())
+    }
+
     fn encode(&self, buffer: &mut Vec<u8>) -> EncodingResult<()> {
         buffer.extend_from_slice(&encode_context_object_id(self.object_identifier, 0)?);
         buffer.extend_from_slice(&encode_context_enumerated(
