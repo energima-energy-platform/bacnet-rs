@@ -521,7 +521,7 @@ impl EventNotification {
         let message_text = if is_context_tag(&data[offset..], 7) {
             let (text, length) = decode_context_char_string(&data[offset..], 7)?;
             offset += length;
-            Some(text)
+            text
         } else {
             None
         };
@@ -587,8 +587,9 @@ fn event_state(value: u32) -> EncodingResult<EventState> {
 }
 
 /// Decode a context-tagged CHARACTER STRING in whichever character set it
-/// declares.
-fn decode_context_char_string(data: &[u8], tag: u8) -> EncodingResult<(String, usize)> {
+/// declares. Text in a set that cannot be read here is `None`: the message is
+/// optional, and the notification it rides on is not to be lost over it.
+fn decode_context_char_string(data: &[u8], tag: u8) -> EncodingResult<(Option<String>, usize)> {
     let (actual, length, header) = decode_context_tag(data)?;
     if actual != tag || length == 0 {
         return Err(EncodingError::InvalidTag);
@@ -596,7 +597,9 @@ fn decode_context_char_string(data: &[u8], tag: u8) -> EncodingResult<(String, u
     let content = data
         .get(header..header + length)
         .ok_or(EncodingError::BufferUnderflow)?;
-    let text = CharacterSet::try_from(content[0])?.decode(&content[1..])?;
+    let text = CharacterSet::try_from(content[0])
+        .and_then(|set| set.decode(&content[1..]))
+        .ok();
     Ok((text, header + length))
 }
 
@@ -988,6 +991,28 @@ mod tests {
                 data: Vec::new()
             }
         );
+    }
+
+    /// DBCS needs a code page carried out of band, so it cannot be read; the
+    /// notification still decodes, with no text.
+    #[test]
+    fn message_text_in_an_unreadable_set_decodes_as_none() {
+        let event = notification(NotificationParameters::ChangeOfState {
+            new_state: PropertyStates::UnsignedValue(2),
+            status_flags: StatusFlags::default(),
+        });
+        let mut encoded = Vec::new();
+        event.encode(&mut encoded).expect("encode");
+        let at = encoded
+            .iter()
+            .position(|&byte| byte == 0x89)
+            .expect("notify type");
+        // Character set 1 (DBCS), a code page, then two octets of text.
+        encoded.splice(at..at, [0x7d, 0x05, 0x01, 0x03, 0xa4, 0x82, 0xa0]);
+
+        let decoded = EventNotification::decode(&encoded).expect("decode");
+        assert_eq!(decoded.message_text, None);
+        assert_eq!(decoded.to_state, event.to_state);
     }
 
     #[test]
