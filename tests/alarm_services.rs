@@ -314,3 +314,77 @@ async fn a_client_taking_480_bytes_is_paged_within_them() {
     }
     assert_eq!(seen, 9);
 }
+
+/// A device whose pages run in a circle - each ends on another object, each
+/// says more follow - is read once round, not forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn paging_stops_when_a_device_goes_round_in_circles() {
+    use bacnet_rs::{object::intrinsic::NotifyType, service::event_information::EventSummary};
+    let device = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = device.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 1500];
+        for answered in 0.. {
+            let Ok((length, peer)) = device.recv_from(&mut buffer) else {
+                return;
+            };
+            let (_, npdu_length) = Npdu::decode(&buffer[4..length]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, .. } =
+                Apdu::decode(&buffer[4 + npdu_length..length]).unwrap()
+            else {
+                continue;
+            };
+            let summary = EventSummary {
+                object_identifier: ObjectIdentifier::new(ObjectType::AnalogInput, answered % 2),
+                event_state: EventState::HighLimit,
+                acknowledged_transitions: [false, true, true],
+                event_time_stamps: [
+                    TimestampValue::SequenceNumber(1),
+                    TimestampValue::SequenceNumber(0),
+                    TimestampValue::SequenceNumber(0),
+                ],
+                notify_type: NotifyType::Alarm,
+                event_enable: [true; 3],
+                event_priorities: [100; 3],
+            };
+            let mut service_data = Vec::new();
+            GetEventInformationAck {
+                list_of_event_summaries: vec![summary],
+                more_events: true,
+            }
+            .encode(&mut service_data)
+            .unwrap();
+            let reply = Apdu::ComplexAck {
+                segmented: false,
+                more_follows: false,
+                invoke_id,
+                sequence_number: None,
+                proposed_window_size: None,
+                service_choice: ConfirmedServiceChoice::GetEventInformation,
+                service_data,
+            };
+            let mut payload = Npdu::new().encode();
+            payload.extend_from_slice(&reply.encode());
+            let mut frame = vec![0x81, 0x0a, 0, (payload.len() + 4) as u8];
+            frame.extend_from_slice(&payload);
+            device.send_to(&frame, peer).unwrap();
+        }
+    });
+
+    let client = AsyncBacnetClient::from_config(ClientConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        timeout: Duration::from_secs(1),
+        retries: 0,
+    })
+    .await
+    .unwrap();
+    let summaries = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_event_information(address),
+    )
+    .await
+    .expect("paging ends")
+    .unwrap();
+    assert_eq!(summaries.len(), 2);
+}
