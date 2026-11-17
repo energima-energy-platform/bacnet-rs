@@ -126,13 +126,18 @@ impl ServerDispatcher {
                 service_data,
                 ..
             } => {
-                let response =
-                    self.dispatch_confirmed(invoke_id, service_choice, &service_data, source)?;
                 // A device cannot send more than it can itself hold, whatever
                 // the requester would accept.
                 let limit = max_response_size
                     .size()
                     .min(self.objects.max_apdu_length_accepted());
+                let response = self.dispatch_confirmed(
+                    invoke_id,
+                    service_choice,
+                    &service_data,
+                    source,
+                    limit,
+                )?;
                 enforce_max_apdu(invoke_id, response, limit, segmented_response_accepted)
             }
             // Replies to what this device sent, not requests of it.
@@ -175,6 +180,7 @@ impl ServerDispatcher {
         service_choice: ConfirmedServiceChoice,
         service_data: &[u8],
         source: Option<std::net::SocketAddr>,
+        max_apdu: usize,
     ) -> Result<Apdu, ServerError> {
         if !self.objects.supports_confirmed_service(service_choice) {
             return Ok(reject(invoke_id, RejectReason::UnrecognizedService));
@@ -248,7 +254,7 @@ impl ServerDispatcher {
                     Ok(request) => {
                         let mut data = Vec::new();
                         self.objects
-                            .get_event_information(&request)
+                            .get_event_information(&request, max_apdu)
                             .encode(&mut data)?;
                         Ok(complex_ack(invoke_id, service_choice, data))
                     }
