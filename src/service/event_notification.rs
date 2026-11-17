@@ -269,16 +269,21 @@ impl NotificationParameters {
     /// [`Self::Other`] for an algorithm not modelled or one that does not
     /// decode as its production says.
     fn decode(event_type: u32, data: &[u8]) -> Self {
-        Self::decode_modelled(data).unwrap_or_else(|| Self::Other {
+        Self::decode_modelled(event_type, data).unwrap_or_else(|| Self::Other {
             event_type,
             data: data.to_vec(),
         })
     }
 
-    fn decode_modelled(data: &[u8]) -> Option<Self> {
+    /// The parameters' CHOICE tag is the event type they belong to. One that
+    /// disagrees with eventType is kept raw rather than trusted either way.
+    fn decode_modelled(event_type: u32, data: &[u8]) -> Option<Self> {
         let (BACnetTag::Opening(choice), _, header) = decode_tag(data).ok()? else {
             return None;
         };
+        if u32::from(choice) != event_type {
+            return None;
+        }
         let body = data.get(header..)?;
         let mut offset = 0;
         let parameters = match choice {
@@ -970,6 +975,30 @@ mod tests {
                 data
             }
         );
+    }
+
+    /// eventType says out-of-range, the parameters are change-of-state.
+    #[test]
+    fn parameters_that_contradict_the_event_type_are_kept_whole() {
+        let event = notification(NotificationParameters::ChangeOfState {
+            new_state: PropertyStates::BinaryValue(true),
+            status_flags: StatusFlags::default(),
+        });
+        let mut encoded = Vec::new();
+        event.encode(&mut encoded).expect("encode");
+        // [6] eventType change-of-state (1) becomes out-of-range (5).
+        let at = encoded
+            .windows(2)
+            .position(|pair| pair == [0x69, 0x01])
+            .expect("event type");
+        encoded[at + 1] = 0x05;
+
+        let decoded = EventNotification::decode(&encoded).expect("decode");
+        assert_eq!(decoded.event_type(), EventType::OutOfRange);
+        assert!(matches!(
+            decoded.parameters,
+            NotificationParameters::Other { event_type: 5, .. }
+        ));
     }
 
     #[test]
