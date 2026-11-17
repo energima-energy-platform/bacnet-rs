@@ -2,14 +2,19 @@ use std::{net::SocketAddr, sync::Arc};
 
 use crate::{
     object::{
-        database::ObjectDatabase, ObjectError, ObjectIdentifier, ObjectType, PropertyIdentifier,
-        PropertyValue, Segmentation,
+        database::ObjectDatabase, intrinsic::NotifyType, EventState, ObjectError, ObjectIdentifier,
+        ObjectType, PropertyIdentifier, PropertyValue, Segmentation,
     },
     property::{
         datatype::Element, BacnetAddress, CovSubscriptionValue, ObjectPropertyReference, Recipient,
-        RecipientProcess,
+        RecipientProcess, TimestampValue,
     },
     service::{
+        event_information::{
+            AlarmSummary, EventSummary, GetAlarmSummaryAck, GetEventInformationAck,
+            GetEventInformationRequest,
+        },
+        list_element::ListElementRequest,
         ConfirmedServiceChoice, IAmRequest, PropertyReference, PropertyResult, ReadAccessResult,
         ReadPropertyMultipleRequest, ReadPropertyMultipleResponse, ReadPropertyRequest,
         ReadPropertyResponse, SubscribeCovPropertyRequest, SubscribeCovRequest,
@@ -526,6 +531,164 @@ impl ObjectService {
         )
     }
 
+    /// GetEventInformation: objects outside normal or awaiting acknowledgement,
+    /// in identifier order, a page at a time.
+    pub fn get_event_information(
+        &self,
+        request: &GetEventInformationRequest,
+    ) -> GetEventInformationAck {
+        let mut summaries = self.event_summaries().into_iter().filter(|summary| {
+            request
+                .last_received_object_identifier
+                .is_none_or(|last| object_order(summary.object_identifier) > object_order(last))
+        });
+        let page: Vec<EventSummary> = summaries.by_ref().take(EVENT_SUMMARIES_PER_PAGE).collect();
+        GetEventInformationAck {
+            list_of_event_summaries: page,
+            more_events: summaries.next().is_some(),
+        }
+    }
+
+    /// GetAlarmSummary: objects in an alarm state whose notifications are
+    /// alarms, as the standard defines it.
+    pub fn get_alarm_summary(&self) -> GetAlarmSummaryAck {
+        GetAlarmSummaryAck {
+            alarms: self
+                .event_summaries()
+                .into_iter()
+                .filter(|summary| {
+                    summary.event_state != EventState::Normal
+                        && summary.notify_type == NotifyType::Alarm
+                })
+                .map(|summary| AlarmSummary {
+                    object_identifier: summary.object_identifier,
+                    alarm_state: summary.event_state,
+                    acknowledged_transitions: summary.acknowledged_transitions,
+                })
+                .collect(),
+        }
+    }
+
+    fn event_summaries(&self) -> Vec<EventSummary> {
+        let mut objects = self.database.get_all_objects();
+        objects.sort_by_key(|&object| object_order(object));
+        objects
+            .into_iter()
+            .filter_map(|object| self.event_summary(object))
+            .collect()
+    }
+
+    fn event_summary(&self, object: ObjectIdentifier) -> Option<EventSummary> {
+        let get = |property| self.database.get_property(object, property).ok();
+        let event_state = match get(PropertyIdentifier::EventState)? {
+            PropertyValue::Enumerated(state) => EventState::from(u16::try_from(state).ok()?),
+            _ => return None,
+        };
+        let bits = |property| match get(property) {
+            Some(PropertyValue::BitString(bits)) => {
+                let bit = |index: usize| bits.get(index).copied().unwrap_or(true);
+                [bit(0), bit(1), bit(2)]
+            }
+            _ => [true; 3],
+        };
+        let acknowledged_transitions = bits(PropertyIdentifier::AckedTransitions);
+        if event_state == EventState::Normal && acknowledged_transitions == [true; 3] {
+            return None;
+        }
+
+        let unspecified = TimestampValue::Time(255, 255, 255, 255);
+        let mut event_time_stamps = [unspecified.clone(), unspecified.clone(), unspecified];
+        if let Some(PropertyValue::Array(stamps)) = get(PropertyIdentifier::EventTimeStamps) {
+            for (slot, stamp) in event_time_stamps.iter_mut().zip(stamps) {
+                if let PropertyValue::Timestamp(stamp) = stamp {
+                    *slot = stamp;
+                }
+            }
+        }
+        let notify_type = match get(PropertyIdentifier::NotifyType) {
+            Some(PropertyValue::Enumerated(value)) => {
+                NotifyType::try_from(value).unwrap_or(NotifyType::Alarm)
+            }
+            _ => NotifyType::Alarm,
+        };
+
+        let mut event_priorities = [crate::object::notification_class::DEFAULT_PRIORITY; 3];
+        if let Some(PropertyValue::Unsigned(class)) = get(PropertyIdentifier::NotificationClass) {
+            let class = ObjectIdentifier::new(ObjectType::NotificationClass, class as u32);
+            if let Ok(PropertyValue::Array(priorities)) = self
+                .database
+                .get_property(class, PropertyIdentifier::Priority)
+            {
+                for (slot, priority) in event_priorities.iter_mut().zip(priorities) {
+                    if let PropertyValue::Unsigned(priority) = priority {
+                        *slot = priority as u32;
+                    }
+                }
+            }
+        }
+
+        Some(EventSummary {
+            object_identifier: object,
+            event_state,
+            acknowledged_transitions,
+            event_time_stamps,
+            notify_type,
+            event_enable: bits(PropertyIdentifier::EventEnable),
+            event_priorities,
+        })
+    }
+
+    /// AddListElement: elements already in the list are not added again, and
+    /// if any cannot be added none are.
+    pub fn add_list_element(&self, request: &ListElementRequest) -> Result<(), ObjectError> {
+        let mut list = self.list_for_change(request)?;
+        for element in &request.list_of_elements {
+            if !list.contains(element) {
+                list.push(element.clone());
+            }
+        }
+        self.database.set_property(
+            request.object_identifier,
+            request.property_identifier,
+            PropertyValue::List(list),
+        )
+    }
+
+    /// RemoveListElement: an element not in the list fails the request, and
+    /// leaves the list as it was.
+    pub fn remove_list_element(&self, request: &ListElementRequest) -> Result<(), ObjectError> {
+        let mut list = self.list_for_change(request)?;
+        for element in &request.list_of_elements {
+            let at = list
+                .iter()
+                .position(|present| present == element)
+                .ok_or(ObjectError::ListElementNotFound)?;
+            list.remove(at);
+        }
+        self.database.set_property(
+            request.object_identifier,
+            request.property_identifier,
+            PropertyValue::List(list),
+        )
+    }
+
+    fn list_for_change(
+        &self,
+        request: &ListElementRequest,
+    ) -> Result<Vec<PropertyValue>, ObjectError> {
+        // A list inside an array element is a datatype nothing here holds.
+        if request.property_array_index.is_some() {
+            return Err(ObjectError::PropertyIsNotArray);
+        }
+        match self
+            .database
+            .get_property(request.object_identifier, request.property_identifier)?
+        {
+            PropertyValue::List(list) => Ok(list),
+            _ => Err(ObjectError::InvalidPropertyType),
+        }
+    }
+
     /// The whole array `property` becomes once element `index` is written.
     fn write_element(
         &self,
@@ -640,14 +803,27 @@ impl ObjectService {
 fn services_supported_bit(service: ConfirmedServiceChoice) -> Option<usize> {
     match service {
         ConfirmedServiceChoice::AcknowledgeAlarm => Some(0),
+        ConfirmedServiceChoice::GetAlarmSummary => Some(3),
         ConfirmedServiceChoice::SubscribeCOV => Some(5),
+        ConfirmedServiceChoice::AddListElement => Some(8),
+        ConfirmedServiceChoice::RemoveListElement => Some(9),
         ConfirmedServiceChoice::ReadProperty => Some(12),
         ConfirmedServiceChoice::ReadPropertyMultiple => Some(14),
         ConfirmedServiceChoice::WriteProperty => Some(15),
         ConfirmedServiceChoice::WritePropertyMultiple => Some(16),
         ConfirmedServiceChoice::SubscribeCOVProperty => Some(38),
+        ConfirmedServiceChoice::GetEventInformation => Some(39),
         _ => None,
     }
+}
+
+/// Small enough that a page fits the smallest APDU a client is likely to
+/// accept, so a page never needs segmenting.
+const EVENT_SUMMARIES_PER_PAGE: usize = 8;
+
+/// The order GetEventInformation pages through objects in.
+fn object_order(object: ObjectIdentifier) -> (u32, u32) {
+    (u32::from(object.object_type), object.instance)
 }
 
 pub(crate) fn object_error_codes(error: &ObjectError) -> (u32, u32) {
@@ -663,6 +839,7 @@ pub(crate) fn object_error_codes(error: &ObjectError) -> (u32, u32) {
         ObjectError::NoSpaceToAddListElement => (3, 19),
         ObjectError::NoSpaceToWriteProperty => (3, 20),
         ObjectError::InvalidTimeStamp => (5, 14),
+        ObjectError::ListElementNotFound => (5, 81),
         ObjectError::TypeNotSupported | ObjectError::InvalidConfiguration(_) => (1, 0),
     }
 }

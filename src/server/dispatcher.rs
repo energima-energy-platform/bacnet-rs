@@ -242,6 +242,43 @@ impl ServerDispatcher {
                     Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
                 }
             }
+            ConfirmedServiceChoice::GetEventInformation => {
+                use crate::service::event_information::GetEventInformationRequest;
+                match GetEventInformationRequest::decode(service_data) {
+                    Ok(request) => {
+                        let mut data = Vec::new();
+                        self.objects
+                            .get_event_information(&request)
+                            .encode(&mut data)?;
+                        Ok(complex_ack(invoke_id, service_choice, data))
+                    }
+                    Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
+                }
+            }
+            ConfirmedServiceChoice::GetAlarmSummary => {
+                let mut data = Vec::new();
+                self.objects.get_alarm_summary().encode(&mut data)?;
+                Ok(complex_ack(invoke_id, service_choice, data))
+            }
+            ConfirmedServiceChoice::AddListElement | ConfirmedServiceChoice::RemoveListElement => {
+                match crate::service::list_element::ListElementRequest::decode(service_data) {
+                    Ok(request) => {
+                        let result = if service_choice == ConfirmedServiceChoice::AddListElement {
+                            self.objects.add_list_element(&request)
+                        } else {
+                            self.objects.remove_list_element(&request)
+                        };
+                        match result {
+                            Ok(()) => Ok(Apdu::SimpleAck {
+                                invoke_id,
+                                service_choice: service_choice as u8,
+                            }),
+                            Err(error) => Ok(object_error_apdu(invoke_id, service_choice, error)),
+                        }
+                    }
+                    Err(_) => Ok(reject(invoke_id, RejectReason::InvalidTag)),
+                }
+            }
             ConfirmedServiceChoice::WriteProperty => {
                 match WritePropertyRequest::decode(service_data) {
                     Ok(request) => match self.objects.write_property(&request, source) {

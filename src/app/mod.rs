@@ -299,17 +299,30 @@ impl Apdu {
             } => 3 + usize::from(*segmented) * 2 + service_data.len(),
             Apdu::SegmentAck { .. } => 4,
             Apdu::Error {
+                service_choice,
                 error_class,
                 error_code,
                 first_failed_write,
                 ..
             } => {
-                // An extended error adds two pairs of one-octet tags.
-                let detail = first_failed_write.as_ref().map_or(0, |reference| {
-                    let mut encoded = Vec::new();
-                    let _ = reference.encode(&mut encoded);
-                    4 + encoded.len()
-                });
+                // An extended error adds two pairs of one-octet tags; a
+                // Change-List-Error one pair and the element number 0 in two.
+                let detail = match first_failed_write {
+                    Some(reference) => {
+                        let mut encoded = Vec::new();
+                        let _ = reference.encode(&mut encoded);
+                        4 + encoded.len()
+                    }
+                    None if matches!(
+                        service_choice,
+                        ConfirmedServiceChoice::AddListElement
+                            | ConfirmedServiceChoice::RemoveListElement
+                    ) =>
+                    {
+                        4
+                    }
+                    None => 0,
+                };
                 3 + encoded_enumerated_len(*error_class)
                     + encoded_enumerated_len(*error_code)
                     + detail
@@ -483,6 +496,22 @@ impl Apdu {
                         let _ = encode_opening_tag(&mut buffer, 1);
                         let _ = reference.encode(&mut buffer);
                         let _ = encode_closing_tag(&mut buffer, 1);
+                    }
+                    // The list services answer with a Change-List-Error. Which
+                    // element failed is not tracked, so it is reported as 0.
+                    None if matches!(
+                        service_choice,
+                        ConfirmedServiceChoice::AddListElement
+                            | ConfirmedServiceChoice::RemoveListElement
+                    ) =>
+                    {
+                        let _ = encode_opening_tag(&mut buffer, 0);
+                        encode_enumerated(&mut buffer, *error_class);
+                        encode_enumerated(&mut buffer, *error_code);
+                        let _ = encode_closing_tag(&mut buffer, 0);
+                        if let Ok(element) = crate::encoding::encode_context_unsigned(0, 1) {
+                            buffer.extend_from_slice(&element);
+                        }
                     }
                     None => {
                         encode_enumerated(&mut buffer, *error_class);

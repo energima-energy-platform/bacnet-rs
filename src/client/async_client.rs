@@ -24,14 +24,22 @@ use tokio::{
 use crate::{
     app::{Apdu, MaxApduSize, MaxSegments},
     datalink::bip::BACNET_IP_PORT,
-    network::{NetworkAddress, Npdu},
+    network::{NetworkAddress, NetworkLayerMessage, NetworkMessageType, Npdu},
     object::{ObjectIdentifier, ObjectType, PropertyIdentifier, Segmentation},
     property::PropertyValue,
     service::{
-        cov_notification::CovNotification, AbortReason, ConfirmedServiceChoice, PropertyReference,
-        ReadAccessSpecification, ReadPropertyMultipleRequest, ReadPropertyMultipleResponse,
-        ReadPropertyRequest, ReadPropertyResponse, RejectReason, SubscribeCovRequest,
-        UnconfirmedServiceChoice, WhoIsRequest, WritePropertyMultipleRequest, WritePropertyRequest,
+        acknowledge_alarm::AcknowledgeAlarmRequest,
+        cov_notification::CovNotification,
+        event_information::{
+            AlarmSummary, EventSummary, GetAlarmSummaryAck, GetEventInformationAck,
+            GetEventInformationRequest,
+        },
+        event_notification::EventNotification,
+        list_element::ListElementRequest,
+        AbortReason, ConfirmedServiceChoice, PropertyReference, ReadAccessSpecification,
+        ReadPropertyMultipleRequest, ReadPropertyMultipleResponse, ReadPropertyRequest,
+        ReadPropertyResponse, RejectReason, SubscribeCovRequest, UnconfirmedServiceChoice,
+        WhoIsRequest, WritePropertyMultipleRequest, WritePropertyRequest,
     },
 };
 
@@ -40,7 +48,7 @@ use super::{
     decode_bacnet_ip_frame, decode_object_list_value, is_broadcast_target,
     parse_i_am_router_response, parse_iam_response, property_read_result, BacnetTarget,
     ClientConfig, ClientError, DeviceInfo, DiscoveredRouter, ObjectSnapshot, PropertyReadResult,
-    BVLC_ORIGINAL_UNICAST,
+    BVLC_ORIGINAL_BROADCAST, BVLC_ORIGINAL_UNICAST,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -575,6 +583,184 @@ impl AsyncBacnetClient {
             .collect())
     }
 
+    /// Add `elements` to a list property, leaving its other elements alone.
+    /// Elements already present are not added twice.
+    pub async fn add_list_element<T>(
+        &self,
+        target: T,
+        object: ObjectIdentifier,
+        property: PropertyIdentifier,
+        elements: Vec<PropertyValue>,
+    ) -> Result<(), ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        self.change_list(
+            target,
+            ConfirmedServiceChoice::AddListElement,
+            object,
+            property,
+            elements,
+        )
+        .await
+    }
+
+    /// Remove `elements` from a list property. The device refuses the whole
+    /// request if any of them is not in the list.
+    pub async fn remove_list_element<T>(
+        &self,
+        target: T,
+        object: ObjectIdentifier,
+        property: PropertyIdentifier,
+        elements: Vec<PropertyValue>,
+    ) -> Result<(), ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        self.change_list(
+            target,
+            ConfirmedServiceChoice::RemoveListElement,
+            object,
+            property,
+            elements,
+        )
+        .await
+    }
+
+    async fn change_list<T>(
+        &self,
+        target: T,
+        service: ConfirmedServiceChoice,
+        object: ObjectIdentifier,
+        property: PropertyIdentifier,
+        elements: Vec<PropertyValue>,
+    ) -> Result<(), ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let mut service_data = Vec::new();
+        ListElementRequest::new(object, property, elements).encode(&mut service_data)?;
+        self.send_confirmed_request(&target.into(), service, service_data)
+            .await?;
+        Ok(())
+    }
+
+    /// Every object the device holds outside normal or awaiting
+    /// acknowledgement, following `more_events` through every page.
+    pub async fn get_event_information<T>(
+        &self,
+        target: T,
+    ) -> Result<Vec<EventSummary>, ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let target = target.into();
+        let mut summaries: Vec<EventSummary> = Vec::new();
+        let mut request = GetEventInformationRequest::default();
+        loop {
+            let mut service_data = Vec::new();
+            request.encode(&mut service_data)?;
+            let response = self
+                .send_confirmed_request(
+                    &target,
+                    ConfirmedServiceChoice::GetEventInformation,
+                    service_data,
+                )
+                .await?;
+            let page = GetEventInformationAck::decode(&response)?;
+            let last = page
+                .list_of_event_summaries
+                .last()
+                .map(|summary| summary.object_identifier);
+            summaries.extend(page.list_of_event_summaries);
+            match (page.more_events, last) {
+                // A device claiming more after an empty page would loop forever.
+                (true, Some(last)) if request.last_received_object_identifier != Some(last) => {
+                    request.last_received_object_identifier = Some(last);
+                }
+                _ => return Ok(summaries),
+            }
+        }
+    }
+
+    /// The objects in alarm, by the older GetAlarmSummary service, for a
+    /// device that does not execute GetEventInformation.
+    pub async fn get_alarm_summary<T>(&self, target: T) -> Result<Vec<AlarmSummary>, ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let response = self
+            .send_confirmed_request(
+                &target.into(),
+                ConfirmedServiceChoice::GetAlarmSummary,
+                Vec::new(),
+            )
+            .await?;
+        Ok(GetAlarmSummaryAck::decode(&response)?.alarms)
+    }
+
+    /// Acknowledge one transition of an alarm.
+    pub async fn acknowledge_alarm<T>(
+        &self,
+        target: T,
+        request: &AcknowledgeAlarmRequest,
+    ) -> Result<(), ClientError>
+    where
+        T: Into<BacnetTarget>,
+    {
+        let mut service_data = Vec::new();
+        request.encode(&mut service_data)?;
+        self.send_confirmed_request(
+            &target.into(),
+            ConfirmedServiceChoice::AcknowledgeAlarm,
+            service_data,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Ask the local segment what network number its routers give it, and
+    /// collect every Network-Number-Is until the timeout elapses. Empty on a
+    /// segment with no router, where the number is 0 for every device on it.
+    pub async fn what_is_network_number(&self) -> Result<Vec<NetworkNumber>, ClientError> {
+        let broadcast = SocketAddr::from(([255, 255, 255, 255], BACNET_IP_PORT));
+        let frame = create_network_message_frame(NetworkMessageType::WhatIsNetworkNumber);
+        let (sink, mut responses) = mpsc::unbounded_channel();
+        self.commands
+            .send(EndpointCommand::DiscoverNetworkNumber {
+                frame,
+                destination: broadcast,
+                sink,
+            })
+            .await
+            .map_err(|_| ClientError::EndpointClosed)?;
+        let mut answers: Vec<NetworkNumber> = Vec::new();
+        while let Some(answer) = responses.recv().await {
+            let answer = answer?;
+            if !answers.contains(&answer) {
+                answers.push(answer);
+            }
+        }
+        Ok(answers)
+    }
+
+    /// Listen for event notifications, confirmed and unconfirmed, whatever
+    /// process identifier or recipient they were sent for.
+    ///
+    /// Every listener sees every notification. A confirmed one is acknowledged
+    /// once it has been handed to the listeners; a retransmission of one
+    /// already handed over is acknowledged again but not delivered twice.
+    /// While no listener is open a confirmed notification is rejected as an
+    /// unrecognized service, so the device does not believe it delivered.
+    pub async fn event_notifications(&self) -> Result<EventListener, ClientError> {
+        let (sink, events) = mpsc::unbounded_channel();
+        self.commands
+            .send(EndpointCommand::ListenEvents { sink })
+            .await
+            .map_err(|_| ClientError::EndpointClosed)?;
+        Ok(EventListener { events })
+    }
+
     /// Subscribe to Change-of-Value notifications for one object.
     ///
     /// `device_instance` is the instance number of the device being subscribed
@@ -642,6 +828,72 @@ impl AsyncBacnetClient {
             client: self.clone(),
             notifications,
         })
+    }
+}
+
+/// A router's answer to What-Is-Network-Number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkNumber {
+    pub router: SocketAddr,
+    pub network: u16,
+    /// Set by configuration, rather than learned from another router.
+    pub configured: bool,
+}
+
+/// Network-Number-Is: the number, then 0 for learned or 1 for configured.
+/// Some routers omit the flag; theirs is taken as configured.
+fn parse_network_number_is(payload: &[u8], router: SocketAddr) -> Option<NetworkNumber> {
+    let message = NetworkLayerMessage::decode(payload).ok()?;
+    if message.message_type != NetworkMessageType::NetworkNumberIs {
+        return None;
+    }
+    let data = message.data().unwrap_or_default();
+    let network = u16::from_be_bytes([*data.first()?, *data.get(1)?]);
+    Some(NetworkNumber {
+        router,
+        network,
+        configured: data.get(2).is_none_or(|&flag| flag == 1),
+    })
+}
+
+fn create_network_message_frame(message_type: NetworkMessageType) -> Vec<u8> {
+    let mut npdu = Npdu::new();
+    npdu.control.network_message = true;
+    let mut payload = npdu.encode();
+    payload.extend_from_slice(&NetworkLayerMessage::new(message_type, None).encode());
+    let length = payload.len() + 4;
+    let mut frame = vec![
+        0x81,
+        BVLC_ORIGINAL_BROADCAST,
+        (length >> 8) as u8,
+        length as u8,
+    ];
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// An event notification as it arrived.
+#[derive(Debug, Clone)]
+pub struct ReceivedEvent {
+    pub notification: EventNotification,
+    /// The datagram's sender: the device, or the router it is behind.
+    pub source: SocketAddr,
+    /// The network-layer source, for a device behind a router.
+    pub route: Option<NetworkAddress>,
+    /// Sent as ConfirmedEventNotification, and acknowledged as one.
+    pub confirmed: bool,
+}
+
+/// Every event notification the client receives, from the moment it was
+/// opened. See [`AsyncBacnetClient::event_notifications`].
+pub struct EventListener {
+    events: mpsc::UnboundedReceiver<ReceivedEvent>,
+}
+
+impl EventListener {
+    /// The next notification, or `None` once the client has shut down.
+    pub async fn recv(&mut self) -> Option<ReceivedEvent> {
+        self.events.recv().await
     }
 }
 
@@ -751,8 +1003,16 @@ enum EndpointCommand {
         destination: SocketAddr,
         sink: mpsc::UnboundedSender<Result<DiscoveredRouter, ClientError>>,
     },
+    DiscoverNetworkNumber {
+        frame: Vec<u8>,
+        destination: SocketAddr,
+        sink: mpsc::UnboundedSender<Result<NetworkNumber, ClientError>>,
+    },
     PeerHealth {
         sink: oneshot::Sender<Vec<PeerHealth>>,
+    },
+    ListenEvents {
+        sink: mpsc::UnboundedSender<ReceivedEvent>,
     },
     SubscribeCov {
         target: BacnetTarget,
@@ -899,6 +1159,22 @@ type TransactionKey = (SocketAddr, u8);
 /// identity a notification asserts about itself cannot collide that way.
 type CovKey = (u32, ObjectIdentifier);
 
+/// A confirmed event notification already handed to the listeners.
+struct DeliveredEvent {
+    at: Instant,
+    source: SocketAddr,
+    invoke_id: u8,
+    service_data: Vec<u8>,
+}
+
+/// Longer than any device's APDU timeout times its retries, so every
+/// retransmission of one notification falls inside it.
+const EVENT_RETRANSMISSION_WINDOW: Duration = Duration::from_secs(120);
+
+/// Bounds the table for a site sending a burst; a notification evicted early
+/// is at worst delivered twice.
+const DELIVERED_EVENTS_KEPT: usize = 512;
+
 struct Endpoint {
     socket: UdpSocket,
     commands: mpsc::Receiver<EndpointCommand>,
@@ -923,7 +1199,12 @@ struct Endpoint {
     quarantined: HashMap<TransactionKey, Instant>,
     device_discoveries: Vec<ActiveDiscovery<DeviceInfo>>,
     router_discoveries: Vec<ActiveDiscovery<DiscoveredRouter>>,
+    network_number_discoveries: Vec<ActiveDiscovery<NetworkNumber>>,
     cov_subscribers: HashMap<CovKey, mpsc::UnboundedSender<CovNotification>>,
+    event_listeners: Vec<mpsc::UnboundedSender<ReceivedEvent>>,
+    /// Confirmed event notifications recently delivered, so a retransmission
+    /// after a lost SimpleACK is acknowledged without a second delivery.
+    delivered_events: VecDeque<DeliveredEvent>,
     next_invoke_id: u8,
     /// What each peer's answers have taken. A request then waits about as long
     /// as that peer needs rather than as long as the slowest on the network.
@@ -950,7 +1231,10 @@ impl Endpoint {
             quarantined: HashMap::new(),
             device_discoveries: Vec::new(),
             router_discoveries: Vec::new(),
+            network_number_discoveries: Vec::new(),
             cov_subscribers: HashMap::new(),
+            event_listeners: Vec::new(),
+            delivered_events: VecDeque::new(),
             next_invoke_id: 0,
             rtt: HashMap::new(),
             timeout,
@@ -969,6 +1253,7 @@ impl Endpoint {
                 .map(|pending| pending.deadline)
                 .chain(self.device_discoveries.iter().map(|d| d.deadline))
                 .chain(self.router_discoveries.iter().map(|d| d.deadline))
+                .chain(self.network_number_discoveries.iter().map(|d| d.deadline))
                 .min();
             let timeout_at = next_deadline.unwrap_or_else(|| {
                 Instant::now()
@@ -1030,6 +1315,16 @@ impl Endpoint {
                     self.router_discoveries.push(discovery);
                 }
             }
+            EndpointCommand::DiscoverNetworkNumber {
+                frame,
+                destination,
+                sink,
+            } => {
+                if let Some(discovery) = self.start_discovery(&frame, destination, sink).await {
+                    self.network_number_discoveries.push(discovery);
+                }
+            }
+            EndpointCommand::ListenEvents { sink } => self.event_listeners.push(sink),
             EndpointCommand::SubscribeCov {
                 target,
                 key,
@@ -1258,6 +1553,13 @@ impl Endpoint {
                         }
                     }
                 }
+                if !self.network_number_discoveries.is_empty() {
+                    if let Some(answer) = parse_network_number_is(frame.payload, source) {
+                        for discovery in &self.network_number_discoveries {
+                            let _ = discovery.sink.send(Ok(answer));
+                        }
+                    }
+                }
                 return;
             }
 
@@ -1271,15 +1573,31 @@ impl Endpoint {
                         }
                     }
                 }
-                if !self.cov_subscribers.is_empty() {
-                    if let Ok(Apdu::UnconfirmedRequest {
-                        service_choice: UnconfirmedServiceChoice::UnconfirmedCOVNotification,
-                        service_data,
-                    }) = Apdu::decode(frame.payload)
-                    {
-                        if let Ok(notification) = CovNotification::decode(&service_data) {
-                            self.dispatch_cov_notification(notification);
+                if !self.cov_subscribers.is_empty() || !self.event_listeners.is_empty() {
+                    match Apdu::decode(frame.payload) {
+                        Ok(Apdu::UnconfirmedRequest {
+                            service_choice: UnconfirmedServiceChoice::UnconfirmedCOVNotification,
+                            service_data,
+                        }) => {
+                            if let Ok(notification) = CovNotification::decode(&service_data) {
+                                self.dispatch_cov_notification(notification);
+                            }
                         }
+                        Ok(Apdu::UnconfirmedRequest {
+                            service_choice: UnconfirmedServiceChoice::UnconfirmedEventNotification,
+                            service_data,
+                        }) => match EventNotification::decode(&service_data) {
+                            Ok(notification) => self.dispatch_event(ReceivedEvent {
+                                notification,
+                                source,
+                                route: frame.npdu.source.clone(),
+                                confirmed: false,
+                            }),
+                            Err(error) => log::debug!(
+                                "undecodable event notification from {source}: {error:?}"
+                            ),
+                        },
+                        _ => {}
                     }
                 }
                 return;
@@ -1301,6 +1619,23 @@ impl Endpoint {
             } = apdu
             {
                 self.handle_confirmed_cov_notification(
+                    invoke_id,
+                    segmented,
+                    service_data,
+                    source,
+                    frame.npdu.source.clone(),
+                );
+                return;
+            }
+            if let Apdu::ConfirmedRequest {
+                invoke_id,
+                segmented,
+                service_choice: ConfirmedServiceChoice::ConfirmedEventNotification,
+                ref service_data,
+                ..
+            } = apdu
+            {
+                self.handle_confirmed_event_notification(
                     invoke_id,
                     segmented,
                     service_data,
@@ -1572,6 +1907,7 @@ impl Endpoint {
         // caller's collection loop.
         self.device_discoveries.retain(|d| d.deadline > now);
         self.router_discoveries.retain(|d| d.deadline > now);
+        self.network_number_discoveries.retain(|d| d.deadline > now);
         let expired = self
             .pending
             .iter()
@@ -1707,6 +2043,86 @@ impl Endpoint {
         let _ = self.socket.try_send_to(&frame, source);
     }
 
+    fn dispatch_event(&mut self, event: ReceivedEvent) {
+        self.event_listeners
+            .retain(|sink| sink.send(event.clone()).is_ok());
+    }
+
+    /// Decode, deliver and acknowledge an inbound ConfirmedEventNotification.
+    fn handle_confirmed_event_notification(
+        &mut self,
+        invoke_id: u8,
+        segmented: bool,
+        service_data: &[u8],
+        source: SocketAddr,
+        route: Option<NetworkAddress>,
+    ) {
+        self.event_listeners.retain(|sink| !sink.is_closed());
+        let simple_ack = Apdu::SimpleAck {
+            invoke_id,
+            service_choice: ConfirmedServiceChoice::ConfirmedEventNotification as u8,
+        };
+        let now = Instant::now();
+        while self
+            .delivered_events
+            .front()
+            .is_some_and(|delivered| now.duration_since(delivered.at) > EVENT_RETRANSMISSION_WINDOW)
+        {
+            self.delivered_events.pop_front();
+        }
+
+        let reply = if segmented {
+            Apdu::Abort {
+                server: true,
+                invoke_id,
+                abort_reason: AbortReason::SegmentationNotSupported,
+            }
+        } else if self.event_listeners.is_empty() {
+            Apdu::Reject {
+                invoke_id,
+                reject_reason: RejectReason::UnrecognizedService,
+            }
+        } else if self.delivered_events.iter().any(|delivered| {
+            delivered.source == source
+                && delivered.invoke_id == invoke_id
+                && delivered.service_data == service_data
+        }) {
+            simple_ack
+        } else {
+            match EventNotification::decode(service_data) {
+                Ok(notification) => {
+                    self.dispatch_event(ReceivedEvent {
+                        notification,
+                        source,
+                        route: route.clone(),
+                        confirmed: true,
+                    });
+                    if self.delivered_events.len() == DELIVERED_EVENTS_KEPT {
+                        self.delivered_events.pop_front();
+                    }
+                    self.delivered_events.push_back(DeliveredEvent {
+                        at: now,
+                        source,
+                        invoke_id,
+                        service_data: service_data.to_vec(),
+                    });
+                    simple_ack
+                }
+                Err(error) => {
+                    log::warn!("undecodable confirmed event notification from {source}: {error:?}");
+                    Apdu::Reject {
+                        invoke_id,
+                        reject_reason: RejectReason::InvalidTag,
+                    }
+                }
+            }
+        };
+        let frame = build_response_frame(&reply, route);
+        // Best-effort, as for COV: a lost ack only brings a retransmission,
+        // which the table above recognises.
+        let _ = self.socket.try_send_to(&frame, source);
+    }
+
     fn remove_cancelled(&mut self) {
         self.pending
             .retain(|_, pending| !pending.response.is_closed());
@@ -1714,7 +2130,10 @@ impl Endpoint {
             .retain(|discovery| !discovery.sink.is_closed());
         self.router_discoveries
             .retain(|discovery| !discovery.sink.is_closed());
+        self.network_number_discoveries
+            .retain(|discovery| !discovery.sink.is_closed());
         self.cov_subscribers.retain(|_, sink| !sink.is_closed());
+        self.event_listeners.retain(|sink| !sink.is_closed());
     }
 
     fn fail_all<F>(&mut self, mut error: F)
@@ -1728,6 +2147,9 @@ impl Endpoint {
             let _ = discovery.sink.send(Err(error()));
         }
         for discovery in self.router_discoveries.drain(..) {
+            let _ = discovery.sink.send(Err(error()));
+        }
+        for discovery in self.network_number_discoveries.drain(..) {
             let _ = discovery.sink.send(Err(error()));
         }
     }

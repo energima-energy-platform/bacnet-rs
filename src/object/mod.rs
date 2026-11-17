@@ -176,6 +176,8 @@ pub enum ObjectError {
     NoSpaceToWriteProperty,
     /// A time stamp does not match the one the device recorded.
     InvalidTimeStamp,
+    /// An element to remove from a list is not in it.
+    ListElementNotFound,
     /// Invalid object configuration
     InvalidConfiguration(String),
 }
@@ -200,6 +202,7 @@ impl fmt::Display for ObjectError {
             ObjectError::NoSpaceToAddListElement => write!(f, "No space to add list element"),
             ObjectError::NoSpaceToWriteProperty => write!(f, "No space to write property"),
             ObjectError::InvalidTimeStamp => write!(f, "Invalid time stamp"),
+            ObjectError::ListElementNotFound => write!(f, "List element not found"),
             ObjectError::InvalidConfiguration(msg) => write!(f, "Invalid configuration: {}", msg),
         }
     }
@@ -997,6 +1000,10 @@ impl ProtocolServicesSupported {
     /// Services executed by the hosted object server.
     pub fn hosted_object_services() -> Self {
         Self::ACKNOWLEDGE_ALARM
+            | Self::GET_ALARM_SUMMARY
+            | Self::GET_EVENT_INFORMATION
+            | Self::ADD_LIST_ELEMENT
+            | Self::REMOVE_LIST_ELEMENT
             | Self::READ_PROPERTY
             | Self::READ_PROPERTY_MULTIPLE
             | Self::WRITE_PROPERTY
@@ -1243,14 +1250,15 @@ mod tests {
                 .enumerate()
                 .filter_map(|(index, enabled)| enabled.then_some(index))
                 .collect::<Vec<_>>(),
-            // AcknowledgeAlarm (0), SubscribeCOV (5), ReadProperty (12),
+            // AcknowledgeAlarm (0), GetAlarmSummary (3), SubscribeCOV (5),
+            // AddListElement (8), RemoveListElement (9), ReadProperty (12),
             // ReadPropertyMultiple (14), WriteProperty (15),
-            // WritePropertyMultiple (16), I-Am (26),
-            // Who-Is (34), SubscribeCOVProperty (38). These are
+            // WritePropertyMultiple (16), I-Am (26), Who-Is (34),
+            // SubscribeCOVProperty (38), GetEventInformation (39). These are
             // BACnetServicesSupported bit numbers, which are not the service
             // choices the APDU carries: SubscribeCOVProperty arrives as service
             // choice 28.
-            vec![0, 5, 12, 14, 15, 16, 26, 34, 38]
+            vec![0, 3, 5, 8, 9, 12, 14, 15, 16, 26, 34, 38, 39]
         );
 
         let PropertyValue::BitString(object_types) = device
