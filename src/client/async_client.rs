@@ -657,7 +657,11 @@ impl AsyncBacnetClient {
         let target = target.into();
         let mut summaries: Vec<EventSummary> = Vec::new();
         let mut request = GetEventInformationRequest::default();
-        loop {
+        // Where each page ended. The standard leaves the order of pages to the
+        // device, so a page ending where an earlier one did is the only sign
+        // of one that would page forever, round any cycle.
+        let mut ends: HashSet<ObjectIdentifier> = HashSet::new();
+        for _ in 0..MAX_EVENT_PAGES {
             let mut service_data = Vec::new();
             request.encode(&mut service_data)?;
             let response = self
@@ -668,19 +672,23 @@ impl AsyncBacnetClient {
                 )
                 .await?;
             let page = GetEventInformationAck::decode(&response)?;
-            let last = page
+            let Some(last) = page
                 .list_of_event_summaries
                 .last()
-                .map(|summary| summary.object_identifier);
-            summaries.extend(page.list_of_event_summaries);
-            match (page.more_events, last) {
-                // A device claiming more after an empty page would loop forever.
-                (true, Some(last)) if request.last_received_object_identifier != Some(last) => {
-                    request.last_received_object_identifier = Some(last);
-                }
-                _ => return Ok(summaries),
+                .map(|summary| summary.object_identifier)
+            else {
+                return Ok(summaries);
+            };
+            if !ends.insert(last) {
+                return Ok(summaries);
             }
+            summaries.extend(page.list_of_event_summaries);
+            if !page.more_events {
+                return Ok(summaries);
+            }
+            request.last_received_object_identifier = Some(last);
         }
+        Ok(summaries)
     }
 
     /// The objects in alarm, by the older GetAlarmSummary service, for a
@@ -871,6 +879,9 @@ fn create_network_message_frame(message_type: NetworkMessageType) -> Vec<u8> {
     frame.extend_from_slice(&payload);
     frame
 }
+
+/// Far past any real device's alarm list at a few summaries a page.
+const MAX_EVENT_PAGES: usize = 1000;
 
 /// An event notification as it arrived.
 #[derive(Debug, Clone)]
