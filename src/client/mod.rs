@@ -670,15 +670,25 @@ fn create_who_is_network_frame(network: u16, service_data: &[u8]) -> Vec<u8> {
 /// Build a Who-Is-Router-To-Network network-layer message.
 #[cfg(feature = "std")]
 fn create_who_is_router_frame(destination_network: Option<u16>, broadcast: bool) -> Vec<u8> {
+    create_network_message_frame(
+        NetworkMessageType::WhoIsRouterToNetwork,
+        destination_network.map(|network| network.to_be_bytes().to_vec()),
+        broadcast,
+    )
+}
+
+/// Build a network-layer message, broadcast or to one address.
+#[cfg(feature = "std")]
+fn create_network_message_frame(
+    message_type: NetworkMessageType,
+    data: Option<Vec<u8>>,
+    broadcast: bool,
+) -> Vec<u8> {
     let mut npdu = Npdu::new();
     npdu.control.network_message = true;
 
-    let message_data = destination_network.map(|network| network.to_be_bytes().to_vec());
-    let network_message =
-        NetworkLayerMessage::new(NetworkMessageType::WhoIsRouterToNetwork, message_data);
-
     let mut payload = npdu.encode();
-    payload.extend_from_slice(&network_message.encode());
+    payload.extend_from_slice(&NetworkLayerMessage::new(message_type, data).encode());
     wrap_bvlc(
         if broadcast {
             BVLC_ORIGINAL_BROADCAST
