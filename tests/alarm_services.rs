@@ -388,3 +388,39 @@ async fn paging_stops_when_a_device_goes_round_in_circles() {
     .unwrap();
     assert_eq!(summaries.len(), 2);
 }
+
+/// Asked of one router, What-Is-Network-Number goes as a unicast, and its
+/// answer's number and configured flag are read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_router_asked_directly_says_its_network_number() {
+    let router = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    router
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let address = router.local_addr().unwrap();
+    let answering = std::thread::spawn(move || {
+        let mut buffer = [0u8; 64];
+        let (length, peer) = router.recv_from(&mut buffer).unwrap();
+        // BVLC original-unicast, NPDU with the network-message bit, What-Is.
+        assert_eq!(&buffer[..2], &[0x81, 0x0a]);
+        assert_eq!(&buffer[4..7], &[0x01, 0x80, 0x12]);
+        assert_eq!(length, 7);
+        // Network-Number-Is: network 26001, configured.
+        let reply = [0x81, 0x0a, 0x00, 0x0a, 0x01, 0x80, 0x13, 0x65, 0x91, 0x01];
+        router.send_to(&reply, peer).unwrap();
+    });
+
+    let client = AsyncBacnetClient::from_config(ClientConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        timeout: Duration::from_millis(500),
+        retries: 0,
+    })
+    .await
+    .unwrap();
+    let answers = client.what_is_network_number_to(address).await.unwrap();
+    answering.join().unwrap();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].network, 26001);
+    assert!(answers[0].configured);
+}

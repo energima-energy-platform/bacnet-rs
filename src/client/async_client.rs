@@ -44,11 +44,11 @@ use crate::{
 };
 
 use super::{
-    create_unconfirmed_frame, create_who_is_network_frame, create_who_is_router_frame,
-    decode_bacnet_ip_frame, decode_object_list_value, is_broadcast_target,
-    parse_i_am_router_response, parse_iam_response, property_read_result, BacnetTarget,
-    ClientConfig, ClientError, DeviceInfo, DiscoveredRouter, ObjectSnapshot, PropertyReadResult,
-    BVLC_ORIGINAL_BROADCAST, BVLC_ORIGINAL_UNICAST,
+    create_network_message_frame, create_unconfirmed_frame, create_who_is_network_frame,
+    create_who_is_router_frame, decode_bacnet_ip_frame, decode_object_list_value,
+    is_broadcast_target, parse_i_am_router_response, parse_iam_response, property_read_result,
+    BacnetTarget, ClientConfig, ClientError, DeviceInfo, DiscoveredRouter, ObjectSnapshot,
+    PropertyReadResult, BVLC_ORIGINAL_UNICAST,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -732,12 +732,25 @@ impl AsyncBacnetClient {
     /// segment with no router, where the number is 0 for every device on it.
     pub async fn what_is_network_number(&self) -> Result<Vec<NetworkNumber>, ClientError> {
         let broadcast = SocketAddr::from(([255, 255, 255, 255], BACNET_IP_PORT));
-        let frame = create_network_message_frame(NetworkMessageType::WhatIsNetworkNumber);
+        self.what_is_network_number_to(broadcast).await
+    }
+
+    /// [`Self::what_is_network_number`], sent to `target`: one router, or a
+    /// directed broadcast.
+    pub async fn what_is_network_number_to(
+        &self,
+        target: SocketAddr,
+    ) -> Result<Vec<NetworkNumber>, ClientError> {
+        let frame = create_network_message_frame(
+            NetworkMessageType::WhatIsNetworkNumber,
+            None,
+            is_broadcast_target(target),
+        );
         let (sink, mut responses) = mpsc::unbounded_channel();
         self.commands
             .send(EndpointCommand::DiscoverNetworkNumber {
                 frame,
-                destination: broadcast,
+                destination: target,
                 sink,
             })
             .await
@@ -862,22 +875,6 @@ fn parse_network_number_is(payload: &[u8], router: SocketAddr) -> Option<Network
         network,
         configured: data.get(2).is_none_or(|&flag| flag == 1),
     })
-}
-
-fn create_network_message_frame(message_type: NetworkMessageType) -> Vec<u8> {
-    let mut npdu = Npdu::new();
-    npdu.control.network_message = true;
-    let mut payload = npdu.encode();
-    payload.extend_from_slice(&NetworkLayerMessage::new(message_type, None).encode());
-    let length = payload.len() + 4;
-    let mut frame = vec![
-        0x81,
-        BVLC_ORIGINAL_BROADCAST,
-        (length >> 8) as u8,
-        length as u8,
-    ];
-    frame.extend_from_slice(&payload);
-    frame
 }
 
 /// Far past any real device's alarm list at a few summaries a page.
