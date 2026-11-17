@@ -698,7 +698,9 @@ impl RouterManager {
 
     /// Handle What-Is-Network-Number message
     fn handle_what_is_network_number(&self) -> Result<Option<NetworkLayerMessage>> {
-        let response_data = self.local_network.to_be_bytes().to_vec();
+        // The number, then 1: a router's own port numbers are configured.
+        let mut response_data = self.local_network.to_be_bytes().to_vec();
+        response_data.push(1);
         Ok(Some(NetworkLayerMessage::new(
             NetworkMessageType::NetworkNumberIs,
             Some(response_data),
@@ -1670,7 +1672,7 @@ mod tests {
         assert!(response.is_some());
         if let Some(resp) = response {
             assert_eq!(resp.message_type, NetworkMessageType::NetworkNumberIs);
-            assert_eq!(resp.data, vec![0x00, 0x01].into()); // Network 1
+            assert_eq!(resp.data, vec![0x00, 0x01, 0x01].into()); // Network 1, configured
         }
 
         // Test Router-Busy-To-Network

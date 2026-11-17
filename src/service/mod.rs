@@ -164,8 +164,12 @@
 pub mod acknowledge_alarm;
 /// ConfirmedEventNotification and UnconfirmedEventNotification services
 pub mod cov_notification;
+/// GetEventInformation and GetAlarmSummary services
+pub mod event_information;
 /// ConfirmedEventNotification and UnconfirmedEventNotification services
 pub mod event_notification;
+/// AddListElement and RemoveListElement services
+pub mod list_element;
 
 #[cfg(feature = "std")]
 use std::error::Error;

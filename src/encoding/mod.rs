@@ -1114,6 +1114,91 @@ pub fn is_context_tag(data: &[u8], tag: u8) -> bool {
     matches!(decode_tag(data), Ok((BACnetTag::Context(actual), _, _)) if actual == tag)
 }
 
+/// Encode a BIT STRING under a context tag.
+pub fn encode_context_bit_string(buffer: &mut Vec<u8>, tag: u8, bits: &[bool]) -> Result<()> {
+    let byte_count = bits.len().div_ceil(8);
+    let unused_bits = if bits.len().is_multiple_of(8) {
+        0
+    } else {
+        8 - (bits.len() % 8)
+    };
+
+    encode_context_tag(buffer, tag, byte_count + 1)?;
+    buffer.push(unused_bits as u8);
+
+    let mut current = 0u8;
+    let mut offset = 0;
+    for &bit in bits {
+        if bit {
+            current |= 1 << (7 - offset);
+        }
+        offset += 1;
+        if offset == 8 {
+            buffer.push(current);
+            current = 0;
+            offset = 0;
+        }
+    }
+    if offset > 0 {
+        buffer.push(current);
+    }
+
+    Ok(())
+}
+
+/// Decode a context-tagged BIT STRING.
+pub fn decode_context_bit_string(data: &[u8], tag: u8) -> Result<(Vec<bool>, usize)> {
+    let (actual, length, header) = decode_context_tag(data)?;
+    if actual != tag || length == 0 {
+        return Err(EncodingError::InvalidTag);
+    }
+    let content = data
+        .get(header..header + length)
+        .ok_or(EncodingError::BufferUnderflow)?;
+    let unused = usize::from(content[0]);
+    if unused > 7 || (content.len() == 1 && unused != 0) {
+        return Err(EncodingError::InvalidFormat(
+            "invalid unused bit count".into(),
+        ));
+    }
+    let total = (content.len() - 1) * 8 - unused;
+    let bits = (0..total)
+        .map(|index| content[1 + index / 8] & (0x80 >> (index % 8)) != 0)
+        .collect();
+    Ok((bits, header + length))
+}
+
+/// How many octets lie between an opening tag `tag` and its matching closing
+/// tag, for `data` starting just after the opening tag. Nested constructs are
+/// stepped over, so a value can be kept whole without being understood.
+pub fn enclosed_length(data: &[u8], tag: u8) -> Result<usize> {
+    let mut offset = 0;
+    let mut depth = 0usize;
+    loop {
+        let (kind, length, header) = decode_tag(data.get(offset..).unwrap_or_default())?;
+        match kind {
+            BACnetTag::Opening(_) => depth += 1,
+            BACnetTag::Closing(closed) if depth == 0 => {
+                return if closed == tag {
+                    Ok(offset)
+                } else {
+                    Err(EncodingError::InvalidTag)
+                };
+            }
+            BACnetTag::Closing(_) => depth -= 1,
+            // An application Boolean carries its value in the length nibble.
+            BACnetTag::Application(ApplicationTag::Boolean) => {}
+            _ => {
+                if data.len() < offset + header + length {
+                    return Err(EncodingError::BufferUnderflow);
+                }
+                offset += length;
+            }
+        }
+        offset += header;
+    }
+}
+
 /// Decode a context-specific unsigned integer
 pub fn decode_context_unsigned(data: &[u8], expected_tag: u8) -> Result<(u32, usize)> {
     let (tag_number, length, tag_consumed) = decode_context_tag(data)?;
