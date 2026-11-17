@@ -172,6 +172,10 @@ pub enum Apdu {
         /// WritePropertyMultiple-Error's firstFailedWriteAttempt: the writes
         /// before it were performed, those after it were not.
         first_failed_write: Option<ObjectPropertyReference>,
+        /// Change-List-Error's firstFailedElementNumber, counted from 1, for
+        /// AddListElement and RemoveListElement. Encoded as 0, "no one
+        /// element", when absent.
+        first_failed_element: Option<u32>,
     },
 
     /// Reject PDU
@@ -303,23 +307,23 @@ impl Apdu {
                 error_class,
                 error_code,
                 first_failed_write,
+                first_failed_element,
                 ..
             } => {
                 // An extended error adds two pairs of one-octet tags; a
-                // Change-List-Error one pair and the element number 0 in two.
+                // Change-List-Error one pair and the element number.
                 let detail = match first_failed_write {
                     Some(reference) => {
                         let mut encoded = Vec::new();
                         let _ = reference.encode(&mut encoded);
                         4 + encoded.len()
                     }
-                    None if matches!(
-                        service_choice,
-                        ConfirmedServiceChoice::AddListElement
-                            | ConfirmedServiceChoice::RemoveListElement
-                    ) =>
-                    {
-                        4
+                    None if is_list_service(*service_choice) => {
+                        2 + crate::encoding::encode_context_unsigned(
+                            first_failed_element.unwrap_or(0),
+                            1,
+                        )
+                        .map_or(0, |element| element.len())
                     }
                     None => 0,
                 };
@@ -479,6 +483,7 @@ impl Apdu {
                 error_class,
                 error_code,
                 first_failed_write,
+                first_failed_element,
             } => {
                 // PDU Type
                 buffer.push((ApduType::Error as u8) << 4);
@@ -497,19 +502,16 @@ impl Apdu {
                         let _ = reference.encode(&mut buffer);
                         let _ = encode_closing_tag(&mut buffer, 1);
                     }
-                    // The list services answer with a Change-List-Error. Which
-                    // element failed is not tracked, so it is reported as 0.
-                    None if matches!(
-                        service_choice,
-                        ConfirmedServiceChoice::AddListElement
-                            | ConfirmedServiceChoice::RemoveListElement
-                    ) =>
-                    {
+                    // The list services answer with a Change-List-Error.
+                    None if is_list_service(*service_choice) => {
                         let _ = encode_opening_tag(&mut buffer, 0);
                         encode_enumerated(&mut buffer, *error_class);
                         encode_enumerated(&mut buffer, *error_code);
                         let _ = encode_closing_tag(&mut buffer, 0);
-                        if let Ok(element) = crate::encoding::encode_context_unsigned(0, 1) {
+                        if let Ok(element) = crate::encoding::encode_context_unsigned(
+                            first_failed_element.unwrap_or(0),
+                            1,
+                        ) {
                             buffer.extend_from_slice(&element);
                         }
                     }
@@ -809,6 +811,7 @@ impl Apdu {
                     decode_enumerated(&data[pos..]).map_err(|_| invalid("error code"))?;
                 pos += offset;
                 let mut first_failed_write = None;
+                let mut first_failed_element = None;
                 if extended {
                     pos += decode_closing_tag(&data[pos..], 0).map_err(|_| invalid("error"))?;
                     if service_choice == ConfirmedServiceChoice::WritePropertyMultiple {
@@ -820,6 +823,11 @@ impl Apdu {
                         decode_closing_tag(&data[pos..], 1)
                             .map_err(|_| invalid("first failed write"))?;
                         first_failed_write = Some(reference);
+                    } else if is_list_service(service_choice) {
+                        let (element, _) =
+                            crate::encoding::decode_context_unsigned(&data[pos..], 1)
+                                .map_err(|_| invalid("first failed element"))?;
+                        first_failed_element = Some(element);
                     }
                 }
 
@@ -829,6 +837,7 @@ impl Apdu {
                     error_class,
                     error_code,
                     first_failed_write,
+                    first_failed_element,
                 })
             }
 
@@ -1440,6 +1449,7 @@ impl ApplicationLayerHandler {
                                 error_class: 0, // Object
                                 error_code: 0,  // Unknown object
                                 first_failed_write: None,
+                                first_failed_element: None,
                             }))
                         }
                     }
@@ -1847,6 +1857,14 @@ impl Default for ApplicationConfig {
     }
 }
 
+/// The services whose Error is a Change-List-Error.
+fn is_list_service(service: ConfirmedServiceChoice) -> bool {
+    matches!(
+        service,
+        ConfirmedServiceChoice::AddListElement | ConfirmedServiceChoice::RemoveListElement
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1903,6 +1921,7 @@ mod tests {
             error_class: 300,
             error_code: 70_000,
             first_failed_write: None,
+            first_failed_element: None,
         };
 
         let encoded = apdu.encode();
@@ -1934,6 +1953,7 @@ mod tests {
             error_class: 2,
             error_code: 37,
             first_failed_write: Some(reference.clone()),
+            first_failed_element: None,
         };
 
         let encoded = apdu.encode();
@@ -1946,8 +1966,37 @@ mod tests {
                 error_class: 2,
                 error_code: 37,
                 first_failed_write: Some(decoded),
+                first_failed_element: None,
                 ..
             } if decoded == reference
+        ));
+    }
+
+    #[test]
+    fn a_change_list_error_names_the_element_that_failed() {
+        let apdu = Apdu::Error {
+            invoke_id: 7,
+            service_choice: ConfirmedServiceChoice::RemoveListElement,
+            error_class: 5,
+            error_code: 81,
+            first_failed_write: None,
+            first_failed_element: Some(2),
+        };
+
+        let encoded = apdu.encode();
+
+        assert_eq!(encoded.len(), apdu.encoded_len());
+        // [0] { services, list-element-not-found } [1] 2
+        assert_eq!(
+            &encoded[3..],
+            &[0x0E, 0x91, 0x05, 0x91, 0x51, 0x0F, 0x19, 0x02]
+        );
+        assert!(matches!(
+            Apdu::decode(&encoded).unwrap(),
+            Apdu::Error {
+                first_failed_element: Some(2),
+                ..
+            }
         ));
     }
 
