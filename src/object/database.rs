@@ -370,6 +370,28 @@ impl ObjectDatabase {
         })
     }
 
+    /// Read a property, change it and write it back as one step, with the
+    /// object locked throughout, so a change made in between is not lost.
+    ///
+    /// Not for Object_Name, whose index this does not keep.
+    pub fn modify_property<F>(
+        &self,
+        identifier: ObjectIdentifier,
+        property: PropertyIdentifier,
+        change: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(PropertyValue) -> Result<PropertyValue>,
+    {
+        if property == PropertyIdentifier::ObjectName {
+            return Err(ObjectError::WriteAccessDenied);
+        }
+        self.update_object(identifier, property, None, move |object| {
+            let changed = change(object.get_property(property)?)?;
+            object.set_property(property, changed)
+        })
+    }
+
     /// Set a property while preserving the command priority from the BACnet
     /// request. Non-commandable objects use their normal property setter.
     pub fn set_property_with_priority(

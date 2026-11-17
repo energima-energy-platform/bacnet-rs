@@ -509,17 +509,9 @@ impl ObjectService {
             None => decode_written_value(property, &request.property_value)?,
         };
 
-        // A recipient registering itself tells us where it is: bind the devices it
-        // names to the address the request came from.
         if property == PropertyIdentifier::RecipientList {
-            if let (Some(source), PropertyValue::List(entries)) = (source, &value) {
-                for entry in entries {
-                    if let PropertyValue::Destination(destination) = entry {
-                        if let crate::property::Recipient::Device(device) = destination.recipient {
-                            self.addresses.learn(device, source);
-                        }
-                    }
-                }
+            if let PropertyValue::List(entries) = &value {
+                self.learn_recipients(entries, source);
             }
         }
 
@@ -663,52 +655,74 @@ impl ObjectService {
 
     /// AddListElement: elements already in the list are not added again, and
     /// if any cannot be added none are.
-    pub fn add_list_element(&self, request: &ListElementRequest) -> Result<(), ObjectError> {
-        let mut list = self.list_for_change(request)?;
-        for element in &request.list_of_elements {
-            if !list.contains(element) {
-                list.push(element.clone());
+    pub fn add_list_element(
+        &self,
+        request: &ListElementRequest,
+        source: Option<SocketAddr>,
+    ) -> Result<(), ObjectError> {
+        self.change_list(request, |list| {
+            for element in &request.list_of_elements {
+                if !list.contains(element) {
+                    list.push(element.clone());
+                }
             }
+            Ok(())
+        })?;
+        if request.property_identifier == PropertyIdentifier::RecipientList {
+            self.learn_recipients(&request.list_of_elements, source);
         }
-        self.database.set_property(
-            request.object_identifier,
-            request.property_identifier,
-            PropertyValue::List(list),
-        )
+        Ok(())
     }
 
     /// RemoveListElement: an element not in the list fails the request, and
     /// leaves the list as it was.
     pub fn remove_list_element(&self, request: &ListElementRequest) -> Result<(), ObjectError> {
-        let mut list = self.list_for_change(request)?;
-        for element in &request.list_of_elements {
-            let at = list
-                .iter()
-                .position(|present| present == element)
-                .ok_or(ObjectError::ListElementNotFound)?;
-            list.remove(at);
-        }
-        self.database.set_property(
-            request.object_identifier,
-            request.property_identifier,
-            PropertyValue::List(list),
-        )
+        self.change_list(request, |list| {
+            for element in &request.list_of_elements {
+                let at = list
+                    .iter()
+                    .position(|present| present == element)
+                    .ok_or(ObjectError::ListElementNotFound)?;
+                list.remove(at);
+            }
+            Ok(())
+        })
     }
 
-    fn list_for_change(
+    /// Change a list property under the object's lock, so two changes at once
+    /// both land.
+    fn change_list(
         &self,
         request: &ListElementRequest,
-    ) -> Result<Vec<PropertyValue>, ObjectError> {
+        change: impl FnOnce(&mut Vec<PropertyValue>) -> Result<(), ObjectError>,
+    ) -> Result<(), ObjectError> {
         // A list inside an array element is a datatype nothing here holds.
         if request.property_array_index.is_some() {
             return Err(ObjectError::PropertyIsNotArray);
         }
-        match self
-            .database
-            .get_property(request.object_identifier, request.property_identifier)?
-        {
-            PropertyValue::List(list) => Ok(list),
-            _ => Err(ObjectError::InvalidPropertyType),
+        self.database.modify_property(
+            request.object_identifier,
+            request.property_identifier,
+            |value| {
+                let PropertyValue::List(mut list) = value else {
+                    return Err(ObjectError::InvalidPropertyType);
+                };
+                change(&mut list)?;
+                Ok(PropertyValue::List(list))
+            },
+        )
+    }
+
+    /// A recipient registering itself tells us where it is: bind the devices
+    /// it names to the address the request came from.
+    fn learn_recipients(&self, entries: &[PropertyValue], source: Option<SocketAddr>) {
+        let Some(source) = source else { return };
+        for entry in entries {
+            if let PropertyValue::Destination(destination) = entry {
+                if let crate::property::Recipient::Device(device) = destination.recipient {
+                    self.addresses.learn(device, source);
+                }
+            }
         }
     }
 
@@ -925,6 +939,89 @@ mod tests {
             ))
             .unwrap()
             .property_values
+    }
+
+    fn service_with_class() -> ObjectService {
+        let database = Arc::new(ObjectDatabase::new(Device::new(
+            1234,
+            "Test device".to_string(),
+        )));
+        database
+            .add_object(Box::new(crate::object::NotificationClass::new(
+                1,
+                "Alarms".to_string(),
+            )))
+            .unwrap();
+        ObjectService::new(database)
+    }
+
+    fn recipient(device: u32) -> PropertyValue {
+        PropertyValue::Destination(crate::property::DestinationValue {
+            valid_days: vec![true; 7],
+            from_time: (0, 0, 0, 0),
+            to_time: (23, 59, 59, 99),
+            recipient: Recipient::Device(ObjectIdentifier::new(ObjectType::Device, device)),
+            process_identifier: 1,
+            issue_confirmed_notifications: false,
+            transitions: vec![true; 3],
+        })
+    }
+
+    fn adding(devices: impl IntoIterator<Item = u32>) -> ListElementRequest {
+        ListElementRequest::new(
+            ObjectIdentifier::new(ObjectType::NotificationClass, 1),
+            PropertyIdentifier::RecipientList,
+            devices.into_iter().map(recipient).collect(),
+        )
+    }
+
+    /// As WriteProperty does: the device an entry names is at the sender.
+    #[test]
+    fn adding_a_recipient_learns_where_it_is() {
+        let service = service_with_class();
+        let sender = SocketAddr::from(([10, 0, 0, 5], 47808));
+        service
+            .add_list_element(&adding([9000]), Some(sender))
+            .unwrap();
+        assert_eq!(
+            service
+                .addresses()
+                .lookup(ObjectIdentifier::new(ObjectType::Device, 9000)),
+            Some(sender)
+        );
+    }
+
+    /// Each change is read, made and written under one lock, so changes made
+    /// together all land.
+    #[test]
+    fn list_changes_made_at_once_all_land() {
+        let service = service_with_class();
+        let threads: Vec<_> = (0..8u32)
+            .map(|thread| {
+                let service = service.clone();
+                std::thread::spawn(move || {
+                    for device in 0..50 {
+                        service
+                            .add_list_element(&adding([thread * 1000 + device]), None)
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let PropertyValue::List(list) = service
+            .database()
+            .get_property(
+                ObjectIdentifier::new(ObjectType::NotificationClass, 1),
+                PropertyIdentifier::RecipientList,
+            )
+            .unwrap()
+        else {
+            panic!("Recipient_List is a list")
+        };
+        assert_eq!(list.len(), 8 * 50);
     }
 
     #[test]

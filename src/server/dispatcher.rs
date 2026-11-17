@@ -270,7 +270,7 @@ impl ServerDispatcher {
                 match crate::service::list_element::ListElementRequest::decode(service_data) {
                     Ok(request) => {
                         let result = if service_choice == ConfirmedServiceChoice::AddListElement {
-                            self.objects.add_list_element(&request)
+                            self.objects.add_list_element(&request, source)
                         } else {
                             self.objects.remove_list_element(&request)
                         };
