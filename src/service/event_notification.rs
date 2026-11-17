@@ -15,9 +15,10 @@ use crate::encoding::{
     decode_closing_tag, decode_context_bit_string, decode_context_boolean,
     decode_context_enumerated, decode_context_object_id, decode_context_real, decode_context_tag,
     decode_context_unsigned, decode_opening_tag, decode_tag, enclosed_length, encode_closing_tag,
-    encode_context_bit_string, encode_context_enumerated, encode_context_object_id,
-    encode_context_tag, encode_context_unsigned, encode_opening_tag, is_context_tag,
-    is_opening_tag, BACnetTag, CharacterSet, EncodingError, Result as EncodingResult,
+    encode_context_bit_string, encode_context_boolean, encode_context_enumerated,
+    encode_context_object_id, encode_context_real, encode_context_tag, encode_context_unsigned,
+    encode_opening_tag, is_context_tag, is_opening_tag, BACnetTag, CharacterSet, EncodingError,
+    Result as EncodingResult,
 };
 use crate::object::{intrinsic::NotifyType, EventState, ObjectIdentifier, Reliability};
 use crate::property::TimestampValue;
@@ -585,7 +586,8 @@ impl EventNotification {
     }
 }
 
-fn event_state(value: u32) -> EncodingResult<EventState> {
+/// A decoded BACnetEventState, which the wire carries as any Unsigned.
+pub(crate) fn event_state(value: u32) -> EncodingResult<EventState> {
     u16::try_from(value)
         .map(EventState::from)
         .map_err(|_| EncodingError::InvalidFormat("event state out of range".into()))
@@ -606,21 +608,6 @@ fn decode_context_char_string(data: &[u8], tag: u8) -> EncodingResult<(Option<St
         .and_then(|set| set.decode(&content[1..]))
         .ok();
     Ok((text, header + length))
-}
-
-/// Encode a REAL under a context tag.
-fn encode_context_real(buffer: &mut Vec<u8>, tag: u8, value: f32) -> EncodingResult<()> {
-    encode_context_tag(buffer, tag, 4)?;
-    buffer.extend_from_slice(&value.to_be_bytes());
-    Ok(())
-}
-
-/// Encode a BOOLEAN under a context tag. Unlike the application form, the value
-/// is carried in a one-byte payload rather than the tag's length field.
-fn encode_context_boolean(buffer: &mut Vec<u8>, tag: u8, value: bool) -> EncodingResult<()> {
-    encode_context_tag(buffer, tag, 1)?;
-    buffer.push(u8::from(value));
-    Ok(())
 }
 
 /// Encode a CHARACTER STRING under a context tag, always as UTF-8.

@@ -16,6 +16,7 @@ use crate::encoding::{
 };
 use crate::object::{intrinsic::NotifyType, EventState, ObjectIdentifier};
 use crate::property::TimestampValue;
+use crate::service::event_notification::event_state;
 
 /// GetEventInformation-Request: the first page, or the page after the object
 /// the previous one ended on.
@@ -213,12 +214,6 @@ impl GetAlarmSummaryAck {
         }
         Ok(Self { alarms })
     }
-}
-
-fn event_state(value: u32) -> EncodingResult<EventState> {
-    u16::try_from(value)
-        .map(EventState::from)
-        .map_err(|_| EncodingError::InvalidFormat("event state out of range".into()))
 }
 
 /// The three transition bits, reading a short bit string's missing bits as
