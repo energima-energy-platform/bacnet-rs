@@ -49,6 +49,9 @@ struct Routes {
     /// announced: a router's networks are its wiring, not its population.
     networks: BTreeSet<u16>,
     devices: BTreeMap<NetworkAddress, Arc<dyn Dispatch>>,
+    /// The number of the B/IP network the router sits on, told to whoever asks
+    /// What-Is-Network-Number. `None` leaves the question unanswered.
+    ip_network: Option<u16>,
 }
 
 impl RouterDevices {
@@ -64,8 +67,39 @@ impl RouterDevices {
                 "{network} cannot be a routed network number"
             )));
         }
-        self.write().networks.insert(network);
+        let mut routes = self.write();
+        if routes.ip_network == Some(network) {
+            return Err(ServerError::InvalidConfiguration(format!(
+                "{network} is the router's own B/IP network"
+            )));
+        }
+        routes.networks.insert(network);
         Ok(())
+    }
+
+    /// Number the B/IP network the router sits on, so a client behind no other
+    /// router can learn the address a device here should send to. `None` stops
+    /// answering What-Is-Network-Number.
+    pub fn set_ip_network(&self, network: Option<u16>) -> Result<(), ServerError> {
+        let mut routes = self.write();
+        if let Some(network) = network {
+            if network == 0 || network == GLOBAL_BROADCAST {
+                return Err(ServerError::InvalidConfiguration(format!(
+                    "{network} cannot be a network number"
+                )));
+            }
+            if routes.networks.contains(&network) {
+                return Err(ServerError::InvalidConfiguration(format!(
+                    "{network} is already behind the router"
+                )));
+            }
+        }
+        routes.ip_network = network;
+        Ok(())
+    }
+
+    pub fn ip_network(&self) -> Option<u16> {
+        self.read().ip_network
     }
 
     /// Take a network away, along with every device on it.
@@ -297,14 +331,37 @@ fn route(
     Ok(replies)
 }
 
-/// Answer the one network-layer question a router must: which networks it
-/// reaches.
+/// Answer the network-layer questions a router must: which networks it
+/// reaches, and the number of the one it sits on.
 fn network_message(devices: &RouterDevices, npdu: &Npdu, payload: &[u8]) -> Option<Vec<u8>> {
     let message = NetworkLayerMessage::decode(payload).ok()?;
-    if message.message_type != NetworkMessageType::WhoIsRouterToNetwork {
+    match message.message_type {
+        NetworkMessageType::WhoIsRouterToNetwork => who_is_router(devices, npdu, &message),
+        NetworkMessageType::WhatIsNetworkNumber => network_number(devices, npdu),
+        _ => None,
+    }
+}
+
+/// Network-Number-Is, flagged as configured. A request routed here from another
+/// network is ignored, as the standard has it: the number is the asker's own.
+fn network_number(devices: &RouterDevices, npdu: &Npdu) -> Option<Vec<u8>> {
+    if npdu.source.is_some() {
         return None;
     }
+    let mut data = devices.ip_network()?.to_be_bytes().to_vec();
+    data.push(1);
+    // Unicast to the asker, as I-Am-Router-To-Network is.
+    Some(network_frame(
+        npdu,
+        NetworkLayerMessage::new(NetworkMessageType::NetworkNumberIs, Some(data)),
+    ))
+}
 
+fn who_is_router(
+    devices: &RouterDevices,
+    npdu: &Npdu,
+    message: &NetworkLayerMessage,
+) -> Option<Vec<u8>> {
     let networks = devices.networks();
     let announced = match message.data() {
         None | Some([]) => networks,
@@ -496,6 +553,61 @@ mod tests {
 
         assert_eq!(announced(&ours[0]), [OTHER_NETWORK]);
         assert!(theirs.is_empty());
+    }
+
+    fn what_is_network_number(routed_from: Option<NetworkAddress>) -> Vec<u8> {
+        let mut npdu = Npdu::new();
+        npdu.control.network_message = true;
+        if let Some(source) = routed_from {
+            npdu.set_source(source);
+        }
+        let message = NetworkLayerMessage::new(NetworkMessageType::WhatIsNetworkNumber, None);
+        frame(BvlcFunction::OriginalBroadcastNpdu, npdu, &message.encode())
+    }
+
+    /// A client enrolling for a device's alarms learns its own network number
+    /// here, to give the device as its address.
+    #[test]
+    fn what_is_network_number_is_told_the_configured_number() {
+        let devices = site();
+        devices.set_ip_network(Some(6)).unwrap();
+
+        let replies = route(&devices, &what_is_network_number(None), source(), None).unwrap();
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].1, source());
+        let (npdu, payload) = decoded(&replies[0]);
+        assert!(npdu.is_network_message());
+        let message = NetworkLayerMessage::decode(&payload).unwrap();
+        assert_eq!(message.message_type, NetworkMessageType::NetworkNumberIs);
+        assert_eq!(message.data().unwrap(), [0, 6, 1]);
+    }
+
+    #[test]
+    fn what_is_network_number_goes_unanswered_without_a_number_or_from_afar() {
+        let unnumbered = site();
+        let numbered = site();
+        numbered.set_ip_network(Some(6)).unwrap();
+        let from_afar = what_is_network_number(Some(at(7, 1)));
+
+        assert!(
+            route(&unnumbered, &what_is_network_number(None), source(), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(route(&numbered, &from_afar, source(), None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_ip_network_cannot_also_be_behind_the_router() {
+        let devices = site();
+
+        assert!(devices.set_ip_network(Some(NETWORK)).is_err());
+        devices.set_ip_network(Some(6)).unwrap();
+        assert!(devices.add_network(6).is_err());
+        assert!(devices.set_ip_network(Some(0)).is_err());
     }
 
     /// The router is not a device: a Who-Is on the local network finds nothing
