@@ -15,7 +15,7 @@ use bacnet_rs::{
         EventState, NotificationClass, ObjectIdentifier, ObjectType, PropertyIdentifier,
     },
     property::{BacnetAddress, DestinationValue, PropertyValue, Recipient, TimestampValue},
-    server::AsyncBacnetIpServer,
+    server::{AsyncBacnetIpServer, RouterDevices, VirtualRouter},
     service::{
         acknowledge_alarm::AcknowledgeAlarmRequest,
         event_information::{GetEventInformationAck, GetEventInformationRequest},
@@ -422,5 +422,36 @@ async fn a_router_asked_directly_says_its_network_number() {
     answering.join().unwrap();
     assert_eq!(answers.len(), 1);
     assert_eq!(answers[0].network, 26001);
+    assert!(answers[0].configured);
+}
+
+/// A virtual router gives the number it was configured with for its B/IP side,
+/// which a client enrolling behind it needs for its own address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_virtual_router_says_its_configured_network_number() {
+    let devices = RouterDevices::new();
+    devices.add_network(1001).unwrap();
+    devices.set_ip_network(Some(6)).unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let address = socket.local_addr().unwrap();
+    let mut router = VirtualRouter::from_socket(socket, devices);
+    let serving = std::thread::spawn(move || router.serve_once().unwrap());
+
+    let client = AsyncBacnetClient::from_config(ClientConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        timeout: Duration::from_millis(500),
+        retries: 0,
+    })
+    .await
+    .unwrap();
+    let answers = client.what_is_network_number_to(address).await.unwrap();
+    assert!(serving.join().unwrap(), "the router answered");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].router, address);
+    assert_eq!(answers[0].network, 6);
     assert!(answers[0].configured);
 }
